@@ -1,6 +1,6 @@
 # SolidCraft SLS 3D Nesting — Staged Implementation Plan (UI-First)
 
-Reference architecture: [`docs/sls-nesting-migration.md`](sls-nesting-migration.md) *(Note: reordered from the migration doc to build minimal Mesh I/O + UI viewport first for visual feedback, then the headless 3D EDT packer.)*
+Reference architecture: [`docs/sls-nesting-migration.md`](sls-nesting-migration.md) · Ranked feature scope: [`docs/sls-feature-matrix.md`](sls-feature-matrix.md) *(Note: reordered from the migration doc to build minimal Mesh I/O + UI viewport first for visual feedback, then the headless 3D EDT packer.)*
 
 ---
 
