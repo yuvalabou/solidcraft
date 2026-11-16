@@ -1,0 +1,13 @@
+[package]
+name = "solidcraft-sls-core"
+description = "Pure-Rust SLS 3D nesting engine: mesh I/O, 3D EDT voxelization, packing, and build verification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

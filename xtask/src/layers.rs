@@ -97,8 +97,11 @@ pub const TABLE: &[(&str, Class)] = &[
     ("viewport-gpu", Class::Shared),
     // the viewport in an egui window: egui-wgpu paint callbacks and install (#12943)
     ("viewport-egui", Class::Shared),
+    // pure-Rust SLS 3D nesting core (mesh I/O, 3D EDT voxelization, 3D packing)
+    ("sls-core", Class::Shared),
     // apps and tooling
     ("solidcraft", Class::Exempt),
+    ("sls", Class::Exempt),
     ("cli", Class::Exempt),
     ("web", Class::Exempt),
     ("xtask", Class::Exempt),

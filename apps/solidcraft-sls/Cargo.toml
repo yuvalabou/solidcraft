@@ -1,0 +1,15 @@
+[package]
+name = "solidcraft-sls"
+description = "SolidCraft SLS 3D nesting desktop app and headless MCP host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+default-run = "solidcraft-sls"
+
+[dependencies]
+solidcraft-sls-core = { path = "../../crates/sls-core" }
+
+[lints]
+workspace = true
