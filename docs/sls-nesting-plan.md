@@ -317,4 +317,7 @@ All SLS development uses `sls-dev` as the protected integration branch, while `m
   - `3caecb49d` — `feat(sls): implement Stage 1 mesh I/O, UI-kit shell, and instanced 3D viewport`
   - `a0f701fe0` — `docs(sls): record Stage 1 progress and commit log`
   - `3da41ea1c` — `feat(sls): complete Stage 1 UI-kit icons, grouped parts tree, triangle picking, and drag-to-translate`
+  - `93593cd10` — `docs(sls): update Stage 1 completion log and test results`
+  - `a602d2372` — `fix(solidcraft-sls): fix offscreen scene/window depth target mismatch, apply theme, and hide console window`
+- **Merged to `sls-dev`:** tagged `sls-stage-1`.
 
