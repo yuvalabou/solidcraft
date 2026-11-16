@@ -289,4 +289,29 @@ All SLS development uses `sls-dev` as the protected integration branch, while `m
   - `cargo +stable build -p solidcraft-sls` — built `target/debug/solidcraft-sls.exe` cleanly
 - **Commits on `sls/stage-0-hygiene`:**
   - `51539ea9f` — `chore(sls): scaffold solidcraft-sls-core and solidcraft-sls (Stage 0)`
+  - `cb2735433` — `docs(sls): add Stage 0 progress, commit log, and executable build workflow`
+- **Merged to `sls-dev`:** tagged `sls-stage-0`.
+
+### Stage 1 — Minimal Mesh I/O + `solidcraft-ui-kit` & `viewport-gpu` Desktop App (`sls/stage-1-ui-viewport`)
+- **What Was Done:**
+  - **Stage 1A (`crates/sls-core`):**
+    - Implemented `model.rs` (`TriMesh`, `MachineProfile` for EOS Formiga P110 `160×210×330 mm` and Farsoon HT403P `400×400×450 mm`, `PartPrototype`, `PartInstance`, `RotationConstraint`, `BuildJob`, `max_z_mm()`, `packing_density_pct()`, `is_instance_in_bounds()`).
+    - Implemented `io/stl.rs` (binary + ASCII STL parser with finite-coordinate validation and vertex interning) and `io/threemf.rs` (pure-mesh 3MF reader/writer with Production Extension `p:path` and `<build><item transform="..."/>` 4×3 matrix support using `zip` + `quick-xml`).
+  - **Stage 1B (`apps/solidcraft-sls/src/icons.rs`, `src/main.rs`):**
+    - Configured `SLS_ICONS` (`IconSet::extended` over `solidcraft_look::icons::DATA`) with all 10 semantic SLS aliases and explicit `glyphs`/`themes`/`icons`/`fonts` startup installation (avoiding `OnceLock` lock-out).
+    - Built `Container`-only UI layout (`Surface::Chrome` top bar, `Surface::Panel` parts tree & inspector/metrics, `Surface::Viewport` central 3D view) with machine switcher, STL/3MF import, 3MF export, duplicate, reset view, and X/Y/Z + Rx/Ry/Rz transform controls.
+  - **Stage 1C (`apps/solidcraft-sls/src/viewport.rs`):**
+    - Rendered build-chamber wireframe, origin triad, and 20 mm `Z = 0` floor grid.
+    - Converted `TriMesh` to `Arc<SharedTris>` and rendered part instances via `InstancedMesh` (`INSTANCE_SIZE = 52`) with normal, selected, and out-of-bounds palette coloring.
+    - Added `solidcraft_viewport::Camera` orbit/pan/zoom controls and screen-ray AABB picking.
+- **Tests Added & Run (`12 passed; 0 failed`):**
+  - `solidcraft-sls-core` (`8 passed`): `error_displays_message`, `rejects_non_finite_or_empty_mesh`, `computes_cube_volume_and_job_metrics`, `parses_ascii_stl_triangle`, `parses_binary_stl_even_with_solid_header`, `rejects_corrupt_stl_without_panicking`, `roundtrips_job_through_threemf`, `rejects_invalid_3mf_zip`.
+  - `solidcraft-sls` (`4 passed`): `sls_icon_aliases_resolve_in_extended_set`, `builds_instanced_scene_for_duplicate_parts`, `ray_picks_centered_instance`, `app_initializes_and_syncs_scene`.
+- **Verification & Executable Build (`+stable`, Rust `1.100.0`):**
+  - `cargo +stable xtask layers` — passed (`solidcraft-sls-core` = `shared`, `solidcraft-sls` = `exempt`, 0 violations)
+  - `cargo +stable xtask ui-containers` — passed
+  - `cargo +stable xtask assets` — passed
+  - `cargo +stable build -p solidcraft-sls` — built `target/debug/solidcraft-sls.exe` cleanly
+- **Commits on `sls/stage-1-ui-viewport`:**
+  - `3caecb49d` — `feat(sls): implement Stage 1 mesh I/O, UI-kit shell, and instanced 3D viewport`
 
