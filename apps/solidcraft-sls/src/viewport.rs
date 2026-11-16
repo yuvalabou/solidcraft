@@ -48,11 +48,23 @@ pub fn build_gpu_scene(
     let oob_color = scene.color(tokens.form_error.to_array());
     let box_color = scene.color(tokens.grid_major.to_array());
     let grid_color = scene.color(tokens.grid.to_array());
+    let margin_color = scene.color(tokens.text_dim.gamma_multiply(0.75).to_array());
+    let ceiling_color = scene.color(tokens.accent.gamma_multiply(0.8).to_array());
     let axis_x = scene.color(tokens.axis_x.to_array());
     let axis_y = scene.color(tokens.axis_y.to_array());
     let axis_z = scene.color(tokens.axis_z.to_array());
 
-    draw_build_chamber(&mut scene, &job.machine, box_color, grid_color, [axis_x, axis_y, axis_z]);
+    draw_build_chamber(
+        &mut scene,
+        &job.machine,
+        job.wall_margin_mm,
+        job.max_z_mm(),
+        box_color,
+        grid_color,
+        margin_color,
+        ceiling_color,
+        [axis_x, axis_y, axis_z],
+    );
 
     let mut per_part: HashMap<PartId, InstancedMesh> = HashMap::new();
     for inst in &job.instances {
@@ -72,46 +84,96 @@ pub fn build_gpu_scene(
             closed: true,
         });
 
-        let color = if !job.is_instance_in_bounds(inst.id) {
+        let in_bounds = job.is_instance_in_bounds(inst.id);
+        let is_selected = Some(inst.id) == selected;
+        let color = if !in_bounds {
             oob_color
-        } else if Some(inst.id) == selected {
+        } else if is_selected {
             selected_color
         } else {
             part_color
         };
         entry.place(inst.transform, color);
+
+        if is_selected {
+            let [lo, hi] = inst.world_bounds(proto.mesh.bounds);
+            draw_box_wireframe(&mut scene, lo, hi, if in_bounds { selected_color } else { oob_color }, 1.6);
+        }
     }
 
     scene.instanced = per_part.into_values().collect();
     scene
 }
 
+fn draw_box_wireframe(
+    scene: &mut GpuScene,
+    lo: [f32; 3],
+    hi: [f32; 3],
+    color: PaletteIndex,
+    width: f32,
+) {
+    let [x0, y0, z0] = lo;
+    let [x1, y1, z1] = hi;
+    let edges = [
+        ([x0, y0, z0], [x1, y0, z0]),
+        ([x1, y0, z0], [x1, y1, z0]),
+        ([x1, y1, z0], [x0, y1, z0]),
+        ([x0, y1, z0], [x0, y0, z0]),
+        ([x0, y0, z1], [x1, y0, z1]),
+        ([x1, y0, z1], [x1, y1, z1]),
+        ([x1, y1, z1], [x0, y1, z1]),
+        ([x0, y1, z1], [x0, y0, z1]),
+        ([x0, y0, z0], [x0, y0, z1]),
+        ([x1, y0, z0], [x1, y0, z1]),
+        ([x1, y1, z0], [x1, y1, z1]),
+        ([x0, y1, z0], [x0, y1, z1]),
+    ];
+    for (a, b) in edges {
+        scene.line(a, b, color, width, false);
+    }
+}
+
+fn draw_rect_z(
+    scene: &mut GpuScene,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    z: f32,
+    color: PaletteIndex,
+    width: f32,
+) {
+    scene.line([x0, y0, z], [x1, y0, z], color, width, false);
+    scene.line([x1, y0, z], [x1, y1, z], color, width, false);
+    scene.line([x1, y1, z], [x0, y1, z], color, width, false);
+    scene.line([x0, y1, z], [x0, y0, z], color, width, false);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_build_chamber(
     scene: &mut GpuScene,
     machine: &MachineProfile,
+    wall_margin_mm: f32,
+    max_z_mm: f32,
     box_color: PaletteIndex,
     grid_color: PaletteIndex,
+    margin_color: PaletteIndex,
+    ceiling_color: PaletteIndex,
     axes: [PaletteIndex; 3],
 ) {
     let [w, d, h] = machine.size_mm();
 
-    // 12 edges of [0..w] x [0..d] x [0..h]
-    let edges = [
-        ([0.0, 0.0, 0.0], [w, 0.0, 0.0]),
-        ([w, 0.0, 0.0], [w, d, 0.0]),
-        ([w, d, 0.0], [0.0, d, 0.0]),
-        ([0.0, d, 0.0], [0.0, 0.0, 0.0]),
-        ([0.0, 0.0, h], [w, 0.0, h]),
-        ([w, 0.0, h], [w, d, h]),
-        ([w, d, h], [0.0, d, h]),
-        ([0.0, d, h], [0.0, 0.0, h]),
-        ([0.0, 0.0, 0.0], [0.0, 0.0, h]),
-        ([w, 0.0, 0.0], [w, 0.0, h]),
-        ([w, d, 0.0], [w, d, h]),
-        ([0.0, d, 0.0], [0.0, d, h]),
-    ];
-    for (a, b) in edges {
-        scene.line(a, b, box_color, 1.4, false);
+    draw_box_wireframe(scene, [0.0, 0.0, 0.0], [w, d, h], box_color, 1.4);
+
+    // Wall-margin safe zone on floor
+    let m = wall_margin_mm.max(0.0);
+    if m > 0.0 && w > 2.0 * m && d > 2.0 * m {
+        draw_rect_z(scene, m, m, w - m, d - m, 0.05, margin_color, 1.2);
+    }
+
+    // Active build ceiling ring at max_z_mm
+    if max_z_mm > 0.1 && max_z_mm <= h {
+        draw_rect_z(scene, 0.0, 0.0, w, d, max_z_mm, ceiling_color, 1.2);
     }
 
     // Origin triad (25 mm)

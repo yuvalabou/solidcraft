@@ -465,6 +465,42 @@ impl BuildJob {
             && hi[1] <= wy - m + EPS
             && hi[2] <= wz - m + EPS
     }
+
+    /// Drop an instance vertically so its lowest world Z rests at `Z = 0.0`.
+    pub fn drop_instance_to_floor(&mut self, id: InstanceId) -> bool {
+        let Some(part_id) = self.instances.iter().find(|i| i.id == id).map(|i| i.part_id) else {
+            return false;
+        };
+        let Some(local_bounds) = self.part(part_id).map(|p| p.mesh.bounds) else {
+            return false;
+        };
+        let Some(inst) = self.instances.iter_mut().find(|i| i.id == id) else {
+            return false;
+        };
+        let wb = inst.world_bounds(local_bounds);
+        inst.transform[2][3] -= wb[0][2];
+        true
+    }
+
+    /// Center an instance horizontally at `(W / 2, D / 2)` without changing Z or rotation.
+    pub fn center_instance_xy(&mut self, id: InstanceId) -> bool {
+        let Some(part_id) = self.instances.iter().find(|i| i.id == id).map(|i| i.part_id) else {
+            return false;
+        };
+        let Some(local_bounds) = self.part(part_id).map(|p| p.mesh.bounds) else {
+            return false;
+        };
+        let [wx, wy, _] = self.machine.size_mm();
+        let Some(inst) = self.instances.iter_mut().find(|i| i.id == id) else {
+            return false;
+        };
+        let wb = inst.world_bounds(local_bounds);
+        let cx = (wb[0][0] + wb[1][0]) * 0.5;
+        let cy = (wb[0][1] + wb[1][1]) * 0.5;
+        inst.transform[0][3] += wx * 0.5 - cx;
+        inst.transform[1][3] += wy * 0.5 - cy;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -545,5 +581,24 @@ mod tests {
         for k in 0..3 {
             assert!((out[k] - deg[k]).abs() < 1e-3, "axis {k}: {} vs {}", out[k], deg[k]);
         }
+    }
+
+    #[test]
+    fn drop_to_floor_and_center_xy_align_bounds() {
+        let cube = unit_cube();
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        let pid = job.add_part("cube", cube);
+        let tf = transform_from_translation_euler_deg([10.0, 20.0, 35.0], [90.0, 0.0, 45.0]);
+        let iid = job.add_instance(pid, tf).expect("added");
+
+        assert!(job.drop_instance_to_floor(iid));
+        assert!(job.center_instance_xy(iid));
+
+        let inst = job.instances.iter().find(|i| i.id == iid).expect("inst");
+        let wb = inst.world_bounds(job.part(pid).expect("proto").mesh.bounds);
+        let [wx, wy, _] = job.machine.size_mm();
+        assert!(wb[0][2].abs() < 1e-4, "bottom Z should be 0, got {}", wb[0][2]);
+        assert!(((wb[0][0] + wb[1][0]) * 0.5 - wx * 0.5).abs() < 1e-3);
+        assert!(((wb[0][1] + wb[1][1]) * 0.5 - wy * 0.5).abs() < 1e-3);
     }
 }
