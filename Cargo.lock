@@ -3611,6 +3611,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "nestcraft"
+version = "0.43.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "egui-wgpu",
+ "nestcraft-core",
+ "rfd",
+ "solidcraft-look",
+ "solidcraft-theme",
+ "solidcraft-ui-kit",
+ "solidcraft-viewport",
+ "solidcraft-viewport-egui",
+ "solidcraft-viewport-gpu",
+ "wgpu",
+]
+
+[[package]]
+name = "nestcraft-core"
+version = "0.43.0"
+dependencies = [
+ "quick-xml",
+ "thiserror 2.0.21",
+ "zip",
+]
+
+[[package]]
 name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6096,33 +6123,6 @@ dependencies = [
  "thiserror 2.0.21",
  "ttf-parser",
  "unicode-bidi",
-]
-
-[[package]]
-name = "solidcraft-sls"
-version = "0.43.0"
-dependencies = [
- "eframe",
- "egui",
- "egui-wgpu",
- "rfd",
- "solidcraft-look",
- "solidcraft-sls-core",
- "solidcraft-theme",
- "solidcraft-ui-kit",
- "solidcraft-viewport",
- "solidcraft-viewport-egui",
- "solidcraft-viewport-gpu",
- "wgpu",
-]
-
-[[package]]
-name = "solidcraft-sls-core"
-version = "0.43.0"
-dependencies = [
- "quick-xml",
- "thiserror 2.0.21",
- "zip",
 ]
 
 [[package]]

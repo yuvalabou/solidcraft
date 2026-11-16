@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use solidcraft_sls_core::model::{Aabb, BuildJob, InstanceId, MachineProfile, PartId, Transform3x4, TriMesh};
+use nestcraft_core::model::{Aabb, BuildJob, InstanceId, MachineProfile, PartId, Transform3x4, TriMesh};
 use solidcraft_theme::Tokens;
 use solidcraft_viewport::{Camera, UpAxis};
 use solidcraft_viewport_gpu::view::{GpuScene, InstanceLook, InstancedMesh, Palette, PaletteIndex, SharedTris};
@@ -383,7 +383,7 @@ fn ray_aabb_intersect(origin: [f32; 3], dir: [f32; 3], aabb: Aabb) -> Option<f32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solidcraft_sls_core::model::IDENTITY_TRANSFORM;
+    use nestcraft_core::model::IDENTITY_TRANSFORM;
     use solidcraft_viewport_gpu::view::INSTANCE_SIZE;
 
     #[test]

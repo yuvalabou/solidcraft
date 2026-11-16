@@ -1,4 +1,6 @@
-# SolidCraft SLS 3D Nesting — Staged Implementation Plan (UI-First)
+# NestCraft 3D Nesting — Staged Implementation Plan (UI-First)
+
+> **Naming & Project Format:** Renamed to **NestCraft** (formerly *SolidCraft SLS*) to distinguish it from a slicer and support a broader 3D/2D nesting & build-preparation approach. Project file format: **`.nestc`** (replacing `.scsls`). Target workspace crates: `crates/nestcraft-core` (`nestcraft-core`) + `apps/nestcraft` (`nestcraft`), migrating from initial Stage 0–1 names (`crates/sls-core` + `apps/solidcraft-sls`).
 
 Reference architecture: [`docs/sls-nesting-migration.md`](sls-nesting-migration.md) · Ranked feature scope: [`docs/sls-feature-matrix.md`](sls-feature-matrix.md) *(Note: reordered from the migration doc to build minimal Mesh I/O + UI viewport first for visual feedback, then the headless 3D EDT packer.)*
 
@@ -11,7 +13,7 @@ Before starting implementation, three repository/environment details were verifi
 1. **Branch & Workspace:** Currently on `sls-dev`. Root `Cargo.toml` (`v0.43.0`, Rust 2024 edition, MSRV `1.95`) globs `crates/*` and `apps/*` and enforces `unsafe_code = "forbid"`.
 2. **External Dependencies to Vet:** `parry3d` is not currently in `Cargo.lock` or `Cargo.toml`. Adding it (or `nalgebra`) requires passing `cargo xtask licences --check` and wasm compatibility checks.
 3. **`pyroid-core` Source & Toolchain:**
-   - `pyroid-core` lives in your fork at `https://github.com/yuvalabou/pyroid` (the local path `raw/projects/GitHub/pyroid/crates/pyroid-core/src/lib.rs` referenced in `sls-nesting-migration.md` does not exist in this workspace). In Stage 2A, we can either pull `pyroid-core` from that GitHub repo/local clone or vendor/port `bvh.rs`, `edt.rs`, and `manifold.rs` into `crates/sls-core`.
+   - `pyroid-core` lives in your fork at `https://github.com/yuvalabou/pyroid` (the local path `raw/projects/GitHub/pyroid/crates/pyroid-core/src/lib.rs` referenced in `sls-nesting-migration.md` does not exist in this workspace). In Stage 2A, we can either pull `pyroid-core` from that GitHub repo/local clone or vendor/port `bvh.rs`, `edt.rs`, and `manifold.rs` into `crates/nestcraft-core`.
    - Running `cargo xtask layers` attempted an online rustup sync for `1.99.1-x86_64-pc-windows-msvc`, so local toolchain availability must be confirmed first.
 
 ---
@@ -23,18 +25,18 @@ Before starting implementation, three repository/environment details were verifi
 ### Detailed Tasks
 1. **Toolchain Verification:**
    - Check installed `rustup toolchain list` and confirm the workspace's pinned toolchain is available offline so `cargo xtask` commands run without network sync failures.
-2. **Scaffold `crates/sls-core`:**
-   - Create `crates/sls-core/Cargo.toml` inheriting `version.workspace = true`, `edition.workspace = true`, `license.workspace = true`, `rust-version.workspace = true`, and `[lints] workspace = true`.
-   - Create `crates/sls-core/src/lib.rs` with `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]` and a `thiserror = "2"` error enum (`SlsError`).
+2. **Scaffold `crates/nestcraft-core`:**
+   - Create `crates/nestcraft-core/Cargo.toml` inheriting `version.workspace = true`, `edition.workspace = true`, `license.workspace = true`, `rust-version.workspace = true`, and `[lints] workspace = true`.
+   - Create `crates/nestcraft-core/src/lib.rs` with `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]` and a `thiserror = "2"` error enum (`NestCraftError`).
    - Keep dependencies strictly pure-Rust / non-UI (`thiserror`, `serde`, `zip`, `quick-xml`, `rayon` when needed).
-3. **Scaffold `apps/solidcraft-sls`:**
-   - Create `apps/solidcraft-sls/Cargo.toml` and `apps/solidcraft-sls/src/main.rs` with a minimal entry point.
+3. **Scaffold `apps/nestcraft`:**
+   - Create `apps/nestcraft/Cargo.toml` and `apps/nestcraft/src/main.rs` with a minimal entry point.
 4. **Register in Layering & Asset Gates:**
-   - Add `("sls-core", Class::Shared)` and `("solidcraft-sls", Class::Exempt)` to `xtask/src/layers.rs::TABLE`.
-   - Create `attribution/pending/sls.md` with the standard attribution table header so future SLS assets pass `cargo xtask assets` without merge conflicts on `ATTRIBUTION.md`.
+   - Add `("nestcraft-core", Class::Shared)` and `("nestcraft", Class::Exempt)` to `xtask/src/layers.rs::TABLE`.
+   - Create `attribution/pending/nestcraft.md` with the standard attribution table header so future NestCraft assets pass `cargo xtask assets` without merge conflicts on `ATTRIBUTION.md`.
 
 ### Exit Criteria
-- `cargo xtask layers`, `cargo xtask ui-containers`, `cargo xtask assets`, and `cargo check -p sls-core -p solidcraft-sls` all pass.
+- `cargo xtask layers`, `cargo xtask ui-containers`, `cargo xtask assets`, and `cargo check -p nestcraft-core -p nestcraft` all pass.
 
 ---
 
@@ -42,28 +44,28 @@ Before starting implementation, three repository/environment details were verifi
 
 **Goal:** Stand up the interactive 3D SLS build-volume viewer first—proving SolidCraft's UI-kit, icon extension, and GPU instancing integration while enabling visual inspection for all later packer work.
 
-### Stage 1A — Minimal `sls-core` Mesh I/O & Machine Definitions
-- **Data Model (`crates/sls-core/src/model.rs`):**
+### Stage 1A — Minimal `nestcraft-core` Mesh I/O & Machine Definitions
+- **Data Model (`crates/nestcraft-core/src/model.rs`):**
   - `TriMesh`: indexed or soup triangle mesh (`positions: Vec<[f32; 3]>`, `indices: Vec<[u32; 3]>`, `normals`, `bounds: [[f32; 3]; 2]`, `volume_mm3`, `surface_area_mm2`), convertible to `solidcore_tess::Mesh` / `SharedTris` at the UI boundary.
   - `PartId`, `PartPrototype` (unique mesh + default constraints), and `PartInstance` (`part_id`, rigid `3×4` row-major transform `[[f32; 4]; 3]`, `RotationConstraint::{Free, ZOnly, Fixed}`, `locked: bool`).
   - `MachineProfile`: EOS Formiga P110 (`160.0 × 210.0 × 330.0 mm`) and Farsoon HT403P (`400.0 × 400.0 × 450.0 mm`), plus configurable wall margins and default part-to-part clearance (`2.5 mm`).
   - `BuildJob`: machine profile, list of `PartPrototype`s, list of `PartInstance`s, and job metrics (`part_count`, `total_part_volume`, `bounding_z_mm`, `packing_density_pct`).
-- **Mesh I/O (`crates/sls-core/src/io/`):**
+- **Mesh I/O (`crates/nestcraft-core/src/io/`):**
   - `stl.rs`: Binary STL (80-byte header + triangle count + 50-byte records) and ASCII STL (`solid` / `facet normal` / `vertex`) reader, with strict bounds/NaN/infinite-vertex validation (`Result`, no `unwrap`).
   - `threemf.rs`: Pure-mesh 3MF reader/writer using `zip = "9"` + `quick-xml = "0.41"`, supporting `3D/3dmodel.model`, Production Extension `p:path` external object references, and `<item objectid="..." transform="...">` 3×4 affine matrices (modeled on `crates/io/src/threemf.rs` without pulling in `solidcraft-doc`).
 
-### Stage 1B — App Shell, Theme & Zero-Touch Icons (`apps/solidcraft-sls`)
-- **Startup Initialization (`apps/solidcraft-sls/src/main.rs`):**
-  - Define `static SLS_ICONS: IconSet = IconSet::extended(solidcraft_look::icons::DATA, IconExtension { masters: &[], aliases: &[...], icon_accents: &[] })` mapping the 10 semantic SLS actions (`sls_import_mesh`, `sls_auto_nest`, `sls_sinterbox`, `sls_orient_lock`, `sls_duplicate`, `sls_emboss_id`, `sls_hollow`, `sls_slice_z`, `sls_collision`, `sls_thermal_map`) to existing `crates/look/icons/design/svg/model/` masters.
-  - Call `solidcraft_look::glyphs::install()`, `solidcraft_look::themes::install()`, `solidcraft_ui_kit::icons::install(&SLS_ICONS)`, and `solidcraft_look::fonts::install(&ctx)` — **never** calling `solidcraft_look::install(&ctx)` so `OnceLock` does not lock out `&SLS_ICONS`.
-- **UI Layout (`apps/solidcraft-sls/src/ui/`):**
+### Stage 1B — App Shell, Theme & Zero-Touch Icons (`apps/nestcraft`)
+- **Startup Initialization (`apps/nestcraft/src/main.rs`):**
+  - Define `static NESTCRAFT_ICONS: IconSet = IconSet::extended(solidcraft_look::icons::DATA, IconExtension { masters: &[], aliases: &[...], icon_accents: &[] })` mapping the 10 semantic actions (`sls_import_mesh`, `sls_auto_nest`, `sls_sinterbox`, `sls_orient_lock`, `sls_duplicate`, `sls_emboss_id`, `sls_hollow`, `sls_slice_z`, `sls_collision`, `sls_thermal_map`) to existing `crates/look/icons/design/svg/model/` masters.
+  - Call `solidcraft_look::glyphs::install()`, `solidcraft_look::themes::install()`, `solidcraft_ui_kit::icons::install(&NESTCRAFT_ICONS)`, and `solidcraft_look::fonts::install(&ctx)` — **never** calling `solidcraft_look::install(&ctx)` so `OnceLock` does not lock out `&NESTCRAFT_ICONS`.
+- **UI Layout (`apps/nestcraft/src/ui/`):**
   - Route every window, panel, ribbon, menu, and tooltip through `solidcraft_ui_kit::Container` and `BackingTooltipExt` (`cargo xtask ui-containers` compliant).
   - **Top Ribbon / Toolbar:** Machine selector (Formiga P110 / HT403P), Import STL/3MF, Export 3MF, Duplicate (`×N`), Orientation Lock (`Free` / `ZOnly` / `Fixed`), Auto-Nest (stubbed/disabled until Stage 2C).
   - **Left Parts Tree Panel:** List of `PartPrototype`s and `PartInstance`s with triangle count, dimensions, quantity, and selection sync.
   - **Right Inspector / Metrics Panel:** Selected part transform (`X, Y, Z, Rx, Ry, Rz`), rotation constraint, and live build metrics (build volume, `max_Z`, packing density %).
 
 ### Stage 1C — Instanced 3D Viewport & Basic Manipulation
-- **Build Volume & Floor Grid (`apps/solidcraft-sls/src/viewport.rs`):**
+- **Build Volume & Floor Grid (`apps/nestcraft/src/viewport.rs`):**
   - Draw machine build envelope wireframe (`SceneLine` box from `(0,0,0)` to `(W, D, H)`) and `Z = 0` XY grid lines using theme tokens.
 - **Hardware-Instanced Parts:**
   - Upload one `Arc<SharedTris>` per unique `PartPrototype` and pack each `PartInstance`'s `[[f32; 4]; 3]` transform + `PaletteIndex` into `InstancedMesh` (`INSTANCE_SIZE = 52` in `crates/viewport-gpu/src/view.rs`).
@@ -75,49 +77,49 @@ Before starting implementation, three repository/environment details were verifi
 
 ### Exit Criteria
 - `cargo xtask ui-containers` and `cargo xtask layers` pass with zero exemptions.
-- `crates/sls-core` has zero UI/GPU dependencies (`cargo xtask shared` passes).
+- `crates/nestcraft-core` has zero UI/GPU dependencies (`cargo xtask shared` passes).
 - Interactive build-volume view, STL/3MF import, 100+ duplicate instances at interactive FPS, and manual part placement verified with captured screenshots.
 
 ---
 
 ## Stage 2 — Headless 3D EDT Voxelizer, Packer & Netfabb Benchmark
 
-**Goal:** Build the pure-Rust 3D nesting kernel in `crates/sls-core`, benchmark it headlessly against Netfabb on 50–150 part jobs, and wire it into the Stage 1 UI (`sls_auto_nest` + live collision highlighting).
+**Goal:** Build the pure-Rust 3D nesting kernel in `crates/nestcraft-core`, benchmark it headlessly against Netfabb on 50–150 part jobs, and wire it into the Stage 1 UI (`sls_auto_nest` + live collision highlighting).
 
 ### Stage 2A — Geometry, Manifold Check & 3D EDT Voxel Masks
-- **Manifold & Winding Gate (`crates/sls-core/src/manifold.rs`):**
+- **Manifold & Winding Gate (`crates/nestcraft-core/src/manifold.rs`):**
   - Port `pyroid-core::manifold`: check edge incidence (every edge shared by exactly 2 faces), consistent triangle winding, and degenerate/zero-area triangles. Flag or reject non-manifold meshes with structured diagnostics (`ManifoldReport`).
-- **BVH & Voxelization (`crates/sls-core/src/voxel.rs`):**
+- **BVH & Voxelization (`crates/nestcraft-core/src/voxel.rs`):**
   - Port `pyroid-core::bvh` (Rayon-parallel BVH ray-cast containment) to voxelize each unique `PartPrototype` (and its quantized orientations, e.g., 90° or 45° steps respecting `RotationConstraint`) at configurable pitch (`1.0 mm` coarse / `0.5 mm` fine).
-- **3D Euclidean Distance Transform (`crates/sls-core/src/edt.rs`):**
+- **3D Euclidean Distance Transform (`crates/nestcraft-core/src/edt.rs`):**
   - Port Felzenszwalb-Huttenlocher 3D EDT from `pyroid-core::edt`.
   - Produce two `u64`-bitpacked 3D grids per `(PartPrototype, Orientation)`:
     - `solid_mask` (`EDT <= 0.0`): exact part occupancy (used for thermal density & Sinterbox checks).
     - `clearance_mask` (`EDT <= clearance_mm / 2.0`, e.g., `1.25 mm` half-clearance for `2.5 mm` part-to-part gap): dilated shell for `O(1)` bitwise `&` collision detection (`(a_word & b_word) != 0`).
 
 ### Stage 2B — 3D Placement, Metaheuristic & Exact Verification
-- **Stage 1 — Constructive Placement (`crates/sls-core/src/packer/constructive.rs`):**
+- **Stage 1 — Constructive Placement (`crates/nestcraft-core/src/packer/constructive.rs`):**
   - Sort parts by bounding volume / height / footprint descending.
   - Bottom-Left-Back-Fill (`Z`-first, then `Y`, then `X`) scanning the build-volume bitgrid for the lowest valid `(x, y, z)` position where `(tray_mask & clearance_mask) == 0` and part stays inside machine bounds.
   - Respect per-part `RotationConstraint` (`Free`: 24/48 orientations, `ZOnly`: Z-axis rotations only, `Fixed`: 1 orientation).
-- **Stage 2 — Metaheuristic Optimization (`crates/sls-core/src/packer/anneal.rs`):**
+- **Stage 2 — Metaheuristic Optimization (`crates/nestcraft-core/src/packer/anneal.rs`):**
   - Simulated Annealing / Tabu local search over part ordering, orientation choice, and local nudges.
   - Objective function: minimize `max_Z` (recoater time/cost driver), secondary objective: minimize local voxel density spikes (thermal hotspot mitigation) + maximize compactness.
   - Support time-budget / iteration-cap cancellation so UI/MCP callers stay responsive.
-- **Stage 3 — Exact Clearance Verification (`crates/sls-core/src/verify.rs`):**
+- **Stage 3 — Exact Clearance Verification (`crates/nestcraft-core/src/verify.rs`):**
   - Broadphase AABB overlap check across placed neighbors, followed by exact mesh-to-mesh distance check (`parry3d` `distance` / `contact` with `clearance_mm` threshold) before committing or exporting 3MF.
 
 ### Stage 2C — Headless Benchmark & UI Integration
-- **Benchmark Harness (`crates/sls-core/benches/` or CLI subcommand):**
+- **Benchmark Harness (`crates/nestcraft-core/benches/` or CLI subcommand):**
   - Run against a real 50–150 part SLS job; record packing density (%), `max_Z` (mm), runtime (s), and exact-clearance pass rate vs. Netfabb baseline.
-- **UI Wiring (`apps/solidcraft-sls`):**
-  - Connect `sls_auto_nest` button to run `sls-core` packer on a background thread with progress/cancel state.
+- **UI Wiring (`apps/nestcraft`):**
+  - Connect `sls_auto_nest` button to run `nestcraft-core` packer on a background thread with progress/cancel state.
   - Connect `sls_collision` check to highlight colliding/too-close instances via `InstancedMesh` `PaletteIndex` (`constraint` red accent).
 
 ### Exit Criteria
 - Unit tests and hostile-input tests (non-manifold STLs, zero-volume/degenerate triangles, oversized parts, empty jobs) pass with zero panics.
 - Headless benchmark meets target density/`max_Z`/runtime on 50–150 parts.
-- Auto-nest + collision highlighting visually verified in `solidcraft-sls`.
+- Auto-nest + collision highlighting visually verified in `nestcraft`.
 
 ---
 
@@ -126,17 +128,17 @@ Before starting implementation, three repository/environment details were verifi
 **Goal:** Add SLS-specific production tools and headless automation over `solidcraft-mcp-server`.
 
 ### Detailed Tasks
-1. **Sinterbox Generator (`crates/sls-core/src/sinterbox.rs`):**
+1. **Sinterbox Generator (`crates/nestcraft-core/src/sinterbox.rs`):**
    - Detect small parts below configurable volume (`< X mm³`) or minimum bounding-box dimension (`< Y mm`).
    - Generate a parametric perforated cage mesh around grouped small parts (wall thickness, hole pitch, clearance margin) so parts don't get lost during depowdering/bead-blasting.
-   - Wire `sls_sinterbox` action in `apps/solidcraft-sls`.
-2. **Thermal Density Heatmap (`crates/sls-core/src/thermal.rs`):**
+   - Wire `sls_sinterbox` action in `apps/nestcraft`.
+2. **Thermal Density Heatmap (`crates/nestcraft-core/src/thermal.rs`):**
    - Run a sliding 3D box filter (e.g., `20 × 20 × 20 mm` kernel) over the build tray's `solid_mask` voxels to compute local sintered volume fraction.
    - Flag PA12 curl / over-sintering hotspots above threshold and map per-instance / per-voxel heat values to the `surface` accent palette (`sls_thermal_map`).
 3. **Additional Production Utilities:**
    - `sls_slice_z`: Z-plane clipping / cross-section slider in the viewport to inspect internal packing & clearances at any layer height.
    - `sls_hollow` / `sls_emboss_id` (if scoped in v1) or job-splitting (`split_builds`) when a BOM exceeds one machine build height.
-4. **Headless MCP Server (`apps/solidcraft-sls` `--mcp` mode):**
+4. **Headless MCP Server (`apps/nestcraft` `--mcp` mode):**
    - Integrate `solidcraft-mcp-server` with zero-dialog execution (strictly respecting `skills/solidcraft-commands/SKILL.md`).
    - Expose tools:
      - `load_job`: load folder of STLs/3MFs + CSV/JSON BOM (quantities, rotation locks, machine profile).
@@ -144,7 +146,7 @@ Before starting implementation, three repository/environment details were verifi
      - `split_builds`: partition overflow jobs across multiple build trays.
      - `export_3mf`: write Production Extension 3MF ready for EOS/Farsoon build prep.
 5. **Nightly CI Workflow:**
-   - Add `.github/workflows/sls-nightly.yml` targeting `sls-dev` running `cargo build --release -p solidcraft-sls` and `sls-core` tests.
+   - Add `.github/workflows/sls-nightly.yml` targeting `sls-dev` running `cargo build --release -p nestcraft` and `nestcraft-core` tests.
 
 ### Exit Criteria
 - End-to-end headless `--mcp` integration test (`load_job` → `nest_job` → `split_builds` → `export_3mf`) passes without opening any window/dialog.
@@ -155,7 +157,7 @@ Before starting implementation, three repository/environment details were verifi
 ## Stage 4 — Upstream / `ws_additive` Readiness (Optional / Future)
 
 - Maintain `LICENSE-BRAND` Clause 2a/2b boundaries (internal fork builds only unless contributed upstream).
-- Keep `crates/sls-core` (`Class::Shared`) UI-agnostic and `apps/solidcraft/` untouched so `crates/sls-core` can integrate cleanly as a `ws_additive` workspace tab alongside `ws_design`, `ws_drawing`, `ws_render`, and `ws_animate` if upstreamed later.
+- Keep `crates/nestcraft-core` (`Class::Shared`) UI-agnostic and `apps/solidcraft/` untouched so `crates/nestcraft-core` can integrate cleanly as a `ws_additive` workspace tab alongside `ws_design`, `ws_drawing`, `ws_render`, and `ws_animate` if upstreamed later.
 
 ---
 
@@ -167,9 +169,9 @@ Estimated **~26 working days (~5.2 weeks)** for Stages 0–3 (assuming offline t
 
 | Stage | Sub-track | Duration | Window | Depends On | Deliverable / Milestone |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Stage 0** | Workspace & `xtask` Hygiene | 1d | Day 1 | — | `sls-core` + `solidcraft-sls` compile; `xtask` gates pass |
+| **Stage 0** | Workspace & `xtask` Hygiene | 1d | Day 1 | — | `nestcraft-core` + `nestcraft` compile; `xtask` gates pass |
 | **Stage 1A** | STL/3MF I/O & Machine Profiles | 3d | Days 2–4 | Stage 0 | Pure-Rust mesh loader & Formiga/HT403P profiles |
-| **Stage 1B** | `ui-kit` Shell & `SLS_ICONS` | 4d | Days 3–6 | Stage 0 | `Container`-compliant UI, ribbon, parts tree, inspector |
+| **Stage 1B** | `ui-kit` Shell & `NESTCRAFT_ICONS` | 4d | Days 3–6 | Stage 0 | `Container`-compliant UI, ribbon, parts tree, inspector |
 | **Stage 1C** | `viewport-gpu` Instancing & Picking | 4d | Days 6–9 | 1A, 1B | Interactive 3D build-volume viewer + manual placement |
 | **Stage 2A** | Manifold, BVH & 3D EDT Masks | 4d | Days 10–13 | 1A, `pyroid-core` | `u64` bitpacked `solid_mask` & `clearance_mask` |
 | **Stage 2B** | BLBF + Annealing + `parry3d` Verify | 5d | Days 14–18 | 2A, `parry3d` | Headless 3D packer with exact clearance check |
@@ -183,7 +185,7 @@ Estimated **~26 working days (~5.2 weeks)** for Stages 0–3 (assuming offline t
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **0. Workspace & Hygiene** | `█····` | `·····` | `·····` | `·····` | `·····` | `·` |
 | **1A. STL/3MF I/O** | `·███·` | `·····` | `·····` | `·····` | `·····` | `·` |
-| **1B. UI-Kit & `SLS_ICONS`** | `··███` | `█····` | `·····` | `·····` | `·····` | `·` |
+| **1B. UI-Kit & `NESTCRAFT_ICONS`** | `··███` | `█····` | `·····` | `·····` | `·····` | `·` |
 | **1C. 3D Viewport & Picking** | `·····` | `████·` | `·····` | `·····` | `·····` | `·` |
 | **2A. BVH & 3D EDT Masks** | `·····` | `····█` | `███··` | `·····` | `·····` | `·` |
 | **2B. Packer & `parry3d`** | `·····` | `·····` | `···██` | `███··` | `·····` | `·` |
@@ -230,16 +232,16 @@ All SLS development uses `sls-dev` as the protected integration branch, while `m
    git checkout -b sls/stage-<N>-<slug>
    ```
 2. **Develop with Boundary & Commit Discipline:**
-   - Use scoped commits (`feat(sls-core): ...`, `feat(solidcraft-sls): ...`, `chore(xtask): ...`).
+   - Use scoped commits (`feat(nestcraft-core): ...`, `feat(nestcraft): ...`, `chore(xtask): ...`).
    - Never edit `apps/solidcraft/`, `crates/engine/`, or `crates/look/`.
-   - Never commit binaries, large test STLs without `attribution/pending/sls.md`, or `unwrap()`/`expect()`/`panic!()` in non-test code.
+   - Never commit binaries, large test STLs without `attribution/pending/nestcraft.md`, or `unwrap()`/`expect()`/`panic!()` in non-test code.
 3. **Run Pre-Merge Gate & Build Executable (Before Merging to `sls-dev`):**
    - `cargo +stable xtask layers`
    - `cargo +stable xtask ui-containers`
    - `cargo +stable xtask assets`
    - `cargo +stable xtask licences --check`
-   - `cargo +stable test -p solidcraft-sls-core -p solidcraft-sls` (with new unit/integration tests for every change)
-   - `cargo +stable build -p solidcraft-sls` (build the `solidcraft-sls.exe` test executable)
+   - `cargo +stable test -p nestcraft-core -p nestcraft` (with new unit/integration tests for every change)
+   - `cargo +stable build -p nestcraft` (build the `nestcraft.exe` test executable)
    - Capture screenshots/recordings for observable UI changes (Stages 1C, 2C, 3A).
 4. **Update Plan Progress & Commit Log:**
    - For each change/stage, add a section to **Progress & Commit Log** below describing what was done, tests added, executable build status, and the exact commit SHA + commit message.
@@ -265,8 +267,8 @@ All SLS development uses `sls-dev` as the protected integration branch, while `m
 
 ## Open Decisions Before Starting Stage 0
 
-1. **Crate naming:** Should `crates/sls-core` be named `solidcraft-sls-core` or `sls-core` in its `Cargo.toml`? *(Resolved in Stage 0: `solidcraft-sls-core`.)*
-2. **`pyroid-core` integration (Stage 2A):** Resolved source: `https://github.com/yuvalabou/pyroid` — prefer adding `pyroid-core` as a git/path dependency or porting `bvh.rs`, `edt.rs`, and `manifold.rs` directly into `crates/sls-core`?
+1. **Crate & App naming:** Initially scaffolded as `solidcraft-sls-core` (`crates/sls-core`) and `solidcraft-sls` (`apps/solidcraft-sls`) in Stage 0; renaming to **`nestcraft-core`** (`crates/nestcraft-core`) and **`nestcraft`** (`apps/nestcraft`) with project file format **`.nestc`**.
+2. **`pyroid-core` integration (Stage 2A):** Resolved source: `https://github.com/yuvalabou/pyroid` — prefer adding `pyroid-core` as a git/path dependency or porting `bvh.rs`, `edt.rs`, and `manifold.rs` directly into `crates/nestcraft-core`?
 3. **`parry3d` addition:** Approve adding `parry3d` (MIT/Apache-2.0) to workspace dependencies for Stage 1C ray-picking / Stage 2B exact verification?
 
 ---

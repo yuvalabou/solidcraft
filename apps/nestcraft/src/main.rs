@@ -1,4 +1,4 @@
-//! SolidCraft SLS 3D nesting desktop application.
+//! NestCraft 3D nesting desktop application.
 
 #![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 #![deny(
@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use solidcraft_sls_core::io::{stl, threemf};
-use solidcraft_sls_core::model::{
+use nestcraft_core::io::{stl, threemf};
+use nestcraft_core::model::{
     BuildJob, InstanceId, MachineProfile, PartId, RotationConstraint, TriMesh,
     transform_from_translation_euler_deg,
 };
@@ -37,7 +37,7 @@ use solidcraft_viewport_gpu::view::{Frame, GpuTarget, SceneSlot, SharedTris};
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SolidCraft SLS")
+            .with_title("NestCraft")
             .with_inner_size([1280.0, 820.0]),
         renderer: eframe::Renderer::Wgpu,
         depth_buffer: 0,
@@ -47,7 +47,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "SolidCraft SLS",
+        "NestCraft",
         native_options,
         Box::new(|cc| {
             icons::install_look_and_icons(&cc.egui_ctx);
@@ -65,10 +65,10 @@ fn main() -> eframe::Result<()> {
                     ..window
                 };
                 let _ = solidcraft_viewport_egui::install(rs, scene, window, false, false, |err| {
-                    eprintln!("solidcraft-sls wgpu error: {err}");
+                    eprintln!("nestcraft wgpu error: {err}");
                 });
             }
-            Ok(Box::new(SlsApp::new()))
+            Ok(Box::new(NestCraftApp::new()))
         }),
     )
 }
@@ -81,7 +81,7 @@ struct DragState {
     plane_z: f32,
 }
 
-struct SlsApp {
+struct NestCraftApp {
     job: BuildJob,
     selected: Option<InstanceId>,
     camera: Camera,
@@ -99,7 +99,7 @@ struct SlsApp {
     sample_counter: u32,
 }
 
-impl SlsApp {
+impl NestCraftApp {
     fn new() -> Self {
         let job = BuildJob::new(MachineProfile::FormigaP110);
         let camera = viewport::default_camera(&job.machine);
@@ -243,7 +243,7 @@ impl SlsApp {
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .show(ui, |ui| {
                         ui.horizontal_centered(|ui| {
-                            ui.label(egui::RichText::new("SolidCraft SLS").strong().color(t.text));
+                            ui.label(egui::RichText::new("NestCraft").strong().color(t.text));
                             StageBar::separator(ui);
 
                             let mut machine_idx = match self.job.machine {
@@ -851,7 +851,7 @@ impl SlsApp {
     }
 }
 
-impl eframe::App for SlsApp {
+impl eframe::App for NestCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         solidcraft_theme::apply(&ctx);
@@ -865,7 +865,7 @@ impl eframe::App for SlsApp {
     }
 }
 
-fn create_sample_bracket_mesh(variant: u32) -> solidcraft_sls_core::Result<TriMesh> {
+fn create_sample_bracket_mesh(variant: u32) -> nestcraft_core::Result<TriMesh> {
     let scale = 1.0 + 0.15 * f32::from((variant % 3) as u8);
     let (w, d, h) = (30.0 * scale, 20.0 * scale, 25.0 * scale);
     let positions = vec![
@@ -901,7 +901,7 @@ mod tests {
 
     #[test]
     fn app_initializes_and_syncs_scene() {
-        let mut app = SlsApp::new();
+        let mut app = NestCraftApp::new();
         app.sync_scene_if_dirty();
         assert!(!app.scene_dirty);
         assert!(app.scene_slot.lock().is_ok_and(|g| g.is_some()));
@@ -909,7 +909,7 @@ mod tests {
 
     #[test]
     fn sample_part_and_90_deg_rotation_update_scene() {
-        let mut app = SlsApp::new();
+        let mut app = NestCraftApp::new();
         app.add_sample_part();
         assert_eq!(app.job.instances.len(), 1);
         let iid = app.selected.expect("selected");

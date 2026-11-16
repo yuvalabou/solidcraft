@@ -11,7 +11,7 @@ use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
 use crate::model::{BuildJob, IDENTITY_TRANSFORM, MachineProfile, Transform3x4, TriMesh};
-use crate::{Result, SlsError};
+use crate::{NestCraftError, Result};
 
 /// One object + placement extracted from a 3MF archive.
 #[derive(Debug, Clone)]
@@ -27,7 +27,7 @@ pub struct ThreeMfLoadedItem {
 /// Read all mesh build items from a `.3mf` archive.
 pub fn read_threemf(bytes: &[u8]) -> Result<Vec<ThreeMfLoadedItem>> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| SlsError::InvalidInput(format!("invalid 3MF zip: {e}")))?;
+        .map_err(|e| NestCraftError::InvalidInput(format!("invalid 3MF zip: {e}")))?;
 
     let root_path = find_root_model_path(&mut archive)?;
     let mut model_cache: HashMap<String, ParsedModel> = HashMap::new();
@@ -73,7 +73,7 @@ pub fn read_threemf(bytes: &[u8]) -> Result<Vec<ThreeMfLoadedItem>> {
     }
 
     if items.is_empty() {
-        return Err(SlsError::InvalidInput("3MF contains no mesh objects".to_owned()));
+        return Err(NestCraftError::InvalidInput("3MF contains no mesh objects".to_owned()));
     }
     Ok(items)
 }
@@ -86,23 +86,23 @@ pub fn write_threemf(job: &BuildJob) -> Result<Vec<u8>> {
         let opts = SimpleFileOptions::default();
 
         zip.start_file("[Content_Types].xml", opts)
-            .map_err(|e| SlsError::InvalidInput(format!("3MF zip write failed: {e}")))?;
+            .map_err(|e| NestCraftError::InvalidInput(format!("3MF zip write failed: {e}")))?;
         zip.write_all(CONTENT_TYPES_XML.as_bytes())
-            .map_err(|e| SlsError::InvalidInput(format!("3MF zip write failed: {e}")))?;
+            .map_err(|e| NestCraftError::InvalidInput(format!("3MF zip write failed: {e}")))?;
 
         zip.start_file("_rels/.rels", opts)
-            .map_err(|e| SlsError::InvalidInput(format!("3MF zip write failed: {e}")))?;
+            .map_err(|e| NestCraftError::InvalidInput(format!("3MF zip write failed: {e}")))?;
         zip.write_all(ROOT_RELS_XML.as_bytes())
-            .map_err(|e| SlsError::InvalidInput(format!("3MF zip write failed: {e}")))?;
+            .map_err(|e| NestCraftError::InvalidInput(format!("3MF zip write failed: {e}")))?;
 
         let model_xml = build_model_xml(job);
         zip.start_file("3D/3dmodel.model", opts)
-            .map_err(|e| SlsError::InvalidInput(format!("3MF zip write failed: {e}")))?;
+            .map_err(|e| NestCraftError::InvalidInput(format!("3MF zip write failed: {e}")))?;
         zip.write_all(model_xml.as_bytes())
-            .map_err(|e| SlsError::InvalidInput(format!("3MF zip write failed: {e}")))?;
+            .map_err(|e| NestCraftError::InvalidInput(format!("3MF zip write failed: {e}")))?;
 
         zip.finish()
-            .map_err(|e| SlsError::InvalidInput(format!("3MF zip finish failed: {e}")))?;
+            .map_err(|e| NestCraftError::InvalidInput(format!("3MF zip finish failed: {e}")))?;
     }
     Ok(buf.into_inner())
 }
@@ -198,16 +198,16 @@ fn find_root_model_path(archive: &mut ZipArchive<Cursor<&[u8]>>) -> Result<Strin
     for i in 0..archive.len() {
         let entry = archive
             .by_index(i)
-            .map_err(|e| SlsError::InvalidInput(format!("3MF zip index error: {e}")))?;
+            .map_err(|e| NestCraftError::InvalidInput(format!("3MF zip index error: {e}")))?;
         let name = entry
             .name()
-            .map_err(|e| SlsError::InvalidInput(format!("3MF zip entry name error: {e}")))?
+            .map_err(|e| NestCraftError::InvalidInput(format!("3MF zip entry name error: {e}")))?
             .into_owned();
         if name.ends_with(".model") {
             return Ok(name);
         }
     }
-    Err(SlsError::InvalidInput("3MF archive contains no .model part".to_owned()))
+    Err(NestCraftError::InvalidInput("3MF archive contains no .model part".to_owned()))
 }
 
 fn normalize_part_path(path: &str) -> String {
@@ -218,10 +218,10 @@ fn read_zip_text(archive: &mut ZipArchive<Cursor<&[u8]>>, path: &str) -> Result<
     let norm = normalize_part_path(path);
     let mut file = archive
         .by_name(&norm)
-        .map_err(|e| SlsError::InvalidInput(format!("missing 3MF part '{norm}': {e}")))?;
+        .map_err(|e| NestCraftError::InvalidInput(format!("missing 3MF part '{norm}': {e}")))?;
     let mut s = String::new();
     file.read_to_string(&mut s)
-        .map_err(|e| SlsError::InvalidInput(format!("unreadable 3MF part '{norm}': {e}")))?;
+        .map_err(|e| NestCraftError::InvalidInput(format!("unreadable 3MF part '{norm}': {e}")))?;
     Ok(s)
 }
 
@@ -367,7 +367,7 @@ fn parse_model_xml(xml: &str) -> Result<ParsedModel> {
                 _ => {}
             },
             Ok(Event::Eof) => break,
-            Err(e) => return Err(SlsError::InvalidInput(format!("3MF XML parse error: {e}"))),
+            Err(e) => return Err(NestCraftError::InvalidInput(format!("3MF XML parse error: {e}"))),
             _ => {}
         }
     }
@@ -382,19 +382,19 @@ fn parse_threemf_transform(s: &str) -> Result<Transform3x4> {
     let mut count = 0_usize;
     for tok in s.split_whitespace() {
         if count >= 12 {
-            return Err(SlsError::InvalidInput("3MF transform has >12 values".to_owned()));
+            return Err(NestCraftError::InvalidInput("3MF transform has >12 values".to_owned()));
         }
         let v: f32 = tok
             .parse()
-            .map_err(|_| SlsError::InvalidInput(format!("invalid 3MF transform float '{tok}'")))?;
+            .map_err(|_| NestCraftError::InvalidInput(format!("invalid 3MF transform float '{tok}'")))?;
         if !v.is_finite() {
-            return Err(SlsError::InvalidInput("3MF transform contains non-finite value".to_owned()));
+            return Err(NestCraftError::InvalidInput("3MF transform contains non-finite value".to_owned()));
         }
         vals[count] = v;
         count += 1;
     }
     if count != 12 {
-        return Err(SlsError::InvalidInput("3MF transform requires 12 values".to_owned()));
+        return Err(NestCraftError::InvalidInput("3MF transform requires 12 values".to_owned()));
     }
     Ok([
         [vals[0], vals[3], vals[6], vals[9]],

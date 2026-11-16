@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::model::TriMesh;
-use crate::{Result, SlsError};
+use crate::{NestCraftError, Result};
 
 /// Parse a binary or ASCII STL buffer into a [`TriMesh`].
 pub fn parse_stl(bytes: &[u8]) -> Result<TriMesh> {
@@ -25,18 +25,18 @@ fn is_binary_stl(bytes: &[u8]) -> bool {
 
 fn parse_binary_stl(bytes: &[u8]) -> Result<TriMesh> {
     if bytes.len() < 84 {
-        return Err(SlsError::InvalidInput("binary STL shorter than 84-byte header".to_owned()));
+        return Err(NestCraftError::InvalidInput("binary STL shorter than 84-byte header".to_owned()));
     }
     let count = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize;
     let expected = count
         .checked_mul(50)
         .and_then(|n| n.checked_add(84))
-        .ok_or_else(|| SlsError::InvalidInput("binary STL triangle count overflow".to_owned()))?;
+        .ok_or_else(|| NestCraftError::InvalidInput("binary STL triangle count overflow".to_owned()))?;
     if bytes.len() < expected {
-        return Err(SlsError::InvalidInput("truncated binary STL payload".to_owned()));
+        return Err(NestCraftError::InvalidInput("truncated binary STL payload".to_owned()));
     }
     if count == 0 {
-        return Err(SlsError::InvalidInput("binary STL contains 0 triangles".to_owned()));
+        return Err(NestCraftError::InvalidInput("binary STL contains 0 triangles".to_owned()));
     }
 
     let mut positions = Vec::new();
@@ -60,20 +60,20 @@ fn parse_binary_stl(bytes: &[u8]) -> Result<TriMesh> {
 
 fn read_vec3(slice: &[u8]) -> Result<[f32; 3]> {
     if slice.len() < 12 {
-        return Err(SlsError::InvalidInput("truncated STL vertex".to_owned()));
+        return Err(NestCraftError::InvalidInput("truncated STL vertex".to_owned()));
     }
     let x = f32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
     let y = f32::from_le_bytes([slice[4], slice[5], slice[6], slice[7]]);
     let z = f32::from_le_bytes([slice[8], slice[9], slice[10], slice[11]]);
     if !x.is_finite() || !y.is_finite() || !z.is_finite() {
-        return Err(SlsError::InvalidInput("STL contains non-finite vertex".to_owned()));
+        return Err(NestCraftError::InvalidInput("STL contains non-finite vertex".to_owned()));
     }
     Ok([x, y, z])
 }
 
 fn parse_ascii_stl(bytes: &[u8]) -> Result<TriMesh> {
     let text = std::str::from_utf8(bytes)
-        .map_err(|_| SlsError::InvalidInput("ASCII STL is not valid UTF-8".to_owned()))?;
+        .map_err(|_| NestCraftError::InvalidInput("ASCII STL is not valid UTF-8".to_owned()))?;
     let mut positions = Vec::new();
     let mut indices = Vec::new();
     let mut intern: HashMap<[u32; 3], u32> = HashMap::new();
@@ -100,19 +100,19 @@ fn parse_ascii_stl(bytes: &[u8]) -> Result<TriMesh> {
     }
 
     if vert_in_tri != 0 {
-        return Err(SlsError::InvalidInput("ASCII STL has incomplete triangle".to_owned()));
+        return Err(NestCraftError::InvalidInput("ASCII STL has incomplete triangle".to_owned()));
     }
 
     TriMesh::from_indexed(positions, indices)
 }
 
 fn parse_f32(tok: Option<&str>) -> Result<f32> {
-    let s = tok.ok_or_else(|| SlsError::InvalidInput("missing ASCII STL coordinate".to_owned()))?;
+    let s = tok.ok_or_else(|| NestCraftError::InvalidInput("missing ASCII STL coordinate".to_owned()))?;
     let v: f32 = s
         .parse()
-        .map_err(|_| SlsError::InvalidInput(format!("invalid ASCII STL float '{s}'")))?;
+        .map_err(|_| NestCraftError::InvalidInput(format!("invalid ASCII STL float '{s}'")))?;
     if !v.is_finite() {
-        return Err(SlsError::InvalidInput("ASCII STL contains non-finite coordinate".to_owned()));
+        return Err(NestCraftError::InvalidInput("ASCII STL contains non-finite coordinate".to_owned()));
     }
     Ok(v)
 }
@@ -128,7 +128,7 @@ fn intern_vertex(
         return Ok(idx);
     }
     let idx = u32::try_from(positions.len())
-        .map_err(|_| SlsError::InvalidInput("STL vertex count exceeds u32::MAX".to_owned()))?;
+        .map_err(|_| NestCraftError::InvalidInput("STL vertex count exceeds u32::MAX".to_owned()))?;
     positions.push(v);
     intern.insert(key, idx);
     Ok(idx)

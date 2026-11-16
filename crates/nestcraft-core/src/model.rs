@@ -1,8 +1,8 @@
-//! Core SLS data model: triangle meshes, machine profiles, part instances, and build jobs.
+//! Core NestCraft data model: triangle meshes, machine profiles, part instances, and build jobs.
 
 use std::sync::Arc;
 
-use crate::{Result, SlsError};
+use crate::{NestCraftError, Result};
 
 /// Axis-aligned bounding box `[min, max]` in millimetres.
 pub type Aabb = [[f32; 3]; 2];
@@ -37,7 +37,7 @@ pub enum RotationConstraint {
     Fixed,
 }
 
-/// Target SLS machine build-volume profile.
+/// Target machine build-volume profile.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MachineProfile {
     /// EOS Formiga P110 (`160 x 210 x 330 mm`).
@@ -95,14 +95,14 @@ impl TriMesh {
     /// Construct a [`TriMesh`] from positions and triangle indices, validating finiteness and bounds.
     pub fn from_indexed(positions: Vec<[f32; 3]>, indices: Vec<[u32; 3]>) -> Result<Self> {
         if positions.is_empty() || indices.is_empty() {
-            return Err(SlsError::InvalidInput("mesh has no triangles".to_owned()));
+            return Err(NestCraftError::InvalidInput("mesh has no triangles".to_owned()));
         }
 
         let mut min = [f32::INFINITY; 3];
         let mut max = [f32::NEG_INFINITY; 3];
         for p in &positions {
             if !p.iter().all(|v| v.is_finite()) {
-                return Err(SlsError::InvalidInput("mesh contains non-finite vertex coordinate".to_owned()));
+                return Err(NestCraftError::InvalidInput("mesh contains non-finite vertex coordinate".to_owned()));
             }
             for k in 0..3 {
                 min[k] = min[k].min(p[k]);
@@ -118,7 +118,7 @@ impl TriMesh {
         for tri in &indices {
             let [i0, i1, i2] = *tri;
             if i0 as usize >= n_verts || i1 as usize >= n_verts || i2 as usize >= n_verts {
-                return Err(SlsError::InvalidInput("triangle index out of range".to_owned()));
+                return Err(NestCraftError::InvalidInput("triangle index out of range".to_owned()));
             }
             let a = positions[i0 as usize];
             let b = positions[i1 as usize];
@@ -288,7 +288,7 @@ pub fn transform_from_translation_euler_deg(translation: [f32; 3], euler_deg: [f
     ]
 }
 
-/// Complete SLS build job state.
+/// Complete NestCraft build job state.
 #[derive(Debug, Clone)]
 pub struct BuildJob {
     /// Target machine build volume.
@@ -359,7 +359,7 @@ impl BuildJob {
     pub fn add_instance(&mut self, part_id: PartId, transform: Transform3x4) -> Result<InstanceId> {
         let constraint = self
             .part(part_id)
-            .ok_or_else(|| SlsError::InvalidInput(format!("unknown part id {}", part_id.0)))?
+            .ok_or_else(|| NestCraftError::InvalidInput(format!("unknown part id {}", part_id.0)))?
             .default_constraint;
         let id = InstanceId(self.next_instance_id);
         self.next_instance_id += 1;
@@ -377,7 +377,7 @@ impl BuildJob {
     pub fn add_instance_centered_on_floor(&mut self, part_id: PartId) -> Result<InstanceId> {
         let mesh = self
             .part(part_id)
-            .ok_or_else(|| SlsError::InvalidInput(format!("unknown part id {}", part_id.0)))?
+            .ok_or_else(|| NestCraftError::InvalidInput(format!("unknown part id {}", part_id.0)))?
             .mesh
             .clone();
         let [lo, hi] = mesh.bounds;
@@ -399,7 +399,7 @@ impl BuildJob {
             .iter()
             .find(|i| i.id == source_id)
             .cloned()
-            .ok_or_else(|| SlsError::InvalidInput(format!("unknown instance id {}", source_id.0)))?;
+            .ok_or_else(|| NestCraftError::InvalidInput(format!("unknown instance id {}", source_id.0)))?;
         let dims = self
             .part(src.part_id)
             .map(|p| p.mesh.dimensions())

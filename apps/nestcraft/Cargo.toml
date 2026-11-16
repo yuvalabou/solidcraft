@@ -1,20 +1,20 @@
 [package]
-name = "solidcraft-sls"
-description = "SolidCraft SLS 3D nesting desktop app and headless MCP host"
+name = "nestcraft"
+description = "NestCraft 3D nesting desktop app and headless MCP host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-default-run = "solidcraft-sls"
+default-run = "nestcraft"
 
 [dependencies]
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "links", "clipboard"] }
 egui = { workspace = true }
 egui-wgpu = { workspace = true }
+nestcraft-core = { path = "../../crates/nestcraft-core" }
 rfd = { workspace = true }
 solidcraft-look = { workspace = true }
-solidcraft-sls-core = { path = "../../crates/sls-core" }
 solidcraft-theme = { workspace = true }
 solidcraft-ui-kit = { workspace = true }
 solidcraft-viewport = { workspace = true }
