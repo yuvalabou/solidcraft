@@ -304,14 +304,17 @@ All SLS development uses `sls-dev` as the protected integration branch, while `m
     - Rendered build-chamber wireframe, origin triad, and 20 mm `Z = 0` floor grid.
     - Converted `TriMesh` to `Arc<SharedTris>` and rendered part instances via `InstancedMesh` (`INSTANCE_SIZE = 52`) with normal, selected, and out-of-bounds palette coloring.
     - Added `solidcraft_viewport::Camera` orbit/pan/zoom controls and screen-ray AABB picking.
-- **Tests Added & Run (`12 passed; 0 failed`):**
-  - `solidcraft-sls-core` (`8 passed`): `error_displays_message`, `rejects_non_finite_or_empty_mesh`, `computes_cube_volume_and_job_metrics`, `parses_ascii_stl_triangle`, `parses_binary_stl_even_with_solid_header`, `rejects_corrupt_stl_without_panicking`, `roundtrips_job_through_threemf`, `rejects_invalid_3mf_zip`.
-  - `solidcraft-sls` (`4 passed`): `sls_icon_aliases_resolve_in_extended_set`, `builds_instanced_scene_for_duplicate_parts`, `ray_picks_centered_instance`, `app_initializes_and_syncs_scene`.
+- **Tests Added & Run (`14 passed; 0 failed`):**
+  - `solidcraft-sls-core` (`9 passed`): `error_displays_message`, `rejects_non_finite_or_empty_mesh`, `computes_cube_volume_and_job_metrics`, `euler_deg_roundtrips_transform`, `parses_ascii_stl_triangle`, `parses_binary_stl_even_with_solid_header`, `rejects_corrupt_stl_without_panicking`, `roundtrips_job_through_threemf`, `rejects_invalid_3mf_zip`.
+  - `solidcraft-sls` (`5 passed`): `sls_icon_aliases_resolve_in_extended_set`, `builds_instanced_scene_for_duplicate_parts`, `ray_picks_centered_instance`, `ray_misses_empty_aabb_corner_of_tetrahedron`, `app_initializes_and_syncs_scene`.
 - **Verification & Executable Build (`+stable`, Rust `1.100.0`):**
   - `cargo +stable xtask layers` — passed (`solidcraft-sls-core` = `shared`, `solidcraft-sls` = `exempt`, 0 violations)
   - `cargo +stable xtask ui-containers` — passed
   - `cargo +stable xtask assets` — passed
+  - `cargo +stable clippy -p solidcraft-sls-core -p solidcraft-sls --all-targets -- -D warnings` — passed (0 warnings)
   - `cargo +stable build -p solidcraft-sls` — built `target/debug/solidcraft-sls.exe` cleanly
 - **Commits on `sls/stage-1-ui-viewport`:**
   - `3caecb49d` — `feat(sls): implement Stage 1 mesh I/O, UI-kit shell, and instanced 3D viewport`
+  - `a0f701fe0` — `docs(sls): record Stage 1 progress and commit log`
+  - `3da41ea1c` — `feat(sls): complete Stage 1 UI-kit icons, grouped parts tree, triangle picking, and drag-to-translate`
 
