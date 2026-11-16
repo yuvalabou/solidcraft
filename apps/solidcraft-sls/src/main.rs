@@ -1,5 +1,6 @@
 //! SolidCraft SLS 3D nesting desktop application.
 
+#![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -34,7 +35,9 @@ fn main() -> eframe::Result<()> {
             .with_title("SolidCraft SLS")
             .with_inner_size([1280.0, 820.0]),
         renderer: eframe::Renderer::Wgpu,
-        depth_buffer: 24,
+        depth_buffer: 0,
+        stencil_buffer: 0,
+        multisampling: 1,
         ..Default::default()
     };
 
@@ -43,15 +46,22 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| {
             icons::install_look_and_icons(&cc.egui_ctx);
+            solidcraft_theme::apply(&cc.egui_ctx);
             if let Some(rs) = &cc.wgpu_render_state {
-                let target = GpuTarget {
+                let window = GpuTarget {
                     format: rs.target_format,
-                    depth: Some(wgpu::TextureFormat::Depth32Float),
+                    depth: None,
                     samples: 1,
                     tess: false,
                     oit: false,
                 };
-                let _ = solidcraft_viewport_egui::install(rs, target, target, false, false, |_| {});
+                let scene = GpuTarget {
+                    depth: Some(solidcraft_viewport_gpu::depth_format(&rs.device, true)),
+                    ..window
+                };
+                let _ = solidcraft_viewport_egui::install(rs, scene, window, false, false, |err| {
+                    eprintln!("solidcraft-sls wgpu error: {err}");
+                });
             }
             Ok(Box::new(SlsApp::new()))
         }),
@@ -191,6 +201,7 @@ impl SlsApp {
 impl eframe::App for SlsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        solidcraft_theme::apply(&ctx);
         let t = Tokens::get();
         let top_c = Container::new(&ctx, Surface::Chrome);
         let side_c = Container::new(&ctx, Surface::Panel);
