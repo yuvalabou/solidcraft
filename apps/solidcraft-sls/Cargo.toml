@@ -9,7 +9,18 @@ publish = false
 default-run = "solidcraft-sls"
 
 [dependencies]
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "links", "clipboard"] }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+rfd = { workspace = true }
+solidcraft-look = { workspace = true }
 solidcraft-sls-core = { path = "../../crates/sls-core" }
+solidcraft-theme = { workspace = true }
+solidcraft-ui-kit = { workspace = true }
+solidcraft-viewport = { workspace = true }
+solidcraft-viewport-egui = { workspace = true }
+solidcraft-viewport-gpu = { workspace = true }
+wgpu = { workspace = true }
 
 [lints]
 workspace = true

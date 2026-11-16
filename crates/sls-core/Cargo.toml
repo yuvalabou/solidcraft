@@ -7,7 +7,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+quick-xml = { workspace = true }
 thiserror = { workspace = true }
+zip = { workspace = true }
 
 [lints]
 workspace = true
