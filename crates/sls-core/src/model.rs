@@ -87,6 +87,8 @@ pub struct TriMesh {
     pub bounds: Aabb,
     /// Signed mesh volume in cubic millimetres (positive for outward-wound closed meshes).
     pub volume_mm3: f64,
+    /// Total triangle surface area in square millimetres.
+    pub surface_area_mm2: f64,
 }
 
 impl TriMesh {
@@ -111,6 +113,7 @@ impl TriMesh {
         let n_verts = positions.len();
         let mut tri_normals = Vec::with_capacity(indices.len());
         let mut signed_vol6 = 0.0_f64;
+        let mut surface_area_mm2 = 0.0_f64;
 
         for tri in &indices {
             let [i0, i1, i2] = *tri;
@@ -122,6 +125,7 @@ impl TriMesh {
             let c = positions[i2 as usize];
             tri_normals.push(compute_face_normal(a, b, c));
             signed_vol6 += signed_tetra_vol6(a, b, c);
+            surface_area_mm2 += triangle_area(a, b, c);
         }
 
         Ok(Self {
@@ -130,6 +134,7 @@ impl TriMesh {
             tri_normals,
             bounds: [min, max],
             volume_mm3: (signed_vol6 / 6.0).abs(),
+            surface_area_mm2,
         })
     }
 
@@ -162,6 +167,23 @@ fn signed_tetra_vol6(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f64 {
     let (bx, by, bz) = (f64::from(b[0]), f64::from(b[1]), f64::from(b[2]));
     let (cx, cy, cz) = (f64::from(c[0]), f64::from(c[1]), f64::from(c[2]));
     ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx)
+}
+
+fn triangle_area(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f64 {
+    let ab = [
+        f64::from(b[0]) - f64::from(a[0]),
+        f64::from(b[1]) - f64::from(a[1]),
+        f64::from(b[2]) - f64::from(a[2]),
+    ];
+    let ac = [
+        f64::from(c[0]) - f64::from(a[0]),
+        f64::from(c[1]) - f64::from(a[1]),
+        f64::from(c[2]) - f64::from(a[2]),
+    ];
+    let cx = ab[1] * ac[2] - ab[2] * ac[1];
+    let cy = ab[2] * ac[0] - ab[0] * ac[2];
+    let cz = ab[0] * ac[1] - ab[1] * ac[0];
+    0.5 * (cx * cx + cy * cy + cz * cz).sqrt()
 }
 
 /// A unique imported part mesh shared across one or more placed instances.
@@ -203,6 +225,19 @@ impl PartInstance {
         self.transform[0][3] = xyz[0];
         self.transform[1][3] = xyz[1];
         self.transform[2][3] = xyz[2];
+    }
+
+    /// Extract `[rx, ry, rz]` Euler angles (degrees) from `transform` (`R = Rz * Ry * Rx`).
+    pub fn euler_deg(&self) -> [f32; 3] {
+        let m = &self.transform;
+        let sy = (-m[2][0]).clamp(-1.0, 1.0);
+        let ry = sy.asin();
+        let (rx, rz) = if ry.cos().abs() > 1e-5 {
+            (m[2][1].atan2(m[2][2]), m[1][0].atan2(m[0][0]))
+        } else {
+            (m[1][2].atan2(m[1][1]), 0.0)
+        };
+        [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()]
     }
 
     /// Compute the transformed world-space AABB for a local bounding box.
@@ -260,6 +295,8 @@ pub struct BuildJob {
     pub machine: MachineProfile,
     /// Minimum required part-to-part clearance in millimetres.
     pub clearance_mm: f32,
+    /// Minimum required margin from X/Y chamber walls and top Z in millimetres.
+    pub wall_margin_mm: f32,
     /// Unique part prototypes.
     pub parts: Vec<PartPrototype>,
     /// Placed part instances.
@@ -275,11 +312,12 @@ impl Default for BuildJob {
 }
 
 impl BuildJob {
-    /// Create an empty build job for `machine` with `2.5 mm` default clearance.
+    /// Create an empty build job for `machine` with `2.5 mm` clearance and `5.0 mm` wall margin.
     pub fn new(machine: MachineProfile) -> Self {
         Self {
             machine,
             clearance_mm: 2.5,
+            wall_margin_mm: 5.0,
             parts: Vec::new(),
             instances: Vec::new(),
             next_part_id: 1,
@@ -303,6 +341,18 @@ impl BuildJob {
     /// Look up a prototype by [`PartId`].
     pub fn part(&self, id: PartId) -> Option<&PartPrototype> {
         self.parts.iter().find(|p| p.id == id)
+    }
+
+    /// Count placed instances referencing `part_id`.
+    pub fn instance_count_for_part(&self, part_id: PartId) -> usize {
+        self.instances.iter().filter(|i| i.part_id == part_id).count()
+    }
+
+    /// Remove an instance by [`InstanceId`], returning `true` if found and removed.
+    pub fn remove_instance(&mut self, id: InstanceId) -> bool {
+        let before = self.instances.len();
+        self.instances.retain(|i| i.id != id);
+        self.instances.len() < before
     }
 
     /// Place a new instance of `part_id` with `transform`.
@@ -377,6 +427,14 @@ impl BuildJob {
         max_z
     }
 
+    /// Total sintered volume of all placed instances in cubic millimetres.
+    pub fn total_part_volume_mm3(&self) -> f64 {
+        self.instances
+            .iter()
+            .filter_map(|inst| self.part(inst.part_id).map(|p| p.mesh.volume_mm3))
+            .sum()
+    }
+
     /// Sintered packing density (%) relative to the occupied build height (`W * D * max_Z`).
     pub fn packing_density_pct(&self) -> f64 {
         let max_z = f64::from(self.max_z_mm());
@@ -385,15 +443,10 @@ impl BuildJob {
         }
         let [wx, wy, _] = self.machine.size_mm();
         let used_box_vol = f64::from(wx) * f64::from(wy) * max_z;
-        let part_vol: f64 = self
-            .instances
-            .iter()
-            .filter_map(|inst| self.part(inst.part_id).map(|p| p.mesh.volume_mm3))
-            .sum();
-        (part_vol / used_box_vol) * 100.0
+        (self.total_part_volume_mm3() / used_box_vol) * 100.0
     }
 
-    /// Check whether an instance's world AABB lies strictly inside `[0, W] x [0, D] x [0, H]`.
+    /// Check whether an instance's world AABB lies inside the machine envelope with `wall_margin_mm`.
     pub fn is_instance_in_bounds(&self, id: InstanceId) -> bool {
         let Some(inst) = self.instances.iter().find(|i| i.id == id) else {
             return false;
@@ -403,13 +456,14 @@ impl BuildJob {
         };
         let [lo, hi] = inst.world_bounds(proto.mesh.bounds);
         let [wx, wy, wz] = self.machine.size_mm();
+        let m = self.wall_margin_mm.max(0.0);
         const EPS: f32 = 1e-3;
-        lo[0] >= -EPS
-            && lo[1] >= -EPS
+        lo[0] >= m - EPS
+            && lo[1] >= m - EPS
             && lo[2] >= -EPS
-            && hi[0] <= wx + EPS
-            && hi[1] <= wy + EPS
-            && hi[2] <= wz + EPS
+            && hi[0] <= wx - m + EPS
+            && hi[1] <= wy - m + EPS
+            && hi[2] <= wz - m + EPS
     }
 }
 
@@ -456,11 +510,40 @@ mod tests {
     fn computes_cube_volume_and_job_metrics() {
         let cube = unit_cube();
         assert!((cube.volume_mm3 - 1000.0).abs() < 1e-3);
+        assert!((cube.surface_area_mm2 - 600.0).abs() < 1e-3);
         let mut job = BuildJob::new(MachineProfile::FormigaP110);
         let pid = job.add_part("cube", cube);
         let iid = job.add_instance_centered_on_floor(pid).expect("placed");
         assert!(job.is_instance_in_bounds(iid));
         assert!((job.max_z_mm() - 10.0).abs() < 1e-4);
+        assert!((job.total_part_volume_mm3() - 1000.0).abs() < 1e-3);
         assert!(job.packing_density_pct() > 0.0);
+        assert_eq!(job.instance_count_for_part(pid), 1);
+
+        // Moving inside wall margin triggers out-of-bounds.
+        if let Some(inst) = job.instances.iter_mut().find(|i| i.id == iid) {
+            inst.set_translation([1.0, 10.0, 0.0]);
+        }
+        assert!(!job.is_instance_in_bounds(iid));
+        assert!(job.remove_instance(iid));
+        assert_eq!(job.instance_count_for_part(pid), 0);
+    }
+
+    #[test]
+    fn euler_deg_roundtrips_transform() {
+        let pos = [12.5, 34.0, 56.25];
+        let deg = [15.0, -25.0, 40.0];
+        let tf = transform_from_translation_euler_deg(pos, deg);
+        let inst = PartInstance {
+            id: InstanceId(1),
+            part_id: PartId(1),
+            transform: tf,
+            constraint: RotationConstraint::Free,
+            locked: false,
+        };
+        let out = inst.euler_deg();
+        for k in 0..3 {
+            assert!((out[k] - deg[k]).abs() < 1e-3, "axis {k}: {} vs {}", out[k], deg[k]);
+        }
     }
 }

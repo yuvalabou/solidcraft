@@ -304,10 +304,10 @@ fn parse_model_xml(xml: &str) -> Result<ParsedModel> {
                                 b"objectid" => oid = std::str::from_utf8(&attr.value).ok().and_then(|s| s.parse().ok()),
                                 b"path" => path = std::str::from_utf8(&attr.value).ok().map(str::to_owned),
                                 b"transform" => {
-                                    if let Ok(s) = std::str::from_utf8(&attr.value) {
-                                        if let Ok(t) = parse_threemf_transform(s) {
-                                            transform = t;
-                                        }
+                                    if let Ok(s) = std::str::from_utf8(&attr.value)
+                                        && let Ok(t) = parse_threemf_transform(s)
+                                    {
+                                        transform = t;
                                     }
                                 }
                                 _ => {}
@@ -326,10 +326,10 @@ fn parse_model_xml(xml: &str) -> Result<ParsedModel> {
                                 b"objectid" => oid = std::str::from_utf8(&attr.value).ok().and_then(|s| s.parse().ok()),
                                 b"path" => path = std::str::from_utf8(&attr.value).ok().map(str::to_owned),
                                 b"transform" => {
-                                    if let Ok(s) = std::str::from_utf8(&attr.value) {
-                                        if let Ok(t) = parse_threemf_transform(s) {
-                                            transform = t;
-                                        }
+                                    if let Ok(s) = std::str::from_utf8(&attr.value)
+                                        && let Ok(t) = parse_threemf_transform(s)
+                                    {
+                                        transform = t;
                                     }
                                 }
                                 _ => {}

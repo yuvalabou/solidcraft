@@ -22,7 +22,8 @@ use solidcraft_sls_core::model::{
     transform_from_translation_euler_deg,
 };
 use solidcraft_theme::Tokens;
-use solidcraft_ui_kit::container::{Container, Edge, Surface};
+use solidcraft_ui_kit::container::{BackingTooltipExt as _, Container, Edge, Surface};
+use solidcraft_ui_kit::icon_label_button;
 use solidcraft_viewport::Camera;
 use solidcraft_viewport_egui::{ViewportCallback, paint_background};
 use solidcraft_viewport_gpu::view::{Frame, GpuTarget, SceneSlot, SharedTris};
@@ -57,6 +58,14 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DragState {
+    instance_id: InstanceId,
+    start_translation: [f32; 3],
+    start_hit: [f32; 3],
+    plane_z: f32,
+}
+
 struct SlsApp {
     job: BuildJob,
     selected: Option<InstanceId>,
@@ -69,6 +78,8 @@ struct SlsApp {
     scene_dirty: bool,
     status: String,
     euler_edit: HashMap<InstanceId, [f32; 3]>,
+    dup_count: usize,
+    drag_state: Option<DragState>,
 }
 
 impl SlsApp {
@@ -87,6 +98,19 @@ impl SlsApp {
             scene_dirty: true,
             status: "Ready — import an STL or 3MF to begin.".to_owned(),
             euler_edit: HashMap::new(),
+            dup_count: 1,
+            drag_state: None,
+        }
+    }
+
+    fn select_instance(&mut self, id: Option<InstanceId>) {
+        if self.selected != id {
+            self.selected = id;
+            if let Some(iid) = id
+                && let Some(inst) = self.job.instances.iter().find(|i| i.id == iid) {
+                    self.euler_edit.insert(iid, inst.euler_deg());
+                }
+            self.mark_dirty();
         }
     }
 
@@ -154,7 +178,8 @@ impl SlsApp {
         if !self.scene_dirty {
             return;
         }
-        let scene = viewport::build_gpu_scene(&self.job, self.selected, &mut self.shared_cache);
+        let tokens = Tokens::get();
+        let scene = viewport::build_gpu_scene(&self.job, self.selected, &tokens, &mut self.shared_cache);
         if let Ok(mut guard) = self.scene_slot.lock() {
             *guard = Some(scene);
         }
@@ -197,75 +222,126 @@ impl eframe::App for SlsApp {
                 }
 
                 ui.separator();
-                if ui.button("Import STL / 3MF").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
+                if icon_label_button(ui, "Import", "sls_import_mesh", true, false)
+                    .backing_on_hover_text("Import STL or 3MF mesh into the build chamber")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
                         .add_filter("3D Mesh", &["stl", "STL", "3mf", "3MF"])
                         .pick_file()
                     {
                         self.import_file(&path);
                     }
-                }
-                if ui.button("Export 3MF").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
+                if icon_label_button(ui, "Export 3MF", "export", !self.job.instances.is_empty(), false)
+                    .backing_on_hover_text("Export build job to 3MF")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
                         .add_filter("3MF", &["3mf"])
                         .set_file_name("build.3mf")
                         .save_file()
                     {
                         self.export_threemf_file(&path);
                     }
-                }
-                if ui.button("Duplicate").clicked() {
-                    if let Some(sel) = self.selected {
-                        if let Ok(ids) = self.job.duplicate_instance(sel, 1) {
-                            self.selected = ids.first().copied();
-                            self.mark_dirty();
+                ui.separator();
+                ui.add(egui::DragValue::new(&mut self.dup_count).range(1..=200).prefix("×"));
+                if icon_label_button(ui, "Duplicate", "sls_duplicate", self.selected.is_some(), false)
+                    .backing_on_hover_text("Duplicate selected instance N times")
+                    .clicked()
+                    && let Some(sel) = self.selected {
+                        let count = self.dup_count.max(1);
+                        if let Ok(ids) = self.job.duplicate_instance(sel, count) {
+                            let last = ids.last().copied();
+                            self.select_instance(last);
+                            self.status = format!("Duplicated {count} instance(s)");
                         }
                     }
-                }
-                if ui.button("Reset View").clicked() {
+                if icon_label_button(ui, "Delete", "delete", self.selected.is_some(), true)
+                    .backing_on_hover_text("Remove selected instance from build")
+                    .clicked()
+                    && let Some(sel) = self.selected
+                        && self.job.remove_instance(sel) {
+                            self.euler_edit.remove(&sel);
+                            self.selected = None;
+                            self.mark_dirty();
+                            self.status = "Removed selected instance".to_owned();
+                        }
+                if icon_label_button(ui, "Reset View", "fit", true, false)
+                    .backing_on_hover_text("Reset camera to default isometric build view")
+                    .clicked()
+                {
                     self.camera = viewport::default_camera(&self.job.machine);
                 }
-                ui.add_enabled(false, egui::Button::new("Auto-Nest (Stage 2)"));
+                icon_label_button(ui, "Auto-Nest", "sls_auto_nest", false, false)
+                    .backing_on_hover_text("3D EDT Auto-Nest (coming in Stage 2)");
             });
         });
 
-        let left_panel = side_c.edge("sls_parts_tree", Edge::Left).default_size(240.0);
+        let left_panel = side_c.edge("sls_parts_tree", Edge::Left).default_size(250.0);
         side_c.show_edge(ui, left_panel, side_c.edge_frame(t.panel), |ui| {
             ui.heading("Build Parts");
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let instances = self.job.instances.clone();
-                for inst in instances {
-                    let label = self
-                        .job
-                        .part(inst.part_id)
-                        .map(|p| format!("{} (#{})", p.name, inst.id.0))
-                        .unwrap_or_else(|| format!("Instance #{}", inst.id.0));
-                    let is_sel = self.selected == Some(inst.id);
-                    if ui.selectable_label(is_sel, label).clicked() {
-                        self.selected = Some(inst.id);
-                        self.mark_dirty();
-                    }
+                let mut picked_id: Option<InstanceId> = None;
+                for proto in &self.job.parts {
+                    let count = self.job.instance_count_for_part(proto.id);
+                    let [dx, dy, dz] = proto.mesh.dimensions();
+                    let tris = proto.mesh.indices.len();
+                    let header = format!("{} (×{count})", proto.name);
+                    egui::CollapsingHeader::new(header)
+                        .id_salt(("proto", proto.id.0))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.small(format!("{tris} tris · {dx:.1} × {dy:.1} × {dz:.1} mm"));
+                            for inst in self.job.instances.iter().filter(|i| i.part_id == proto.id) {
+                                let is_sel = self.selected == Some(inst.id);
+                                let pos = inst.translation();
+                                let label = format!("#{}  ({:.1}, {:.1}, {:.1})", inst.id.0, pos[0], pos[1], pos[2]);
+                                if ui.selectable_label(is_sel, label).clicked() {
+                                    picked_id = Some(inst.id);
+                                }
+                            }
+                        });
+                }
+                if let Some(id) = picked_id {
+                    self.select_instance(Some(id));
                 }
             });
         });
 
-        let right_panel = side_c.edge("sls_inspector", Edge::Right).default_size(260.0);
+        let right_panel = side_c.edge("sls_inspector", Edge::Right).default_size(270.0);
         side_c.show_edge(ui, right_panel, side_c.edge_frame(t.panel), |ui| {
             ui.heading("Build Metrics");
             ui.separator();
             let [wx, wy, wz] = self.job.machine.size_mm();
             ui.label(format!("Machine: {}", self.job.machine.name()));
             ui.label(format!("Envelope: {wx:.0} × {wy:.0} × {wz:.0} mm"));
-            ui.label(format!("Instances: {}", self.job.instances.len()));
+            ui.label(format!("Parts / Instances: {} / {}", self.job.parts.len(), self.job.instances.len()));
+            ui.label(format!("Part Volume: {:.2} cm³", self.job.total_part_volume_mm3() / 1000.0));
             ui.label(format!("Max Z: {:.2} mm", self.job.max_z_mm()));
             ui.label(format!("Density: {:.2}%", self.job.packing_density_pct()));
+            ui.horizontal(|ui| {
+                ui.label("Wall Margin:");
+                if ui
+                    .add(egui::DragValue::new(&mut self.job.wall_margin_mm).range(0.0..=25.0).speed(0.5).suffix(" mm"))
+                    .changed()
+                {
+                    self.mark_dirty();
+                }
+            });
 
             ui.add_space(12.0);
             ui.heading("Selected Instance");
             ui.separator();
             if let Some(sel_id) = self.selected {
                 let in_bounds = self.job.is_instance_in_bounds(sel_id);
+                let mut current_euler = None;
+                let mut part_area = None;
+                if let Some(inst) = self.job.instances.iter().find(|i| i.id == sel_id) {
+                    current_euler = Some(inst.euler_deg());
+                    part_area = self.job.part(inst.part_id).map(|p| p.mesh.surface_area_mm2);
+                }
+                if let Some(area) = part_area {
+                    ui.small(format!("Surface Area: {:.2} cm²", area / 100.0));
+                }
                 if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == sel_id) {
                     let mut pos = inst.translation();
                     let mut changed = false;
@@ -278,7 +354,10 @@ impl eframe::App for SlsApp {
                         changed |= ui.add(egui::DragValue::new(&mut pos[2]).speed(0.5).suffix(" mm")).changed();
                     });
 
-                    let euler = self.euler_edit.entry(sel_id).or_insert([0.0, 0.0, 0.0]);
+                    let euler = self
+                        .euler_edit
+                        .entry(sel_id)
+                        .or_insert_with(|| current_euler.unwrap_or([0.0, 0.0, 0.0]));
                     let mut rot_changed = false;
                     ui.horizontal(|ui| {
                         ui.label("Rx");
@@ -326,14 +405,9 @@ impl eframe::App for SlsApp {
             if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
                 let delta = resp.drag_delta();
                 if ui.input(|i| i.modifiers.shift) {
-                    let (right, up, _) = self.camera.basis();
-                    let scale = self.camera.distance * 0.0015;
-                    self.camera.target = self.camera.target
-                        - right * (f64::from(delta.x) * scale)
-                        + up * (f64::from(delta.y) * scale);
+                    self.camera.pan(f64::from(delta.x), f64::from(delta.y), f64::from(rect.height().max(1.0)));
                 } else {
-                    self.camera.yaw -= f64::from(delta.x) * 0.006;
-                    self.camera.pitch = (self.camera.pitch + f64::from(delta.y) * 0.006).clamp(-1.54, 1.54);
+                    self.camera.orbit(f64::from(-delta.x) * 0.006, f64::from(delta.y) * 0.006);
                 }
             }
 
@@ -341,19 +415,62 @@ impl eframe::App for SlsApp {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                 if scroll.abs() > 0.01 {
                     let factor = (1.0 - f64::from(scroll) * 0.0015).clamp(0.5, 1.5);
-                    self.camera.distance = (self.camera.distance * factor).clamp(15.0, 5000.0);
+                    self.camera.zoom_at(factor, None);
+                    self.camera.distance = self.camera.distance.clamp(15.0, 5000.0);
                 }
             }
 
-            if resp.clicked_by(egui::PointerButton::Primary) {
-                if let Some(pos) = resp.interact_pointer_pos() {
+            if resp.drag_started_by(egui::PointerButton::Primary)
+                && let Some(pos) = resp.interact_pointer_pos() {
                     let hit = viewport::pick_instance(&self.job, &self.camera, rect, pos);
-                    if hit != self.selected {
-                        self.selected = hit;
-                        self.mark_dirty();
+                    if let Some(iid) = hit {
+                        self.select_instance(Some(iid));
+                        if let Some(inst) = self.job.instances.iter().find(|i| i.id == iid)
+                            && !inst.locked {
+                                let tr = inst.translation();
+                                let plane_z = tr[2];
+                                if let Some(hit_pt) = viewport::intersect_horizontal_plane(&self.camera, rect, pos, plane_z) {
+                                    self.drag_state = Some(DragState {
+                                        instance_id: iid,
+                                        start_translation: tr,
+                                        start_hit: hit_pt,
+                                        plane_z,
+                                    });
+                                }
+                            }
                     }
                 }
+
+            if resp.dragged_by(egui::PointerButton::Primary)
+                && let (Some(ds), Some(pos)) = (self.drag_state, resp.interact_pointer_pos()) {
+                    let shift = ui.input(|i| i.modifiers.shift);
+                    if shift {
+                        if let Some(z_now) = viewport::intersect_vertical_plane(&self.camera, rect, pos, ds.start_hit)
+                            && let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == ds.instance_id) {
+                                let mut tr = inst.translation();
+                                tr[2] = ds.start_translation[2] + (z_now - ds.plane_z);
+                                inst.set_translation(tr);
+                                self.mark_dirty();
+                            }
+                    } else if let Some(hit_now) = viewport::intersect_horizontal_plane(&self.camera, rect, pos, ds.plane_z)
+                        && let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == ds.instance_id) {
+                            let mut tr = inst.translation();
+                            tr[0] = ds.start_translation[0] + (hit_now[0] - ds.start_hit[0]);
+                            tr[1] = ds.start_translation[1] + (hit_now[1] - ds.start_hit[1]);
+                            inst.set_translation(tr);
+                            self.mark_dirty();
+                        }
+                }
+
+            if resp.drag_stopped() {
+                self.drag_state = None;
             }
+
+            if resp.clicked_by(egui::PointerButton::Primary)
+                && let Some(pos) = resp.interact_pointer_pos() {
+                    let hit = viewport::pick_instance(&self.job, &self.camera, rect, pos);
+                    self.select_instance(hit);
+                }
 
             self.sync_scene_if_dirty();
 

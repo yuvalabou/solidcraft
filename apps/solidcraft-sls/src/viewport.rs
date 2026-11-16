@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use solidcraft_sls_core::model::{Aabb, BuildJob, InstanceId, MachineProfile, PartId, TriMesh};
+use solidcraft_sls_core::model::{Aabb, BuildJob, InstanceId, MachineProfile, PartId, Transform3x4, TriMesh};
+use solidcraft_theme::Tokens;
 use solidcraft_viewport::{Camera, UpAxis};
 use solidcraft_viewport_gpu::view::{GpuScene, InstanceLook, InstancedMesh, Palette, PaletteIndex, SharedTris};
 
@@ -37,18 +38,19 @@ pub fn mesh_to_shared_tris(mesh: &TriMesh) -> Arc<SharedTris> {
 pub fn build_gpu_scene(
     job: &BuildJob,
     selected: Option<InstanceId>,
+    tokens: &Tokens,
     cache: &mut HashMap<PartId, Arc<SharedTris>>,
 ) -> GpuScene {
     let mut scene = GpuScene::with_palette(Palette::default());
 
-    let part_color = scene.color([210, 214, 220, 255]);
-    let selected_color = scene.color([238, 178, 56, 255]);
-    let oob_color = scene.color([220, 68, 68, 255]);
-    let box_color = scene.color([120, 145, 175, 220]);
-    let grid_color = scene.color([82, 90, 102, 160]);
-    let axis_x = scene.color([210, 80, 80, 230]);
-    let axis_y = scene.color([80, 190, 95, 230]);
-    let axis_z = scene.color([80, 145, 225, 230]);
+    let part_color = scene.color(tokens.text.to_array());
+    let selected_color = scene.color(tokens.accent.to_array());
+    let oob_color = scene.color(tokens.form_error.to_array());
+    let box_color = scene.color(tokens.grid_major.to_array());
+    let grid_color = scene.color(tokens.grid.to_array());
+    let axis_x = scene.color(tokens.axis_x.to_array());
+    let axis_y = scene.color(tokens.axis_y.to_array());
+    let axis_z = scene.color(tokens.axis_z.to_array());
 
     draw_build_chamber(&mut scene, &job.machine, box_color, grid_color, [axis_x, axis_y, axis_z]);
 
@@ -146,43 +148,74 @@ pub fn default_camera(machine: &MachineProfile) -> Camera {
     }
 }
 
-/// Pick the closest instance whose world AABB is hit by a screen-space pointer ray.
+/// Compute world-space `(origin, unit_dir)` ray from `cam` through `pointer` inside `rect`.
+pub fn screen_ray(
+    cam: &Camera,
+    rect: egui::Rect,
+    pointer: egui::Pos2,
+) -> Option<([f32; 3], [f32; 3])> {
+    if !rect.contains(pointer) || rect.width() <= 1.0 || rect.height() <= 1.0 {
+        return None;
+    }
+    let px = f64::from(pointer.x - rect.left());
+    let py = f64::from(pointer.y - rect.top());
+    let (origin, dir) = cam.ray(px, py, f64::from(rect.width()), f64::from(rect.height()));
+    Some((origin.to_f32(), dir.to_f32()))
+}
+
+/// Intersect a screen ray with a horizontal `Z = plane_z` plane (for XY dragging).
+pub fn intersect_horizontal_plane(
+    cam: &Camera,
+    rect: egui::Rect,
+    pointer: egui::Pos2,
+    plane_z: f32,
+) -> Option<[f32; 3]> {
+    let (origin, dir) = screen_ray(cam, rect, pointer)?;
+    if dir[2].abs() < 1e-6 {
+        return None;
+    }
+    let t = (plane_z - origin[2]) / dir[2];
+    if t < 0.0 || !t.is_finite() {
+        return None;
+    }
+    Some([origin[0] + dir[0] * t, origin[1] + dir[1] * t, plane_z])
+}
+
+/// Intersect a screen ray with a vertical camera-facing plane through `anchor` (for Z dragging).
+pub fn intersect_vertical_plane(
+    cam: &Camera,
+    rect: egui::Rect,
+    pointer: egui::Pos2,
+    anchor: [f32; 3],
+) -> Option<f32> {
+    let (origin, dir) = screen_ray(cam, rect, pointer)?;
+    let back = cam.back().to_f32();
+    let nx = back[0];
+    let ny = back[1];
+    let len = (nx * nx + ny * ny).sqrt();
+    if len < 1e-6 {
+        return None;
+    }
+    let (nx, ny) = (nx / len, ny / len);
+    let denom = dir[0] * nx + dir[1] * ny;
+    if denom.abs() < 1e-6 {
+        return None;
+    }
+    let t = ((anchor[0] - origin[0]) * nx + (anchor[1] - origin[1]) * ny) / denom;
+    if t < 0.0 || !t.is_finite() {
+        return None;
+    }
+    Some(origin[2] + dir[2] * t)
+}
+
+/// Pick the closest instance whose world AABB and triangles are hit by a screen-space pointer ray.
 pub fn pick_instance(
     job: &BuildJob,
     cam: &Camera,
     rect: egui::Rect,
     pointer: egui::Pos2,
 ) -> Option<InstanceId> {
-    if !rect.contains(pointer) || rect.width() <= 1.0 || rect.height() <= 1.0 {
-        return None;
-    }
-    let ndc_x = ((pointer.x - rect.left()) / rect.width()) * 2.0 - 1.0;
-    let ndc_y = 1.0 - ((pointer.y - rect.top()) / rect.height()) * 2.0;
-
-    let (right, up, back) = cam.basis();
-    let half_h = cam.half_height() as f32;
-    let aspect = rect.width() / rect.height();
-    let half_w = half_h * aspect;
-    let eye = cam.eye().to_f32();
-    let forward = [-back.x as f32, -back.y as f32, -back.z as f32];
-    let r = [right.x as f32, right.y as f32, right.z as f32];
-    let u = [up.x as f32, up.y as f32, up.z as f32];
-
-    let (ray_origin, ray_dir) = if cam.fov > 0.0 {
-        let dir = [
-            forward[0] + r[0] * (ndc_x * half_w) + u[0] * (ndc_y * half_h),
-            forward[1] + r[1] * (ndc_x * half_w) + u[1] * (ndc_y * half_h),
-            forward[2] + r[2] * (ndc_x * half_w) + u[2] * (ndc_y * half_h),
-        ];
-        (eye, normalize3(dir))
-    } else {
-        let origin = [
-            eye[0] + r[0] * (ndc_x * half_w) + u[0] * (ndc_y * half_h),
-            eye[1] + r[1] * (ndc_x * half_w) + u[1] * (ndc_y * half_h),
-            eye[2] + r[2] * (ndc_x * half_w) + u[2] * (ndc_y * half_h),
-        ];
-        (origin, forward)
-    };
+    let (ray_origin, ray_dir) = screen_ray(cam, rect, pointer)?;
 
     let mut best: Option<(f32, InstanceId)> = None;
     for inst in &job.instances {
@@ -190,22 +223,80 @@ pub fn pick_instance(
             continue;
         };
         let wb = inst.world_bounds(proto.mesh.bounds);
-        if let Some(t) = ray_aabb_intersect(ray_origin, ray_dir, wb) {
-            if best.is_none_or(|(best_t, _)| t < best_t) {
-                best = Some((t, inst.id));
-            }
+        if ray_aabb_intersect(ray_origin, ray_dir, wb).is_none() {
+            continue;
+        }
+        let (local_origin, local_dir) = inverse_transform_ray(&inst.transform, ray_origin, ray_dir);
+        for tri in &proto.mesh.indices {
+            let a = proto.mesh.positions[tri[0] as usize];
+            let b = proto.mesh.positions[tri[1] as usize];
+            let c = proto.mesh.positions[tri[2] as usize];
+            if let Some(t) = ray_triangle_intersect(local_origin, local_dir, a, b, c)
+                && best.is_none_or(|(best_t, _)| t < best_t) {
+                    best = Some((t, inst.id));
+                }
         }
     }
     best.map(|(_, id)| id)
 }
 
-fn normalize3(v: [f32; 3]) -> [f32; 3] {
-    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if len > 1e-9 {
-        [v[0] / len, v[1] / len, v[2] / len]
-    } else {
-        [0.0, 0.0, -1.0]
+fn inverse_transform_ray(
+    m: &Transform3x4,
+    origin: [f32; 3],
+    dir: [f32; 3],
+) -> ([f32; 3], [f32; 3]) {
+    let dx = origin[0] - m[0][3];
+    let dy = origin[1] - m[1][3];
+    let dz = origin[2] - m[2][3];
+    // Transpose of orthonormal 3x3 rotation part
+    let local_o = [
+        m[0][0] * dx + m[1][0] * dy + m[2][0] * dz,
+        m[0][1] * dx + m[1][1] * dy + m[2][1] * dz,
+        m[0][2] * dx + m[1][2] * dy + m[2][2] * dz,
+    ];
+    let local_d = [
+        m[0][0] * dir[0] + m[1][0] * dir[1] + m[2][0] * dir[2],
+        m[0][1] * dir[0] + m[1][1] * dir[1] + m[2][1] * dir[2],
+        m[0][2] * dir[0] + m[1][2] * dir[1] + m[2][2] * dir[2],
+    ];
+    (local_o, local_d)
+}
+
+fn ray_triangle_intersect(
+    origin: [f32; 3],
+    dir: [f32; 3],
+    v0: [f32; 3],
+    v1: [f32; 3],
+    v2: [f32; 3],
+) -> Option<f32> {
+    let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+    let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+    let h = [
+        dir[1] * e2[2] - dir[2] * e2[1],
+        dir[2] * e2[0] - dir[0] * e2[2],
+        dir[0] * e2[1] - dir[1] * e2[0],
+    ];
+    let a = e1[0] * h[0] + e1[1] * h[1] + e1[2] * h[2];
+    if a.abs() < 1e-8 {
+        return None;
     }
+    let f = 1.0 / a;
+    let s = [origin[0] - v0[0], origin[1] - v0[1], origin[2] - v0[2]];
+    let u = f * (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]);
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = [
+        s[1] * e1[2] - s[2] * e1[1],
+        s[2] * e1[0] - s[0] * e1[2],
+        s[0] * e1[1] - s[1] * e1[0],
+    ];
+    let v = f * (dir[0] * q[0] + dir[1] * q[1] + dir[2] * q[2]);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = f * (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]);
+    (t > 1e-5).then_some(t)
 }
 
 fn ray_aabb_intersect(origin: [f32; 3], dir: [f32; 3], aabb: Aabb) -> Option<f32> {
@@ -248,7 +339,7 @@ mod tests {
         let _ = job.duplicate_instance(i1, 3).expect("duplicated");
 
         let mut cache = HashMap::new();
-        let scene = build_gpu_scene(&job, Some(i1), &mut cache);
+        let scene = build_gpu_scene(&job, Some(i1), &Tokens::get(), &mut cache);
         assert_eq!(scene.instanced.len(), 1);
         assert_eq!(scene.instanced[0].instances.len(), 4 * INSTANCE_SIZE);
         assert!(!scene.lines.is_empty());
@@ -268,7 +359,20 @@ mod tests {
                     [10.0, 10.0, 20.0],
                     [-10.0, 10.0, 20.0],
                 ],
-                vec![[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7]],
+                vec![
+                    [0, 2, 1],
+                    [0, 3, 2],
+                    [4, 5, 6],
+                    [4, 6, 7],
+                    [0, 1, 5],
+                    [0, 5, 4],
+                    [1, 2, 6],
+                    [1, 6, 5],
+                    [2, 3, 7],
+                    [2, 7, 6],
+                    [3, 0, 4],
+                    [3, 4, 7],
+                ],
             )
             .expect("valid box"),
         );
@@ -281,5 +385,32 @@ mod tests {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let picked = pick_instance(&job, &cam, rect, rect.center());
         assert_eq!(picked, Some(iid));
+    }
+
+    #[test]
+    fn ray_misses_empty_aabb_corner_of_tetrahedron() {
+        let mesh = Arc::new(
+            TriMesh::from_indexed(
+                vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [0.0, 20.0, 0.0], [0.0, 0.0, 20.0]],
+                vec![[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]],
+            )
+            .expect("valid tet"),
+        );
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        let pid = job.add_part("tet", mesh);
+        let _iid = job.add_instance_centered_on_floor(pid).expect("placed");
+
+        // Top-down camera looking at the empty (18, 18, 18) corner of the tet's AABB.
+        let cam = Camera {
+            target: [88.0, 113.0, 10.0].into(),
+            yaw: 0.0,
+            pitch: 1.54,
+            roll: 0.0,
+            distance: 100.0,
+            fov: 0.5,
+            up: UpAxis::Z,
+        };
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        assert_eq!(pick_instance(&job, &cam, rect, rect.center()), None);
     }
 }
