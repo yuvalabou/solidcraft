@@ -6102,14 +6102,27 @@ dependencies = [
 name = "solidcraft-sls"
 version = "0.43.0"
 dependencies = [
+ "eframe",
+ "egui",
+ "egui-wgpu",
+ "rfd",
+ "solidcraft-look",
  "solidcraft-sls-core",
+ "solidcraft-theme",
+ "solidcraft-ui-kit",
+ "solidcraft-viewport",
+ "solidcraft-viewport-egui",
+ "solidcraft-viewport-gpu",
+ "wgpu",
 ]
 
 [[package]]
 name = "solidcraft-sls-core"
 version = "0.43.0"
 dependencies = [
+ "quick-xml",
  "thiserror 2.0.21",
+ "zip",
 ]
 
 [[package]]

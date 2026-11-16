@@ -9,6 +9,9 @@
     clippy::unreachable
 )]
 
+pub mod io;
+pub mod model;
+
 use thiserror::Error;
 
 /// Top-level error type for `solidcraft-sls-core`.
