@@ -6099,6 +6099,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "solidcraft-sls"
+version = "0.43.0"
+dependencies = [
+ "solidcraft-sls-core",
+]
+
+[[package]]
+name = "solidcraft-sls-core"
+version = "0.43.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "solidcraft-smlib"
 version = "0.43.0"
 dependencies = [
