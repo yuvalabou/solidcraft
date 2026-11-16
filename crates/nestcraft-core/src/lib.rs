@@ -10,6 +10,7 @@
 )]
 
 pub mod io;
+pub mod manifold;
 pub mod model;
 
 use thiserror::Error;
