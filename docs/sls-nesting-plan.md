@@ -233,14 +233,17 @@ All SLS development uses `sls-dev` as the protected integration branch, while `m
    - Use scoped commits (`feat(sls-core): ...`, `feat(solidcraft-sls): ...`, `chore(xtask): ...`).
    - Never edit `apps/solidcraft/`, `crates/engine/`, or `crates/look/`.
    - Never commit binaries, large test STLs without `attribution/pending/sls.md`, or `unwrap()`/`expect()`/`panic!()` in non-test code.
-3. **Run Pre-Merge Gate (Before Merging to `sls-dev`):**
-   - `cargo xtask layers`
-   - `cargo xtask ui-containers`
-   - `cargo xtask assets`
-   - `cargo xtask licences --check`
-   - `cargo test -p sls-core -p solidcraft-sls`
+3. **Run Pre-Merge Gate & Build Executable (Before Merging to `sls-dev`):**
+   - `cargo +stable xtask layers`
+   - `cargo +stable xtask ui-containers`
+   - `cargo +stable xtask assets`
+   - `cargo +stable xtask licences --check`
+   - `cargo +stable test -p solidcraft-sls-core -p solidcraft-sls` (with new unit/integration tests for every change)
+   - `cargo +stable build -p solidcraft-sls` (build the `solidcraft-sls.exe` test executable)
    - Capture screenshots/recordings for observable UI changes (Stages 1C, 2C, 3A).
-4. **Rebase, Merge (`--no-ff`) & Tag Milestone:**
+4. **Update Plan Progress & Commit Log:**
+   - For each change/stage, add a section to **Progress & Commit Log** below describing what was done, tests added, executable build status, and the exact commit SHA + commit message.
+5. **Rebase, Merge (`--no-ff`) & Tag Milestone:**
    ```powershell
    # Ensure linear history on the stage branch before merging
    git fetch origin
@@ -255,13 +258,35 @@ All SLS development uses `sls-dev` as the protected integration branch, while `m
    # Clean up merged stage branch
    git branch -d sls/stage-<N>-<slug>
    ```
-5. **Sync Upstream Between Stages:**
+6. **Sync Upstream Between Stages:**
    - Pull `upstream/main` into `main` and merge `main` into `sls-dev` **between** stages (before cutting the next `sls/stage-*` branch) to avoid mid-stage conflicts.
 
 ---
 
 ## Open Decisions Before Starting Stage 0
 
-1. **Crate naming:** Should `crates/sls-core` be named `solidcraft-sls-core` or `sls-core` in its `Cargo.toml`?
+1. **Crate naming:** Should `crates/sls-core` be named `solidcraft-sls-core` or `sls-core` in its `Cargo.toml`? *(Resolved in Stage 0: `solidcraft-sls-core`.)*
 2. **`pyroid-core` integration (Stage 2A):** Resolved source: `https://github.com/yuvalabou/pyroid` — prefer adding `pyroid-core` as a git/path dependency or porting `bvh.rs`, `edt.rs`, and `manifold.rs` directly into `crates/sls-core`?
 3. **`parry3d` addition:** Approve adding `parry3d` (MIT/Apache-2.0) to workspace dependencies for Stage 1C ray-picking / Stage 2B exact verification?
+
+---
+
+## Progress & Commit Log
+
+### Stage 0 — Workspace, Toolchain & Layering Hygiene (`sls/stage-0-hygiene`)
+- **What Was Done:**
+  - Created `crates/sls-core` (`solidcraft-sls-core`, `Class::Shared`) with strict lints (`#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]`) and `SlsError` via `thiserror = "2"`.
+  - Created `apps/solidcraft-sls` (`solidcraft-sls`, `Class::Exempt`) linking `solidcraft-sls-core`.
+  - Registered `("sls-core", Class::Shared)` and `("sls", Class::Exempt)` in `xtask/src/layers.rs::TABLE` (`short_name()` strips the `solidcraft-` prefix).
+  - Created `attribution/pending/sls.md` table header for future SLS asset provenance.
+- **Tests Added & Run:**
+  - `solidcraft-sls-core`: `tests::error_displays_message` (`1 passed; 0 failed`)
+  - `solidcraft-sls`: `tests::links_sls_core_error` (`1 passed; 0 failed`)
+- **Verification & Executable Build (`+stable`, Rust `1.100.0`):**
+  - `cargo +stable xtask layers` — passed (0 violations)
+  - `cargo +stable xtask ui-containers` — passed
+  - `cargo +stable xtask assets` — passed (1105 files, all attributed)
+  - `cargo +stable build -p solidcraft-sls` — built `target/debug/solidcraft-sls.exe` cleanly
+- **Commits on `sls/stage-0-hygiene`:**
+  - `51539ea9f` — `chore(sls): scaffold solidcraft-sls-core and solidcraft-sls (Stage 0)`
+
