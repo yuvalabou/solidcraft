@@ -68,6 +68,9 @@ pub fn build_gpu_scene(
 
     let mut per_part: HashMap<PartId, InstancedMesh> = HashMap::new();
     for inst in &job.instances {
+        if !job.is_instance_visible(inst) {
+            continue;
+        }
         let Some(proto) = job.part(inst.part_id) else {
             continue;
         };
@@ -281,6 +284,9 @@ pub fn pick_instance(
 
     let mut best: Option<(f32, InstanceId)> = None;
     for inst in &job.instances {
+        if !job.is_instance_visible(inst) {
+            continue;
+        }
         let Some(proto) = job.part(inst.part_id) else {
             continue;
         };
