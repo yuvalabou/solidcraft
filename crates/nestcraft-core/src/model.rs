@@ -25,6 +25,21 @@ pub struct PartId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InstanceId(pub u32);
 
+/// Unique identifier for a hierarchical project tree group in a [`BuildJob`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GroupId(pub u32);
+
+/// Named group organizing part instances in the project tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartGroup {
+    /// Group identifier.
+    pub id: GroupId,
+    /// Display name.
+    pub name: String,
+    /// Whether all instances in this group are hidden from the viewport.
+    pub hidden: bool,
+}
+
 /// Per-part orientation constraint for nesting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RotationConstraint {
@@ -71,6 +86,26 @@ impl MachineProfile {
     pub fn volume_mm3(&self) -> f64 {
         let [x, y, z] = self.size_mm();
         f64::from(x) * f64::from(y) * f64::from(z)
+    }
+
+    /// Construct a validated custom machine profile with dimensions clamped to at least `10 mm`.
+    pub fn custom(name: impl Into<String>, size_mm: [f32; 3]) -> Self {
+        let raw_name = name.into();
+        let trimmed = raw_name.trim();
+        let clean_name = if trimmed.is_empty() {
+            "Custom Chamber".to_owned()
+        } else {
+            trimmed.to_owned()
+        };
+        let clamped = [
+            size_mm[0].clamp(10.0, 2000.0),
+            size_mm[1].clamp(10.0, 2000.0),
+            size_mm[2].clamp(10.0, 2000.0),
+        ];
+        Self::Custom {
+            name: clean_name,
+            size_mm: clamped,
+        }
     }
 }
 
@@ -212,6 +247,10 @@ pub struct PartInstance {
     pub constraint: RotationConstraint,
     /// Whether manual lock prevents the packer from moving this instance.
     pub locked: bool,
+    /// Whether this instance is hidden in the 3D viewport.
+    pub hidden: bool,
+    /// Optional project-tree group membership.
+    pub group_id: Option<GroupId>,
 }
 
 impl PartInstance {
@@ -301,8 +340,11 @@ pub struct BuildJob {
     pub parts: Vec<PartPrototype>,
     /// Placed part instances.
     pub instances: Vec<PartInstance>,
+    /// Project-tree groups.
+    pub groups: Vec<PartGroup>,
     next_part_id: u32,
     next_instance_id: u32,
+    next_group_id: u32,
 }
 
 impl Default for BuildJob {
@@ -320,8 +362,10 @@ impl BuildJob {
             wall_margin_mm: 5.0,
             parts: Vec::new(),
             instances: Vec::new(),
+            groups: Vec::new(),
             next_part_id: 1,
             next_instance_id: 1,
+            next_group_id: 1,
         }
     }
 
@@ -369,6 +413,8 @@ impl BuildJob {
             transform,
             constraint,
             locked: false,
+            hidden: false,
+            group_id: None,
         });
         Ok(id)
     }
@@ -501,6 +547,85 @@ impl BuildJob {
         inst.transform[1][3] += wy * 0.5 - cy;
         true
     }
+
+    /// Create a new project-tree group and return its [`GroupId`].
+    pub fn create_group(&mut self, name: impl Into<String>) -> GroupId {
+        let id = GroupId(self.next_group_id);
+        self.next_group_id += 1;
+        let raw = name.into();
+        let trimmed = raw.trim();
+        let clean = if trimmed.is_empty() {
+            format!("Group {}", id.0)
+        } else {
+            trimmed.to_owned()
+        };
+        self.groups.push(PartGroup {
+            id,
+            name: clean,
+            hidden: false,
+        });
+        id
+    }
+
+    /// Remove a group by [`GroupId`], ungrouping any member instances.
+    pub fn remove_group(&mut self, id: GroupId) -> bool {
+        let before = self.groups.len();
+        self.groups.retain(|g| g.id != id);
+        if self.groups.len() == before {
+            return false;
+        }
+        for inst in &mut self.instances {
+            if inst.group_id == Some(id) {
+                inst.group_id = None;
+            }
+        }
+        true
+    }
+
+    /// Toggle or set a group's `hidden` flag.
+    pub fn set_group_hidden(&mut self, id: GroupId, hidden: bool) -> bool {
+        let Some(group) = self.groups.iter_mut().find(|g| g.id == id) else {
+            return false;
+        };
+        group.hidden = hidden;
+        true
+    }
+
+    /// Assign or clear an instance's group membership.
+    pub fn set_instance_group(&mut self, inst_id: InstanceId, group_id: Option<GroupId>) -> bool {
+        if let Some(gid) = group_id
+            && !self.groups.iter().any(|g| g.id == gid)
+        {
+            return false;
+        }
+        let Some(inst) = self.instances.iter_mut().find(|i| i.id == inst_id) else {
+            return false;
+        };
+        inst.group_id = group_id;
+        true
+    }
+
+    /// Set `hidden` on a single instance.
+    pub fn set_instance_hidden(&mut self, inst_id: InstanceId, hidden: bool) -> bool {
+        let Some(inst) = self.instances.iter_mut().find(|i| i.id == inst_id) else {
+            return false;
+        };
+        inst.hidden = hidden;
+        true
+    }
+
+    /// Return `true` when `inst` is visible (neither itself nor its group is hidden).
+    pub fn is_instance_visible(&self, inst: &PartInstance) -> bool {
+        if inst.hidden {
+            return false;
+        }
+        if let Some(gid) = inst.group_id
+            && let Some(group) = self.groups.iter().find(|g| g.id == gid)
+        {
+            return !group.hidden;
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -576,6 +701,8 @@ mod tests {
             transform: tf,
             constraint: RotationConstraint::Free,
             locked: false,
+            hidden: false,
+            group_id: None,
         };
         let out = inst.euler_deg();
         for k in 0..3 {
@@ -600,5 +727,31 @@ mod tests {
         assert!(wb[0][2].abs() < 1e-4, "bottom Z should be 0, got {}", wb[0][2]);
         assert!(((wb[0][0] + wb[1][0]) * 0.5 - wx * 0.5).abs() < 1e-3);
         assert!(((wb[0][1] + wb[1][1]) * 0.5 - wy * 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn groups_visibility_and_custom_machine_work() {
+        let cube = unit_cube();
+        let mut job = BuildJob::new(MachineProfile::custom("  My SLS  ", [5.0, 250.0, 300.0]));
+        assert_eq!(job.machine.name(), "My SLS");
+        assert_eq!(job.machine.size_mm(), [10.0, 250.0, 300.0]);
+
+        let pid = job.add_part("cube", cube);
+        let iid = job.add_instance_centered_on_floor(pid).expect("placed");
+        let gid = job.create_group("Batch A");
+        assert!(job.set_instance_group(iid, Some(gid)));
+        assert!(job.is_instance_visible(&job.instances[0]));
+
+        assert!(job.set_group_hidden(gid, true));
+        assert!(!job.is_instance_visible(&job.instances[0]));
+
+        assert!(job.set_group_hidden(gid, false));
+        assert!(job.set_instance_hidden(iid, true));
+        assert!(!job.is_instance_visible(&job.instances[0]));
+
+        assert!(job.set_instance_hidden(iid, false));
+        assert!(job.remove_group(gid));
+        assert_eq!(job.instances[0].group_id, None);
+        assert!(job.is_instance_visible(&job.instances[0]));
     }
 }
