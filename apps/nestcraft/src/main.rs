@@ -18,8 +18,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use nestcraft_core::io::{stl, threemf};
+use nestcraft_core::manifold::{self, ManifoldReport};
 use nestcraft_core::model::{
-    BuildJob, InstanceId, MachineProfile, PartId, RotationConstraint, TriMesh,
+    BuildJob, GroupId, InstanceId, MachineProfile, PartId, RotationConstraint, TriMesh,
     transform_from_translation_euler_deg,
 };
 use solidcraft_theme::Tokens;
@@ -97,12 +98,20 @@ struct NestCraftApp {
     drag_state: Option<DragState>,
     compass_drag: CompassDrag,
     sample_counter: u32,
+    manifold_cache: HashMap<PartId, ManifoldReport>,
+    custom_platform_open: bool,
+    custom_name: String,
+    custom_size_mm: [f32; 3],
+    custom_wall_margin: f32,
+    new_group_name: String,
 }
 
 impl NestCraftApp {
     fn new() -> Self {
         let job = BuildJob::new(MachineProfile::FormigaP110);
         let camera = viewport::default_camera(&job.machine);
+        let custom_size_mm = job.machine.size_mm();
+        let custom_wall_margin = job.wall_margin_mm;
         Self {
             job,
             selected: None,
@@ -119,7 +128,57 @@ impl NestCraftApp {
             drag_state: None,
             compass_drag: CompassDrag::default(),
             sample_counter: 0,
+            manifold_cache: HashMap::new(),
+            custom_platform_open: false,
+            custom_name: "Custom SLS".to_owned(),
+            custom_size_mm,
+            custom_wall_margin,
+            new_group_name: String::new(),
         }
+    }
+
+    fn manifold_report(&mut self, part_id: PartId) -> Option<ManifoldReport> {
+        if let Some(report) = self.manifold_cache.get(&part_id) {
+            return Some(report.clone());
+        }
+        let mesh = self.job.part(part_id)?.mesh.clone();
+        let report = manifold::analyze_mesh(&mesh);
+        self.manifold_cache.insert(part_id, report.clone());
+        Some(report)
+    }
+
+    fn open_custom_platform_dialog(&mut self) {
+        self.custom_name = match &self.job.machine {
+            MachineProfile::Custom { name, .. } => name.clone(),
+            _ => "Custom SLS".to_owned(),
+        };
+        self.custom_size_mm = self.job.machine.size_mm();
+        self.custom_wall_margin = self.job.wall_margin_mm;
+        self.custom_platform_open = true;
+    }
+
+    fn split_part_shells(&mut self, part_id: PartId) {
+        let Some(proto) = self.job.part(part_id).cloned() else {
+            return;
+        };
+        let Ok(shells) = manifold::split_shells(&proto.mesh) else {
+            self.status = format!("Failed to split shells for '{}'", proto.name);
+            return;
+        };
+        if shells.len() <= 1 {
+            self.status = format!("'{}' has only 1 shell.", proto.name);
+            return;
+        }
+        let count = shells.len();
+        for (idx, shell_mesh) in shells.into_iter().enumerate() {
+            let name = format!("{} [Shell {}]", proto.name, idx + 1);
+            let pid = self.job.add_part(name, Arc::new(shell_mesh));
+            if let Ok(iid) = self.job.add_instance_centered_on_floor(pid) {
+                self.select_instance(Some(iid));
+            }
+        }
+        self.mark_dirty();
+        self.status = format!("Split '{}' into {count} shell parts.", proto.name);
     }
 
     fn select_instance(&mut self, id: Option<InstanceId>) {
@@ -249,14 +308,14 @@ impl NestCraftApp {
                             let mut machine_idx = match self.job.machine {
                                 MachineProfile::FormigaP110 => 0,
                                 MachineProfile::FarsoonHT403P => 1,
-                                MachineProfile::Custom { .. } => 0,
+                                MachineProfile::Custom { .. } => 2,
                             };
                             let machine_changed = ui
                                 .push_id("machine_seg", |ui| {
                                     segmented(
                                         ui,
                                         &mut machine_idx,
-                                        &["Formiga P110", "Farsoon HT403P"],
+                                        &["Formiga P110", "Farsoon HT403P", "Custom"],
                                         Segments {
                                             dense: true,
                                             intrinsic: true,
@@ -267,13 +326,28 @@ impl NestCraftApp {
                                 })
                                 .inner;
                             if machine_changed {
-                                self.job.machine = if machine_idx == 1 {
-                                    MachineProfile::FarsoonHT403P
-                                } else {
-                                    MachineProfile::FormigaP110
-                                };
-                                self.camera = viewport::default_camera(&self.job.machine);
-                                self.mark_dirty();
+                                match machine_idx {
+                                    0 => {
+                                        self.job.machine = MachineProfile::FormigaP110;
+                                        self.camera = viewport::default_camera(&self.job.machine);
+                                        self.mark_dirty();
+                                    }
+                                    1 => {
+                                        self.job.machine = MachineProfile::FarsoonHT403P;
+                                        self.camera = viewport::default_camera(&self.job.machine);
+                                        self.mark_dirty();
+                                    }
+                                    _ => {
+                                        self.open_custom_platform_dialog();
+                                    }
+                                }
+                            }
+                            if matches!(self.job.machine, MachineProfile::Custom { .. })
+                                && button(ui, "Edit...", Button::Small)
+                                    .backing_on_hover_text("Edit custom build chamber dimensions")
+                                    .clicked()
+                            {
+                                self.open_custom_platform_dialog();
                             }
 
                             StageBar::separator(ui);
@@ -397,21 +471,166 @@ impl NestCraftApp {
     }
 
     fn draw_parts_browser(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
+        enum TreeAction {
+            Select(InstanceId),
+            ToggleInstanceHidden(InstanceId, bool),
+            ToggleInstanceLock(InstanceId, bool),
+            Duplicate(InstanceId),
+            DropToFloor(InstanceId),
+            CenterXy(InstanceId),
+            DeleteInstance(InstanceId),
+            SetInstanceGroup(InstanceId, Option<GroupId>),
+            ToggleGroupHidden(GroupId, bool),
+            DeleteGroup(GroupId),
+            SplitShells(PartId),
+        }
+
+        // Pre-populate manifold reports so the immutable render pass can read them cleanly.
+        let part_ids: Vec<PartId> = self.job.parts.iter().map(|p| p.id).collect();
+        for pid in part_ids {
+            let _ = self.manifold_report(pid);
+        }
+
         let side_c = Container::new(ctx, Surface::Panel);
-        let left_panel = side_c.edge("sls_parts_tree", Edge::Left).default_size(265.0);
+        let left_panel = side_c.edge("sls_parts_tree", Edge::Left).default_size(275.0);
         side_c.show_edge(ui, left_panel, side_c.edge_frame(t.panel), |ui| {
             scope(ui, |ui| {
                 ui.label(egui::RichText::new("Build Parts Browser").strong().size(t.font_heading).color(t.form_ink));
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_group_name)
+                            .desired_width(140.0)
+                            .hint_text("New group name..."),
+                    );
+                    if button(ui, "+ Group", Button::Small)
+                        .backing_on_hover_text("Create a project tree group (assigns selected part if any)")
+                        .clicked()
+                    {
+                        let name = std::mem::take(&mut self.new_group_name);
+                        let gid = self.job.create_group(name);
+                        if let Some(sel) = self.selected {
+                            let _ = self.job.set_instance_group(sel, Some(gid));
+                        }
+                        self.status = "Created project group".to_owned();
+                    }
+                });
                 ui.separator();
-                let mut picked_id: Option<InstanceId> = None;
+
+                let mut actions: Vec<TreeAction> = Vec::new();
                 let footer_h = solidcraft_ui_kit::catalog_footer_height(ui) + t.space_8;
                 let scroll_h = (ui.available_height() - footer_h).max(60.0);
                 egui::ScrollArea::vertical()
                     .max_height(scroll_h)
                     .show(ui, |ui| {
-                        if self.job.parts.is_empty() {
+                        if self.job.parts.is_empty() && self.job.groups.is_empty() {
                             status_line(ui, "No parts loaded yet. Import an STL/3MF or add a Sample Part.", StatusTone::Dim);
                         }
+
+                        if !self.job.groups.is_empty() {
+                            for group in &self.job.groups {
+                                let members: Vec<_> = self
+                                    .job
+                                    .instances
+                                    .iter()
+                                    .filter(|i| i.group_id == Some(group.id))
+                                    .collect();
+                                let header_resp = ui.horizontal(|ui| {
+                                    let vis_label = if group.hidden { "○" } else { "●" };
+                                    if ui
+                                        .small_button(vis_label)
+                                        .on_hover_text(if group.hidden { "Show group" } else { "Hide group" })
+                                        .clicked()
+                                    {
+                                        actions.push(TreeAction::ToggleGroupHidden(group.id, !group.hidden));
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(format!("{} ({})", group.name, members.len()))
+                                            .strong()
+                                            .color(if group.hidden { t.form_dim } else { t.form_ink }),
+                                    );
+                                });
+                                header_resp.response.context_menu(|ui| {
+                                    if ui.button(if group.hidden { "Show Group" } else { "Hide Group" }).clicked() {
+                                        actions.push(TreeAction::ToggleGroupHidden(group.id, !group.hidden));
+                                        ui.close();
+                                    }
+                                    if ui.button("Ungroup & Delete").clicked() {
+                                        actions.push(TreeAction::DeleteGroup(group.id));
+                                        ui.close();
+                                    }
+                                });
+                                ui.indent(("grp", group.id.0), |ui| {
+                                    if members.is_empty() {
+                                        status_line(ui, "Empty group (right-click a part to assign)", StatusTone::Dim);
+                                    }
+                                    for inst in members {
+                                        let part_name = self
+                                            .job
+                                            .part(inst.part_id)
+                                            .map(|p| p.name.as_str())
+                                            .unwrap_or("Part");
+                                        let is_sel = self.selected == Some(inst.id);
+                                        let in_bounds = self.job.is_instance_in_bounds(inst.id);
+                                        let mut tag = String::new();
+                                        if inst.hidden {
+                                            tag.push_str(" [HIDDEN]");
+                                        }
+                                        if inst.locked {
+                                            tag.push_str(" [LOCK]");
+                                        }
+                                        if !in_bounds {
+                                            tag.push_str(" [OOB]");
+                                        }
+                                        let label = format!("#{} {part_name}{tag}", inst.id.0);
+                                        let rich = if !in_bounds {
+                                            egui::RichText::new(label).color(t.form_error)
+                                        } else if inst.hidden || group.hidden {
+                                            egui::RichText::new(label).color(t.form_dim)
+                                        } else {
+                                            egui::RichText::new(label)
+                                        };
+                                        let resp = ui.selectable_label(is_sel, rich);
+                                        if resp.clicked() {
+                                            actions.push(TreeAction::Select(inst.id));
+                                        }
+                                        resp.context_menu(|ui| {
+                                            if ui.button("Duplicate").clicked() {
+                                                actions.push(TreeAction::Duplicate(inst.id));
+                                                ui.close();
+                                            }
+                                            if ui.button("Drop to Z = 0").clicked() {
+                                                actions.push(TreeAction::DropToFloor(inst.id));
+                                                ui.close();
+                                            }
+                                            if ui.button("Center XY").clicked() {
+                                                actions.push(TreeAction::CenterXy(inst.id));
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                            if ui.button(if inst.hidden { "Show" } else { "Hide" }).clicked() {
+                                                actions.push(TreeAction::ToggleInstanceHidden(inst.id, !inst.hidden));
+                                                ui.close();
+                                            }
+                                            if ui.button(if inst.locked { "Unlock" } else { "Lock" }).clicked() {
+                                                actions.push(TreeAction::ToggleInstanceLock(inst.id, !inst.locked));
+                                                ui.close();
+                                            }
+                                            if ui.button("Remove from Group").clicked() {
+                                                actions.push(TreeAction::SetInstanceGroup(inst.id, None));
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                            if ui.button("Delete").clicked() {
+                                                actions.push(TreeAction::DeleteInstance(inst.id));
+                                                ui.close();
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                            ui.separator();
+                        }
+
                         for proto in &self.job.parts {
                             let count = self.job.instance_count_for_part(proto.id);
                             let [dx, dy, dz] = proto.mesh.dimensions();
@@ -425,16 +644,66 @@ impl NestCraftApp {
                                     .size(t.font_small)
                                     .color(t.form_dim),
                                 );
+
+                                if let Some(report) = self.manifold_cache.get(&proto.id) {
+                                    let is_ok = report.is_watertight_manifold();
+                                    let summary = if is_ok {
+                                        format!("Analysis: Watertight ({} shell)", report.shell_count)
+                                    } else {
+                                        format!(
+                                            "Analysis: {} open · {} flipped · {} shells",
+                                            report.boundary_edge_count,
+                                            report.flipped_edge_count,
+                                            report.shell_count
+                                        )
+                                    };
+                                    ui.push_id(("analysis", proto.id.0), |ui| {
+                                        ui.collapsing(
+                                            egui::RichText::new(summary)
+                                                .size(t.font_small)
+                                                .color(if is_ok { t.form_dim } else { t.form_error }),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "Shells: {} | Boundary: {} | Non-manifold: {} | Flipped: {} | Degenerate: {}",
+                                                        report.shell_count,
+                                                        report.boundary_edge_count,
+                                                        report.non_manifold_edge_count,
+                                                        report.flipped_edge_count,
+                                                        report.degenerate_triangle_count,
+                                                    ))
+                                                    .size(t.font_small)
+                                                    .color(t.form_dim),
+                                                );
+                                                if report.shell_count > 1
+                                                    && button(ui, "Split Shells to Parts", Button::Small).clicked()
+                                                {
+                                                    actions.push(TreeAction::SplitShells(proto.id));
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+
                                 for inst in self.job.instances.iter().filter(|i| i.part_id == proto.id) {
                                     let is_sel = self.selected == Some(inst.id);
                                     let in_bounds = self.job.is_instance_in_bounds(inst.id);
+                                    let visible = self.job.is_instance_visible(inst);
                                     let pos = inst.translation();
                                     let mut tag = String::new();
+                                    if inst.hidden {
+                                        tag.push_str(" [HIDDEN]");
+                                    }
                                     if inst.locked {
                                         tag.push_str(" [LOCK]");
                                     }
                                     if !in_bounds {
                                         tag.push_str(" [OOB]");
+                                    }
+                                    if let Some(gid) = inst.group_id
+                                        && let Some(g) = self.job.groups.iter().find(|g| g.id == gid)
+                                    {
+                                        tag.push_str(&format!(" [{}]", g.name));
                                     }
                                     let label = format!(
                                         "#{:<3} ({:.1}, {:.1}, {:.1}){tag}",
@@ -442,26 +711,217 @@ impl NestCraftApp {
                                     );
                                     let rich = if !in_bounds {
                                         egui::RichText::new(label).color(t.form_error)
+                                    } else if !visible {
+                                        egui::RichText::new(label).color(t.form_dim)
                                     } else {
                                         egui::RichText::new(label)
                                     };
-                                    if ui.selectable_label(is_sel, rich).clicked() {
-                                        picked_id = Some(inst.id);
+                                    let row_resp = ui.horizontal(|ui| {
+                                        if ui
+                                            .small_button(if inst.hidden { "○" } else { "●" })
+                                            .on_hover_text(if inst.hidden { "Show instance" } else { "Hide instance" })
+                                            .clicked()
+                                        {
+                                            actions.push(TreeAction::ToggleInstanceHidden(inst.id, !inst.hidden));
+                                        }
+                                        ui.selectable_label(is_sel, rich)
+                                    });
+                                    let resp = row_resp.inner;
+                                    if resp.clicked() {
+                                        actions.push(TreeAction::Select(inst.id));
                                     }
+                                    resp.context_menu(|ui| {
+                                        if ui.button("Duplicate").clicked() {
+                                            actions.push(TreeAction::Duplicate(inst.id));
+                                            ui.close();
+                                        }
+                                        if ui.button("Drop to Z = 0").clicked() {
+                                            actions.push(TreeAction::DropToFloor(inst.id));
+                                            ui.close();
+                                        }
+                                        if ui.button("Center XY").clicked() {
+                                            actions.push(TreeAction::CenterXy(inst.id));
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        if ui.button(if inst.hidden { "Show" } else { "Hide" }).clicked() {
+                                            actions.push(TreeAction::ToggleInstanceHidden(inst.id, !inst.hidden));
+                                            ui.close();
+                                        }
+                                        if ui.button(if inst.locked { "Unlock" } else { "Lock" }).clicked() {
+                                            actions.push(TreeAction::ToggleInstanceLock(inst.id, !inst.locked));
+                                            ui.close();
+                                        }
+                                        if !self.job.groups.is_empty() {
+                                            ui.menu_button("Assign to Group", |ui| {
+                                                for g in &self.job.groups {
+                                                    if ui.button(&g.name).clicked() {
+                                                        actions.push(TreeAction::SetInstanceGroup(inst.id, Some(g.id)));
+                                                        ui.close();
+                                                    }
+                                                }
+                                                if inst.group_id.is_some() && ui.button("None (Ungroup)").clicked() {
+                                                    actions.push(TreeAction::SetInstanceGroup(inst.id, None));
+                                                    ui.close();
+                                                }
+                                            });
+                                        }
+                                        ui.separator();
+                                        if ui.button("Delete").clicked() {
+                                            actions.push(TreeAction::DeleteInstance(inst.id));
+                                            ui.close();
+                                        }
+                                    });
                                 }
                             });
                         }
                     });
-                if let Some(id) = picked_id {
-                    self.select_instance(Some(id));
+
+                for action in actions {
+                    match action {
+                        TreeAction::Select(id) => self.select_instance(Some(id)),
+                        TreeAction::ToggleInstanceHidden(id, hidden) => {
+                            if self.job.set_instance_hidden(id, hidden) {
+                                self.mark_dirty();
+                                self.status = if hidden {
+                                    format!("Hidden instance #{}", id.0)
+                                } else {
+                                    format!("Shown instance #{}", id.0)
+                                };
+                            }
+                        }
+                        TreeAction::ToggleInstanceLock(id, locked) => {
+                            if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == id) {
+                                inst.locked = locked;
+                            }
+                        }
+                        TreeAction::Duplicate(id) => {
+                            if let Ok(ids) = self.job.duplicate_instance(id, 1) {
+                                self.select_instance(ids.last().copied());
+                                self.mark_dirty();
+                                self.status = format!("Duplicated #{}", id.0);
+                            }
+                        }
+                        TreeAction::DropToFloor(id) => {
+                            if self.job.drop_instance_to_floor(id) {
+                                self.mark_dirty();
+                                self.status = format!("Dropped #{} to Z = 0", id.0);
+                            }
+                        }
+                        TreeAction::CenterXy(id) => {
+                            if self.job.center_instance_xy(id) {
+                                self.mark_dirty();
+                                self.status = format!("Centered #{} in XY", id.0);
+                            }
+                        }
+                        TreeAction::DeleteInstance(id) => {
+                            if self.job.remove_instance(id) {
+                                self.euler_edit.remove(&id);
+                                if self.selected == Some(id) {
+                                    self.selected = None;
+                                }
+                                self.mark_dirty();
+                                self.status = format!("Deleted instance #{}", id.0);
+                            }
+                        }
+                        TreeAction::SetInstanceGroup(id, gid) => {
+                            let _ = self.job.set_instance_group(id, gid);
+                            self.mark_dirty();
+                        }
+                        TreeAction::ToggleGroupHidden(gid, hidden) => {
+                            if self.job.set_group_hidden(gid, hidden) {
+                                self.mark_dirty();
+                            }
+                        }
+                        TreeAction::DeleteGroup(gid) => {
+                            if self.job.remove_group(gid) {
+                                self.mark_dirty();
+                                self.status = "Removed project group".to_owned();
+                            }
+                        }
+                        TreeAction::SplitShells(pid) => {
+                            self.split_part_shells(pid);
+                        }
+                    }
                 }
+
                 catalog_footer_with_tip(
                     ui,
                     &format!("{} instance(s) in chamber", self.job.instances.len()),
-                    "Click an instance row or mesh in the 3D viewport to inspect or drag (Shift+drag for Z).",
+                    "Right-click an instance for actions; Shift+drag in viewport for Z.",
                 );
             });
         });
+    }
+
+    fn draw_custom_platform_modal(&mut self, ctx: &egui::Context) {
+        if !self.custom_platform_open {
+            return;
+        }
+        let mut open = self.custom_platform_open;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Custom Machine Platform")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                row(ui, "Profile Name", |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.custom_name).desired_width(180.0));
+                });
+                row(ui, "Width X", |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.custom_size_mm[0])
+                            .range(10.0..=2000.0)
+                            .speed(1.0)
+                            .suffix(" mm"),
+                    );
+                });
+                row(ui, "Depth Y", |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.custom_size_mm[1])
+                            .range(10.0..=2000.0)
+                            .speed(1.0)
+                            .suffix(" mm"),
+                    );
+                });
+                row(ui, "Height Z", |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.custom_size_mm[2])
+                            .range(10.0..=2000.0)
+                            .speed(1.0)
+                            .suffix(" mm"),
+                    );
+                });
+                row(ui, "Wall Margin", |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.custom_wall_margin)
+                            .range(0.0..=50.0)
+                            .speed(0.5)
+                            .suffix(" mm"),
+                    );
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if button(ui, "Apply", Button::Primary).clicked() {
+                        apply = true;
+                    }
+                    if button(ui, "Cancel", Button::Small).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if apply {
+            self.job.machine = MachineProfile::custom(&self.custom_name, self.custom_size_mm);
+            self.job.wall_margin_mm = self.custom_wall_margin;
+            self.camera = viewport::default_camera(&self.job.machine);
+            self.mark_dirty();
+            self.status = format!("Applied custom platform '{}'", self.job.machine.name());
+            self.custom_platform_open = false;
+        } else if cancel || !open {
+            self.custom_platform_open = false;
+        }
     }
 
     fn draw_inspector(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
@@ -862,6 +1322,7 @@ impl eframe::App for NestCraftApp {
         self.draw_parts_browser(ui, &ctx, &t);
         self.draw_inspector(ui, &ctx, &t);
         self.draw_viewport(ui, &ctx, &t);
+        self.draw_custom_platform_modal(&ctx);
     }
 }
 
