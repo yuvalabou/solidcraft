@@ -27,19 +27,19 @@ Related docs: [`docs/sls-nesting-plan.md`](sls-nesting-plan.md) · [`docs/sls-ne
 
 | Ref          | NestCraft Feature                                   |       Rank       |   Status   | Implementation Target                     |
 | :----------- | :-------------------------------------------------- | :--------------: | :---------: | :---------------------------------------- |
-| `1.1–1.2` | Watertight / closedness check (open boundary edges) | **`P0`** | `Planned` | `crates/nestcraft-core/src/manifold.rs` |
-| `1.3`      | Consistent triangle orientation / winding check     | **`P0`** | `Planned` | `crates/nestcraft-core/src/manifold.rs` |
+| `1.1–1.2` | Watertight / closedness check (open boundary edges) | **`P0`** |  `Done`   | `crates/nestcraft-core/src/manifold.rs` |
+| `1.3`      | Consistent triangle orientation / winding check     | **`P0`** |  `Done`   | `crates/nestcraft-core/src/manifold.rs` |
 | `1.4`      | Self-intersection detection & highlighting          | **`P1`** | `Planned` | `crates/nestcraft-core/src/manifold.rs` |
 
 ### §2. Workspace, Project Tree & Build Platform
 
 | Ref               | NestCraft Feature                                                                                             |       Rank       |   Status   | Implementation Target                                                                |
 | :---------------- | :------------------------------------------------------------------------------------------------------------ | :--------------: | :---------: | :----------------------------------------------------------------------------------- |
-| `2.1, 5.7`      | Hierarchical Project Tree (groups, hide/show, part IDs `#1..#N`, repair/analysis child nodes, context menu) | **`P0`** | `Partial` | `apps/nestcraft` (prototype grouping done; groups/visibility/context menu pending) |
+| `2.1, 5.7`      | Hierarchical Project Tree (groups, hide/show, part IDs `#1..#N`, repair/analysis child nodes, context menu) | **`P0`** |  `Done`   | `apps/nestcraft` (groups, visibility, analysis child nodes, split shells, context menu) |
 | `2.2, 4.1–4.3` | 3D Viewport (perspective/ortho, floor grid, origin triad, wall-margin zone, 3D View Compass)                  | **`P0`** |  `Done`  | `apps/nestcraft/src/viewport.rs`                                                   |
-| `2.4, 5.9`      | Machine Platform presets (Formiga P110, Farsoon HT403P) + Custom Platform editor                              | **`P0`** | `Partial` | `crates/nestcraft-core/src/model.rs` (presets done; custom dialog pending)         |
+| `2.4, 5.9`      | Machine Platform presets (Formiga P110, Farsoon HT403P) + Custom Platform editor                              | **`P0`** |  `Done`   | `crates/nestcraft-core/src/model.rs` + `apps/nestcraft`                              |
 | `2.5`           | File formats: Binary/ASCII STL & Production 3MF/STL (read/write)                                              | **`P0`** |  `Done`  | `crates/nestcraft-core/src/io/{stl,threemf}.rs`                                    |
-| `2.6`           | Keyboard shortcuts (view presets, transform, duplicate, pack, collision check)                                | **`P1`** | `Planned` | `apps/nestcraft`                                                                   |
+| `2.6`           | Keyboard shortcuts (view presets, transform, duplicate, pack, collision check)                                | **`P1`** | `Partial` | `apps/nestcraft` (view/transform/nudge/dup/del/hide/lock done; pack & collision pending) |
 
 ### §3. Project Management, Reporting & Export
 
@@ -47,7 +47,7 @@ Related docs: [`docs/sls-nesting-plan.md`](sls-nesting-plan.md) · [`docs/sls-ne
 | :--------------- | :--------------------------------------------------------------------------------------- | :--------------: | :---------: | :------------------------------------------------------------------------------------------------ |
 | `3.1–3.2.2`   | Project lifecycle & multi-part STL/3MF import                                            | **`P0`** | `Partial` | `apps/nestcraft` (single-file picker done; multi-file/folder + project `.nestc` save pending) |
 | `3.2.3`        | File Preview Browser (dimensions, triangle count, thumbnail before import)               | **`P2`** | `Planned` | `apps/nestcraft`                                                                                |
-| `3.2.4, 6.2.4` | Split multi-shell STLs into separate parts                                               | **`P1`** | `Planned` | `crates/nestcraft-core/src/manifold.rs`                                                         |
+| `3.2.4, 6.2.4` | Split multi-shell STLs into separate parts                                               | **`P1`** |  `Done`   | `crates/nestcraft-core/src/manifold.rs` + `apps/nestcraft`                                        |
 | `3.2.5`        | Build Report Sheets (`.pdf` / `.csv` / HTML build summary with metrics & thumbnails) | **`P1`** | `Planned` | `crates/nestcraft-core` + `apps/nestcraft`                                                    |
 | `3.3`          | Export build job to 3MF & export individual/merged parts to STL                          | **`P0`** | `Partial` | `crates/nestcraft-core/src/io/` (3MF export done; STL writer pending)                           |
 | `3.4`          | High-resolution viewport screenshot capture                                              | **`P2`** | `Planned` | `apps/nestcraft`                                                                                |

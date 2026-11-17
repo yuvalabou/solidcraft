@@ -219,6 +219,168 @@ impl NestCraftApp {
         }
     }
 
+    fn duplicate_selected(&mut self) {
+        let Some(sel) = self.selected else {
+            return;
+        };
+        let count = self.dup_count.max(1);
+        if let Ok(ids) = self.job.duplicate_instance(sel, count) {
+            let last = ids.last().copied();
+            self.select_instance(last);
+            self.status = format!("Duplicated {count} instance(s)");
+        }
+    }
+
+    fn delete_selected(&mut self) {
+        let Some(sel) = self.selected else {
+            return;
+        };
+        if self.job.remove_instance(sel) {
+            self.euler_edit.remove(&sel);
+            self.selected = None;
+            self.mark_dirty();
+            self.status = "Removed selected instance".to_owned();
+        }
+    }
+
+    fn nudge_selected(&mut self, delta: [f32; 3]) {
+        let Some(sel_id) = self.selected else {
+            return;
+        };
+        if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == sel_id) {
+            let mut pos = inst.translation();
+            pos[0] += delta[0];
+            pos[1] += delta[1];
+            pos[2] += delta[2];
+            inst.set_translation(pos);
+            self.mark_dirty();
+        }
+    }
+
+    fn toggle_selected_hidden(&mut self) {
+        let Some(sel_id) = self.selected else {
+            return;
+        };
+        let currently_hidden = self
+            .job
+            .instances
+            .iter()
+            .find(|i| i.id == sel_id)
+            .is_some_and(|i| i.hidden);
+        if self.job.set_instance_hidden(sel_id, !currently_hidden) {
+            self.mark_dirty();
+            self.status = if !currently_hidden {
+                format!("Hidden instance #{}", sel_id.0)
+            } else {
+                format!("Shown instance #{}", sel_id.0)
+            };
+        }
+    }
+
+    fn toggle_selected_locked(&mut self) {
+        let Some(sel_id) = self.selected else {
+            return;
+        };
+        if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == sel_id) {
+            inst.locked = !inst.locked;
+            self.status = if inst.locked {
+                format!("Locked instance #{}", sel_id.0)
+            } else {
+                format!("Unlocked instance #{}", sel_id.0)
+            };
+        }
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() || self.custom_platform_open {
+            return;
+        }
+        ctx.input(|i| {
+            let cmd = i.modifiers.command;
+            let shift = i.modifiers.shift;
+            let alt = i.modifiers.alt;
+
+            if cmd && i.key_pressed(egui::Key::D) {
+                self.duplicate_selected();
+                return;
+            }
+            if !cmd && !alt && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+                self.delete_selected();
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::Z)
+                && let Some(sel) = self.selected
+                && self.job.drop_instance_to_floor(sel)
+            {
+                self.mark_dirty();
+                self.status = "Dropped part to Z = 0".to_owned();
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::C)
+                && let Some(sel) = self.selected
+                && self.job.center_instance_xy(sel)
+            {
+                self.mark_dirty();
+                self.status = "Centered part in XY".to_owned();
+            }
+            if !cmd && i.key_pressed(egui::Key::R) {
+                let axis = if shift {
+                    0
+                } else if alt {
+                    1
+                } else {
+                    2
+                };
+                self.rotate_selected_90(axis);
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::H) {
+                self.toggle_selected_hidden();
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::L) {
+                self.toggle_selected_locked();
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::F) {
+                self.camera = viewport::default_camera(&self.job.machine);
+            }
+
+            let step = if shift {
+                10.0
+            } else if cmd {
+                0.1
+            } else {
+                1.0
+            };
+            if i.key_pressed(egui::Key::ArrowLeft) {
+                self.nudge_selected([-step, 0.0, 0.0]);
+            }
+            if i.key_pressed(egui::Key::ArrowRight) {
+                self.nudge_selected([step, 0.0, 0.0]);
+            }
+            if i.key_pressed(egui::Key::ArrowUp) {
+                self.nudge_selected([0.0, step, 0.0]);
+            }
+            if i.key_pressed(egui::Key::ArrowDown) {
+                self.nudge_selected([0.0, -step, 0.0]);
+            }
+            if i.key_pressed(egui::Key::PageUp) {
+                self.nudge_selected([0.0, 0.0, step]);
+            }
+            if i.key_pressed(egui::Key::PageDown) {
+                self.nudge_selected([0.0, 0.0, -step]);
+            }
+
+            if !cmd && !alt {
+                if i.key_pressed(egui::Key::Num1) {
+                    self.camera = self.camera.looking_from([0.0, -1.0, 0.0].into());
+                } else if i.key_pressed(egui::Key::Num3) {
+                    self.camera = self.camera.looking_from([1.0, 0.0, 0.0].into());
+                } else if i.key_pressed(egui::Key::Num7) {
+                    self.camera = self.camera.looking_from([0.0, 0.0, 1.0].into());
+                } else if i.key_pressed(egui::Key::Num0) {
+                    self.camera = viewport::default_camera(&self.job.machine);
+                }
+            }
+        });
+    }
+
     fn mark_dirty(&mut self) {
         self.scene_dirty = true;
     }
@@ -381,19 +543,13 @@ impl NestCraftApp {
                             ui.add(egui::DragValue::new(&mut self.dup_count).range(1..=200).prefix("×"))
                                 .backing_on_hover_text("Number of duplicate copies to place");
                             if icon_label_button(ui, "Duplicate", "sls_duplicate", self.selected.is_some(), false)
-                                .backing_on_hover_text("Duplicate selected instance N times")
+                                .backing_on_hover_text("Duplicate selected instance N times (Ctrl+D)")
                                 .clicked()
-                                && let Some(sel) = self.selected
                             {
-                                let count = self.dup_count.max(1);
-                                if let Ok(ids) = self.job.duplicate_instance(sel, count) {
-                                    let last = ids.last().copied();
-                                    self.select_instance(last);
-                                    self.status = format!("Duplicated {count} instance(s)");
-                                }
+                                self.duplicate_selected();
                             }
                             if icon_label_button(ui, "Drop Z=0", "sls_orient_lock", self.selected.is_some(), false)
-                                .backing_on_hover_text("Drop selected part to the build floor (Z = 0)")
+                                .backing_on_hover_text("Drop selected part to the build floor (Z)")
                                 .clicked()
                                 && let Some(sel) = self.selected
                                 && self.job.drop_instance_to_floor(sel)
@@ -402,15 +558,10 @@ impl NestCraftApp {
                                 self.status = "Dropped part to Z = 0".to_owned();
                             }
                             if icon_label_button(ui, "Delete", "delete", self.selected.is_some(), true)
-                                .backing_on_hover_text("Remove selected instance from build")
+                                .backing_on_hover_text("Remove selected instance from build (Del)")
                                 .clicked()
-                                && let Some(sel) = self.selected
-                                && self.job.remove_instance(sel)
                             {
-                                self.euler_edit.remove(&sel);
-                                self.selected = None;
-                                self.mark_dirty();
-                                self.status = "Removed selected instance".to_owned();
+                                self.delete_selected();
                             }
 
                             StageBar::separator(ui);
@@ -437,6 +588,14 @@ impl NestCraftApp {
                                 solidcraft_theme::apply(ctx);
                                 self.mark_dirty();
                             }
+                            let _ = button(ui, "?", Button::Small).backing_on_hover_text(
+                                "Shortcuts:\n\
+                                 Ctrl+D: Duplicate   |   Del: Delete\n\
+                                 R / Shift+R / Alt+R: Rotate +90° Z / X / Y\n\
+                                 Z: Drop Z=0   |   C: Center XY   |   H: Hide   |   L: Lock\n\
+                                 Arrows / PgUp/PgDn: Nudge 1 mm (Shift: 10 mm, Ctrl: 0.1 mm)\n\
+                                 1 / 3 / 7 / 0 / F: Front / Right / Top / Iso / Fit View",
+                            );
                         });
                     });
             });
@@ -1317,6 +1476,7 @@ impl eframe::App for NestCraftApp {
         solidcraft_theme::apply(&ctx);
         let t = Tokens::get();
 
+        self.handle_shortcuts(&ctx);
         self.draw_top_bar(ui, &ctx, &t);
         self.draw_bottom_bar(ui, &ctx, &t);
         self.draw_parts_browser(ui, &ctx, &t);
@@ -1379,5 +1539,29 @@ mod tests {
         assert!(!app.scene_dirty);
         assert!(app.job.drop_instance_to_floor(iid));
         assert!(app.job.is_instance_in_bounds(iid));
+    }
+
+    #[test]
+    fn shortcut_helpers_nudge_duplicate_hide_lock_and_delete() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        assert!(app.selected.is_some());
+        let before = app.job.instances[0].translation();
+        app.nudge_selected([5.0, -3.0, 2.0]);
+        let after = app.job.instances[0].translation();
+        assert!((after[0] - (before[0] + 5.0)).abs() < 1e-4);
+        assert!((after[1] - (before[1] - 3.0)).abs() < 1e-4);
+        assert!((after[2] - (before[2] + 2.0)).abs() < 1e-4);
+
+        app.toggle_selected_hidden();
+        assert!(app.job.instances[0].hidden);
+        app.toggle_selected_locked();
+        assert!(app.job.instances[0].locked);
+
+        app.dup_count = 2;
+        app.duplicate_selected();
+        assert_eq!(app.job.instances.len(), 3);
+        app.delete_selected();
+        assert_eq!(app.job.instances.len(), 2);
     }
 }
