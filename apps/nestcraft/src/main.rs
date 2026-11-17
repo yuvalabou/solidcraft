@@ -39,7 +39,8 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("NestCraft")
-            .with_inner_size([1280.0, 820.0]),
+            .with_inner_size([1280.0, 820.0])
+            .with_drag_and_drop(true),
         renderer: eframe::Renderer::Wgpu,
         depth_buffer: 0,
         stencil_buffer: 0,
@@ -385,11 +386,8 @@ impl NestCraftApp {
         self.scene_dirty = true;
     }
 
-    fn import_file(&mut self, path: &Path) {
-        let Ok(bytes) = std::fs::read(path) else {
-            self.status = format!("Failed to read {}", path.display());
-            return;
-        };
+    fn import_single_file(&mut self, path: &Path) -> Result<(usize, String), String> {
+        let bytes = std::fs::read(path).map_err(|_| format!("Failed to read {}", path.display()))?;
         let ext = path
             .extension()
             .and_then(|s| s.to_str())
@@ -397,38 +395,121 @@ impl NestCraftApp {
             .unwrap_or_default();
 
         if ext == "3mf" {
-            match threemf::read_threemf(&bytes) {
-                Ok(items) => {
-                    let count = items.len();
-                    for item in items {
-                        let pid = self.job.add_part(item.name, item.mesh);
-                        if let Ok(iid) = self.job.add_instance(pid, item.transform) {
-                            self.select_instance(Some(iid));
-                        }
-                    }
-                    self.status = format!("Imported {count} build item(s) from {}", path.display());
-                    self.mark_dirty();
+            let items = threemf::read_threemf(&bytes).map_err(|e| format!("3MF import error: {e}"))?;
+            let count = items.len();
+            for item in items {
+                let pid = self.job.add_part(item.name, item.mesh);
+                if let Ok(iid) = self.job.add_instance(pid, item.transform) {
+                    self.select_instance(Some(iid));
                 }
-                Err(e) => self.status = format!("3MF import error: {e}"),
             }
+            Ok((count, format!("Imported {count} build item(s) from {}", path.display())))
+        } else if ext == "stl" {
+            let mesh = stl::parse_stl(&bytes).map_err(|e| format!("STL import error: {e}"))?;
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("part")
+                .to_owned();
+            let pid = self.job.add_part(name.clone(), Arc::new(mesh));
+            if let Ok(iid) = self.job.add_instance_centered_on_floor(pid) {
+                self.select_instance(Some(iid));
+            }
+            Ok((1, format!("Imported '{name}'")))
         } else {
-            match stl::parse_stl(&bytes) {
-                Ok(mesh) => {
-                    let name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("part")
-                        .to_owned();
-                    let pid = self.job.add_part(name.clone(), Arc::new(mesh));
-                    if let Ok(iid) = self.job.add_instance_centered_on_floor(pid) {
-                        self.select_instance(Some(iid));
+            Err(format!("Unsupported file '{}' (expected .stl or .3mf)", path.display()))
+        }
+    }
+
+    fn import_files<P: AsRef<Path>>(&mut self, paths: &[P]) {
+        if paths.is_empty() {
+            return;
+        }
+        if paths.len() == 1 {
+            match self.import_single_file(paths[0].as_ref()) {
+                Ok((count, msg)) => {
+                    self.status = msg;
+                    if count > 0 {
+                        self.mark_dirty();
                     }
-                    self.status = format!("Imported '{name}'");
-                    self.mark_dirty();
                 }
-                Err(e) => self.status = format!("STL import error: {e}"),
+                Err(err) => self.status = err,
+            }
+            return;
+        }
+
+        let mut imported_files = 0usize;
+        let mut imported_items = 0usize;
+        let mut errors = Vec::new();
+
+        for path in paths {
+            match self.import_single_file(path.as_ref()) {
+                Ok((count, _)) => {
+                    imported_files += 1;
+                    imported_items += count;
+                }
+                Err(err) => errors.push(err),
             }
         }
+
+        if imported_items > 0 {
+            self.mark_dirty();
+        }
+        self.status = if errors.is_empty() {
+            format!("Imported {imported_items} item(s) from {imported_files} file(s)")
+        } else if imported_files > 0 {
+            format!(
+                "Imported {imported_items} item(s) from {imported_files} file(s); {} failed ({})",
+                errors.len(),
+                errors[0]
+            )
+        } else {
+            format!("Import failed for {} file(s): {}", errors.len(), errors[0])
+        };
+    }
+
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+        if dropped.is_empty() {
+            return;
+        }
+        let paths: Vec<std::path::PathBuf> = dropped
+            .into_iter()
+            .map(|f| f.path().to_path_buf())
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        self.import_files(&paths);
+    }
+
+    fn draw_drop_overlay(&self, ctx: &egui::Context, rect: egui::Rect, t: &Tokens) {
+        let hovered = ctx.input(|i| i.raw.hovered_files.len());
+        if hovered == 0 {
+            return;
+        }
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique("nestcraft_drop_overlay"),
+        ));
+        let fill = egui::Color32::from_rgba_unmultiplied(t.panel.r(), t.panel.g(), t.panel.b(), 210);
+        painter.rect_filled(rect, 0.0, fill);
+        painter.rect_stroke(
+            rect.shrink(12.0),
+            8.0,
+            egui::Stroke::new(2.0, t.form_ink),
+            egui::StrokeKind::Inside,
+        );
+        let label = if hovered == 1 {
+            "Drop STL or 3MF file to import".to_owned()
+        } else {
+            format!("Drop {hovered} STL or 3MF files to import")
+        };
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(t.font_heading + 4.0),
+            t.form_ink,
+        );
     }
 
     fn export_threemf_file(&mut self, path: &Path) {
@@ -514,13 +595,13 @@ impl NestCraftApp {
 
                             StageBar::separator(ui);
                             if icon_label_button(ui, "Import", "sls_import_mesh", true, false)
-                                .backing_on_hover_text("Import STL or 3MF mesh into the build chamber")
+                                .backing_on_hover_text("Import STL or 3MF meshes into the build chamber")
                                 .clicked()
-                                && let Some(path) = rfd::FileDialog::new()
+                                && let Some(paths) = rfd::FileDialog::new()
                                     .add_filter("3D Mesh", &["stl", "STL", "3mf", "3MF"])
-                                    .pick_file()
+                                    .pick_files()
                             {
-                                self.import_file(&path);
+                                self.import_files(&paths);
                             }
                             if icon_label_button(ui, "Sample Part", "mesh_body", true, false)
                                 .backing_on_hover_text("Insert a sample 30x20x25 mm bracket into the chamber")
@@ -1473,16 +1554,19 @@ impl NestCraftApp {
 impl eframe::App for NestCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let window_rect = ui.max_rect();
         solidcraft_theme::apply(&ctx);
         let t = Tokens::get();
 
         self.handle_shortcuts(&ctx);
+        self.handle_dropped_files(&ctx);
         self.draw_top_bar(ui, &ctx, &t);
         self.draw_bottom_bar(ui, &ctx, &t);
         self.draw_parts_browser(ui, &ctx, &t);
         self.draw_inspector(ui, &ctx, &t);
         self.draw_viewport(ui, &ctx, &t);
         self.draw_custom_platform_modal(&ctx);
+        self.draw_drop_overlay(&ctx, window_rect, &t);
     }
 }
 
@@ -1563,5 +1647,31 @@ mod tests {
         assert_eq!(app.job.instances.len(), 3);
         app.delete_selected();
         assert_eq!(app.job.instances.len(), 2);
+    }
+
+    #[test]
+    fn import_files_loads_multiple_stls_and_reports_partial_failures() {
+        let dir = std::env::temp_dir().join(format!("nestcraft_multi_import_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let ascii_stl = b"solid tri\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 10 0 0\nvertex 0 10 0\nendloop\nendfacet\nendsolid tri\n";
+        let stl_a = dir.join("part_a.stl");
+        let stl_b = dir.join("part_b.STL");
+        let bad = dir.join("notes.txt");
+        assert!(std::fs::write(&stl_a, ascii_stl).is_ok());
+        assert!(std::fs::write(&stl_b, ascii_stl).is_ok());
+        assert!(std::fs::write(&bad, b"not a mesh").is_ok());
+
+        let mut app = NestCraftApp::new();
+        app.scene_dirty = false;
+        app.import_files(&[&stl_a, &stl_b]);
+        assert_eq!(app.job.instances.len(), 2);
+        assert!(app.scene_dirty);
+        assert!(app.status.contains("Imported 2 item(s) from 2 file(s)"), "status: {}", app.status);
+
+        app.import_files(&[&stl_a, &bad]);
+        assert_eq!(app.job.instances.len(), 3);
+        assert!(app.status.contains("1 failed"), "status: {}", app.status);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
