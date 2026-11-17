@@ -3741,7 +3741,7 @@ dependencies = [
 
 [[package]]
 name = "nestcraft"
-version = "0.43.0"
+version = "0.44.0"
 dependencies = [
  "eframe",
  "egui",
@@ -3759,7 +3759,7 @@ dependencies = [
 
 [[package]]
 name = "nestcraft-core"
-version = "0.43.0"
+version = "0.44.0"
 dependencies = [
  "quick-xml",
  "thiserror 2.0.21",
