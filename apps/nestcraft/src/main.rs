@@ -32,12 +32,12 @@ use solidcraft_ui_kit::container::{BackingTooltipExt as _, Container, Edge, Surf
 use solidcraft_ui_kit::view_compass::{self, Compass, Drag as CompassDrag, ViewAction, ViewAxes};
 use solidcraft_ui_kit::{
     Button, Segments, StageBar, StatusTone, button, catalog_footer_with_tip, checkbox_row,
-    icon_label_button, row, scope, section, section_count, segmented, status_line, value_row,
+    icon_label_button, row, scope, section, segmented, status_line, value_row,
 };
 use solidcraft_viewport::vec::{Bounds, Vec3Ops as _};
 use solidcraft_viewport::{Camera, StandardView};
 use solidcraft_viewport_egui::{ViewportCallback, paint_background};
-use solidcraft_viewport_gpu::view::{Frame, GpuTarget, MovingLayer, SceneSlot, SharedTris};
+use solidcraft_viewport_gpu::view::{Frame, GpuScene, GpuTarget, MovingLayer, SceneSlot, SharedTris};
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -223,8 +223,11 @@ struct NestCraftApp {
     hl_slot: SceneSlot,
     empty_slot: SceneSlot,
     scene_key: u64,
+    hl_key: u64,
     moving_key: u64,
     moving_target: Option<viewport::DragExclude>,
+    align_face_target: Option<InstanceId>,
+    hovered_face: Option<(InstanceId, usize)>,
     scene_dirty: bool,
     status: String,
     euler_edit: HashMap<InstanceId, [f32; 3]>,
@@ -260,6 +263,8 @@ struct NestCraftApp {
     compass_drag: CompassDrag,
     sample_counter: u32,
     manifold_cache: HashMap<PartId, ManifoldReport>,
+    part_thumbs: HashMap<PartId, egui::TextureHandle>,
+    expanded_parts: HashSet<PartId>,
     active_machine_slot: usize,
     machine_presets: [MachinePresetConfig; 3],
     custom_platform_open: bool,
@@ -452,6 +457,94 @@ fn show_color_submenu(ui: &mut egui::Ui) -> Option<ColorMenuChoice> {
     choice
 }
 
+const THUMB_PX: usize = 20;
+
+fn render_part_thumbnail(mesh: &TriMesh) -> egui::ColorImage {
+    let mut rgba = vec![0_u8; THUMB_PX * THUMB_PX * 4];
+    if mesh.positions.is_empty() || mesh.indices.is_empty() {
+        return egui::ColorImage::from_rgba_unmultiplied([THUMB_PX, THUMB_PX], &rgba);
+    }
+    let right = [0.707_106_77_f32, -0.707_106_77, 0.0];
+    let up = [-0.408_248_3_f32, -0.408_248_3, 0.816_496_6];
+    let fwd = [0.577_350_26_f32, 0.577_350_26, 0.577_350_26];
+    let light = [0.35_f32, -0.25, 0.90];
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+    let mut min_u = f32::INFINITY;
+    let mut max_u = f32::NEG_INFINITY;
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    let p_step = (mesh.positions.len() / 2000).max(1);
+    for p in mesh.positions.iter().step_by(p_step) {
+        let u = dot(*p, right);
+        let v = dot(*p, up);
+        min_u = min_u.min(u);
+        max_u = max_u.max(u);
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+    }
+    let span = (max_u - min_u).max(max_v - min_v).max(1e-4);
+    let pad = 1.5_f32;
+    let usable = THUMB_PX as f32 - 2.0 * pad;
+    let scale = usable / span;
+    let cx = (min_u + max_u) * 0.5;
+    let cy = (min_v + max_v) * 0.5;
+    let half = THUMB_PX as f32 * 0.5;
+    let project = |p: [f32; 3]| -> [f32; 3] {
+        [
+            half + (dot(p, right) - cx) * scale,
+            half - (dot(p, up) - cy) * scale,
+            dot(p, fwd),
+        ]
+    };
+
+    let mut zbuf = [f32::NEG_INFINITY; THUMB_PX * THUMB_PX];
+    let t_step = (mesh.indices.len() / 500).max(1);
+    for (tri_i, tri) in mesh.indices.iter().enumerate().step_by(t_step) {
+        let Some(&p0) = mesh.positions.get(tri[0] as usize) else { continue };
+        let Some(&p1) = mesh.positions.get(tri[1] as usize) else { continue };
+        let Some(&p2) = mesh.positions.get(tri[2] as usize) else { continue };
+        let a = project(p0);
+        let b = project(p1);
+        let c = project(p2);
+        let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        if area.abs() < 1e-4 {
+            continue;
+        }
+        let inv_area = 1.0 / area;
+        let n = mesh.tri_normals.get(tri_i).copied().unwrap_or([0.0, 0.0, 1.0]);
+        let shade = (0.38 + 0.62 * dot(n, light).abs()).clamp(0.0, 1.0);
+        let lum = (shade * 255.0).round() as u8;
+
+        let x0 = (a[0].min(b[0]).min(c[0]).floor() as isize).clamp(0, THUMB_PX as isize - 1) as usize;
+        let x1 = (a[0].max(b[0]).max(c[0]).ceil() as isize).clamp(0, THUMB_PX as isize - 1) as usize;
+        let y0 = (a[1].min(b[1]).min(c[1]).floor() as isize).clamp(0, THUMB_PX as isize - 1) as usize;
+        let y1 = (a[1].max(b[1]).max(c[1]).ceil() as isize).clamp(0, THUMB_PX as isize - 1) as usize;
+        for py in y0..=y1 {
+            let fy = py as f32 + 0.5;
+            for px in x0..=x1 {
+                let fx = px as f32 + 0.5;
+                let w0 = ((b[0] - fx) * (c[1] - fy) - (b[1] - fy) * (c[0] - fx)) * inv_area;
+                let w1 = ((c[0] - fx) * (a[1] - fy) - (c[1] - fy) * (a[0] - fx)) * inv_area;
+                let w2 = 1.0 - w0 - w1;
+                if w0 >= -1e-3 && w1 >= -1e-3 && w2 >= -1e-3 {
+                    let z = w0 * a[2] + w1 * b[2] + w2 * c[2];
+                    let idx = py * THUMB_PX + px;
+                    if z > zbuf[idx] {
+                        zbuf[idx] = z;
+                        let off = idx * 4;
+                        rgba[off] = lum;
+                        rgba[off + 1] = lum;
+                        rgba[off + 2] = lum;
+                        rgba[off + 3] = 255;
+                    }
+                }
+            }
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([THUMB_PX, THUMB_PX], &rgba)
+}
+
 fn format_export_stl_stem(
     prefix: &str,
     part_name: &str,
@@ -601,8 +694,11 @@ impl NestCraftApp {
             hl_slot: Arc::new(Mutex::new(None)),
             empty_slot: Arc::new(Mutex::new(None)),
             scene_key: 1,
+            hl_key: 0,
             moving_key: 1,
             moving_target: None,
+            align_face_target: None,
+            hovered_face: None,
             scene_dirty: true,
             status: "Ready — import an STL/3MF or add a sample part.".to_owned(),
             euler_edit: HashMap::new(),
@@ -638,6 +734,8 @@ impl NestCraftApp {
             compass_drag: CompassDrag::default(),
             sample_counter: 0,
             manifold_cache: HashMap::new(),
+            part_thumbs: HashMap::new(),
+            expanded_parts: HashSet::new(),
             active_machine_slot: 0,
             machine_presets,
             custom_platform_open: false,
@@ -770,6 +868,47 @@ impl NestCraftApp {
         }
     }
 
+    fn group_selected_parts(&mut self, name: String) {
+        if self.selected_set.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let gid = self.job.create_group(name);
+        let sel_ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        let mut assigned = 0usize;
+        for sel in sel_ids {
+            if self.job.set_instance_group(sel, Some(gid)) {
+                assigned += 1;
+            }
+        }
+        self.mark_dirty();
+        self.status = format!("Grouped {assigned} part(s)");
+    }
+
+    fn ungroup_selected_parts(&mut self) {
+        let grouped_ids: Vec<InstanceId> = self
+            .job
+            .instances
+            .iter()
+            .filter(|i| self.selected_set.contains(&i.id) && i.group_id.is_some())
+            .map(|i| i.id)
+            .collect();
+        if grouped_ids.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let mut changed = 0usize;
+        for id in grouped_ids {
+            if self.job.set_instance_group(id, None) {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.mark_dirty();
+            self.status = format!("Ungrouped {changed} part(s)");
+        }
+    }
+
     fn select_instance(&mut self, id: Option<InstanceId>) {
         self.selected_set.clear();
         if let Some(iid) = id {
@@ -837,6 +976,10 @@ impl NestCraftApp {
     }
 
     fn rotate_selected_90(&mut self, axis: usize) {
+        self.rotate_selected_by(axis, 90.0);
+    }
+
+    fn rotate_selected_by(&mut self, axis: usize, deg: f32) {
         let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
         if ids.is_empty() {
             return;
@@ -845,7 +988,7 @@ impl NestCraftApp {
         for sel_id in ids {
             let new_euler = if let Some(inst) = self.job.instances.iter().find(|i| i.id == sel_id) {
                 let euler = self.euler_edit.entry(sel_id).or_insert_with(|| inst.euler_deg());
-                euler[axis] = (euler[axis] + 90.0).rem_euclid(360.0);
+                euler[axis] = (euler[axis] + deg).rem_euclid(360.0);
                 Some(*euler)
             } else {
                 None
@@ -943,6 +1086,7 @@ impl NestCraftApp {
         self.drag_state = None;
         self.drag_zone = None;
         self.moving_target = None;
+        self.clear_align_face_mode();
         self.below_zero_import_dialog.clear();
         self.mark_dirty();
     }
@@ -991,6 +1135,21 @@ impl NestCraftApp {
             let created = ids.len();
             self.status = format!("Duplicated {created} instance(s)");
         }
+    }
+
+    fn start_align_face_mode(&mut self, target: InstanceId) {
+        self.clear_align_face_mode();
+        self.align_face_target = Some(target);
+        self.status = "Align mode: hover a face to highlight and click to snap it to -Z (Esc to cancel)".to_owned();
+    }
+
+    fn clear_align_face_mode(&mut self) {
+        self.align_face_target = None;
+        self.hovered_face = None;
+        if let Ok(mut guard) = self.hl_slot.lock() {
+            *guard = Some(GpuScene::default());
+        }
+        self.hl_key = self.hl_key.wrapping_add(1).max(1);
     }
 
     fn delete_selected(&mut self) {
@@ -1309,25 +1468,48 @@ impl NestCraftApp {
                 self.open_move_dialog();
                 return;
             }
-            if !cmd && !alt && i.key_pressed(egui::Key::Escape) && (self.zoom_rect_mode || self.zoom_rect.is_some()) {
-                self.zoom_rect_mode = false;
-                self.zoom_rect = None;
-                self.status = "Cancelled zoom to selection".to_owned();
-                return;
+            if !cmd && !alt && i.key_pressed(egui::Key::Escape) {
+                if self.align_face_target.is_some() {
+                    self.clear_align_face_mode();
+                    self.status = "Cancelled face alignment".to_owned();
+                    return;
+                }
+                if self.zoom_rect_mode || self.zoom_rect.is_some() {
+                    self.zoom_rect_mode = false;
+                    self.zoom_rect = None;
+                    self.status = "Cancelled zoom to selection".to_owned();
+                    return;
+                }
             }
             if !cmd && !alt && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
                 self.delete_selected();
             }
-            if !cmd && !alt && i.key_pressed(egui::Key::Z)
-                && let Some(sel) = self.selected
-            {
-                self.push_undo();
-                if self.job.drop_instance_to_floor(sel) {
-                    self.mark_dirty();
-                    self.status = "Dropped part to Z = 0".to_owned();
-                } else {
-                    self.undo_stack.pop();
+            if cmd && !shift && !alt && i.key_pressed(egui::Key::ArrowDown) {
+                let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+                if !ids.is_empty() {
+                    self.push_undo();
+                    let mut dropped = false;
+                    for id in ids {
+                        dropped |= self.job.drop_instance_to_floor(id);
+                    }
+                    if dropped {
+                        self.mark_dirty();
+                        self.status = "Dropped selection to Min Z".to_owned();
+                    } else {
+                        self.undo_stack.pop();
+                    }
                 }
+                return;
+            }
+            let rot_step_45 = if shift { -45.0 } else { 45.0 };
+            if !cmd && !alt && i.key_pressed(egui::Key::X) {
+                self.rotate_selected_by(0, rot_step_45);
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::Y) {
+                self.rotate_selected_by(1, rot_step_45);
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::Z) {
+                self.rotate_selected_by(2, rot_step_45);
             }
             if !cmd && !alt && i.key_pressed(egui::Key::C)
                 && let Some(sel) = self.selected
@@ -1481,9 +1663,12 @@ impl NestCraftApp {
         self.drag_state = None;
         self.drag_zone = None;
         self.moving_target = None;
+        self.clear_align_face_mode();
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.manifold_cache.clear();
+        self.part_thumbs.clear();
+        self.expanded_parts.clear();
         self.camera = viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
         self.mark_dirty();
         self.status = format!("Opened bed {path_display}");
@@ -2083,6 +2268,23 @@ impl NestCraftApp {
                             {
                                 self.delete_selected();
                             }
+                            if icon_label_button(
+                                ui,
+                                "Align",
+                                "sls_orient_lock",
+                                self.selected.is_some(),
+                                self.align_face_target.is_some(),
+                            )
+                            .backing_on_hover_text("Select a face on the part to snap its normal to -Z (build floor)")
+                            .clicked()
+                                && let Some(sel) = self.selected
+                            {
+                                if self.align_face_target.is_some() {
+                                    self.clear_align_face_mode();
+                                } else {
+                                    self.start_align_face_mode(sel);
+                                }
+                            }
                             if icon_label_button(ui, "Shells to Parts", "mesh_body", !self.selected_set.is_empty(), false)
                                 .backing_on_hover_text("Split disconnected STL shells in selected part(s) into separate parts")
                                 .clicked()
@@ -2124,9 +2326,9 @@ impl NestCraftApp {
                             }
                             let _ = button(ui, "?", Button::Small).backing_on_hover_text(
                                 "Shortcuts:\n\
-                                 Ctrl+D: Duplicate   |   Del: Delete\n\
-                                 R / Shift+R / Alt+R: Rotate +90° Z / X / Y\n\
-                                 Z: Drop Z=0   |   C: Center XY   |   H: Hide   |   L: Lock\n\
+                                 Ctrl+D: Duplicate   |   Ctrl+Z / Ctrl+Y: Undo / Redo   |   Del: Delete\n\
+                                 X / Y / Z: Rotate +45° X / Y / Z (Shift: -45°)   |   R: +90° Z\n\
+                                 Ctrl+Down: Drop Z=0   |   C: Center XY   |   H: Hide   |   L: Lock\n\
                                  Arrows / PgUp/PgDn: Nudge 1 mm (Shift: 10 mm, Ctrl: 0.1 mm)\n\
                                  1 / 3 / 7 / 0 / F: Front / Right / Top / Iso / Fit View",
                             );
@@ -2341,6 +2543,27 @@ impl NestCraftApp {
         });
     }
 
+    fn ensure_part_thumbnails(&mut self, ctx: &egui::Context) {
+        let mut generated = 0usize;
+        for proto in &self.job.parts {
+            if self.part_thumbs.contains_key(&proto.id) {
+                continue;
+            }
+            let img = render_part_thumbnail(&proto.mesh);
+            let tex = ctx.load_texture(
+                format!("part_thumb_{}", proto.id.0),
+                img,
+                egui::TextureOptions::LINEAR,
+            );
+            self.part_thumbs.insert(proto.id, tex);
+            generated += 1;
+            if generated >= 16 {
+                ctx.request_repaint();
+                break;
+            }
+        }
+    }
+
     fn draw_parts_browser(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
         enum TreeAction {
             Select(InstanceId),
@@ -2357,18 +2580,23 @@ impl NestCraftApp {
             ExportParts(InstanceId),
             DeleteInstance(InstanceId),
             SetInstanceGroup(InstanceId, Option<GroupId>),
+            GroupSelected(InstanceId),
+            UngroupSelected(InstanceId),
             ToggleGroupHidden(GroupId, bool),
             DeleteGroup(GroupId),
+            RemoveEmptyGroups,
             SplitShells(PartId),
             ShellsToParts(InstanceId),
+            AlignFace(InstanceId),
             MergeSelected,
         }
 
-        // Pre-populate manifold reports so the immutable render pass can read them cleanly.
+        // Pre-populate manifold reports and tiny 20x20 thumbnails so the render pass reads them cleanly.
         let part_ids: Vec<PartId> = self.job.parts.iter().map(|p| p.id).collect();
         for pid in part_ids {
             let _ = self.manifold_report(pid);
         }
+        self.ensure_part_thumbnails(ctx);
 
         let side_c = Container::new(ctx, Surface::Panel);
         let left_panel = side_c.edge("sls_parts_tree", Edge::Left).default_size(275.0);
@@ -2386,12 +2614,27 @@ impl NestCraftApp {
                         .clicked()
                     {
                         let name = std::mem::take(&mut self.new_group_name);
-                        let gid = self.job.create_group(name);
-                        let sel_ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
-                        for sel in sel_ids {
-                            let _ = self.job.set_instance_group(sel, Some(gid));
+                        if self.selected_set.is_empty() {
+                            self.push_undo();
+                            self.job.create_group(name);
+                            self.status = "Created project group".to_owned();
+                        } else {
+                            self.group_selected_parts(name);
                         }
-                        self.status = "Created project group".to_owned();
+                    }
+                    let has_empty_groups = self
+                        .job
+                        .groups
+                        .iter()
+                        .any(|g| self.job.instances.iter().all(|i| i.group_id != Some(g.id)));
+                    if has_empty_groups
+                        && button(ui, "Clean", Button::Small)
+                            .backing_on_hover_text("Remove empty groups")
+                            .clicked()
+                    {
+                        self.push_undo();
+                        let removed = self.job.remove_empty_groups();
+                        self.status = format!("Removed {removed} empty group(s)");
                     }
                 });
                 ui.separator();
@@ -2400,6 +2643,7 @@ impl NestCraftApp {
                 let mut tree_order: Vec<InstanceId> = Vec::new();
                 let footer_h = solidcraft_ui_kit::catalog_footer_height(ui) + t.space_8;
                 let scroll_h = (ui.available_height() - footer_h).max(60.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
                 egui::ScrollArea::vertical()
                     .max_height(scroll_h)
                     .show(ui, |ui| {
@@ -2437,6 +2681,10 @@ impl NestCraftApp {
                                     }
                                     if ui.button("Ungroup & Delete").clicked() {
                                         actions.push(TreeAction::DeleteGroup(group.id));
+                                        ui.close();
+                                    }
+                                    if ui.button("Remove Empty Groups").clicked() {
+                                        actions.push(TreeAction::RemoveEmptyGroups);
                                         ui.close();
                                     }
                                 });
@@ -2535,12 +2783,20 @@ impl NestCraftApp {
                                                     }
                                                 }
                                             }
-                                            if ui.button("Remove from Group").clicked() {
-                                                actions.push(TreeAction::SetInstanceGroup(inst.id, None));
+                                            if ui.button("Group Selected").clicked() {
+                                                actions.push(TreeAction::GroupSelected(inst.id));
+                                                ui.close();
+                                            }
+                                            if ui.button("Ungroup").clicked() {
+                                                actions.push(TreeAction::UngroupSelected(inst.id));
                                                 ui.close();
                                             }
                                             ui.separator();
-                                            if ui.button("Shells to Parts").clicked() {
+                                            if icon_label_button(ui, "Align Face to Z", "sls_orient_lock", true, false).clicked() {
+                                        actions.push(TreeAction::AlignFace(inst.id));
+                                        ui.close();
+                                    }
+                                    if ui.button("Shells to Parts").clicked() {
                                                 actions.push(TreeAction::ShellsToParts(inst.id));
                                                 ui.close();
                                             }
@@ -2570,204 +2826,397 @@ impl NestCraftApp {
                             ui.separator();
                         }
 
+                        let mut toggle_expand: Option<PartId> = None;
                         for proto in &self.job.parts {
-                            let count = self.job.instance_count_for_part(proto.id);
+                            let instances: Vec<&nestcraft_core::model::PartInstance> = self
+                                .job
+                                .instances
+                                .iter()
+                                .filter(|i| i.part_id == proto.id && i.group_id.is_none())
+                                .collect();
+                            if instances.is_empty() {
+                                continue;
+                            }
+                            let count = instances.len();
                             let [dx, dy, dz] = proto.mesh.dimensions();
                             let tris = proto.mesh.indices.len();
                             let vol_cm3 = proto.mesh.volume_mm3 / 1000.0;
-                            section_count(ui, ("proto", proto.id.0), &proto.name, true, Some(count), |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{tris} tris · {dx:.1}×{dy:.1}×{dz:.1} mm · {vol_cm3:.2} cm³"
-                                    ))
-                                    .size(t.font_small)
-                                    .color(t.form_dim),
-                                );
+                            let report_info = self.manifold_cache.get(&proto.id).map(|report| {
+                                let ok = report.is_watertight_manifold();
+                                let line = if ok {
+                                    format!("Watertight ({} shell)", report.shell_count)
+                                } else {
+                                    format!(
+                                        "{} open · {} flipped · {} shells",
+                                        report.boundary_edge_count, report.flipped_edge_count, report.shell_count
+                                    )
+                                };
+                                (ok, report.shell_count > 1, line)
+                            });
+                            let tooltip = match &report_info {
+                                Some((_, _, summary)) => format!(
+                                    "{}\n{tris} tris · {dx:.1}×{dy:.1}×{dz:.1} mm · {vol_cm3:.2} cm³\n{summary}",
+                                    proto.name
+                                ),
+                                None => format!(
+                                    "{}\n{tris} tris · {dx:.1}×{dy:.1}×{dz:.1} mm · {vol_cm3:.2} cm³",
+                                    proto.name
+                                ),
+                            };
 
-                                if let Some(report) = self.manifold_cache.get(&proto.id) {
-                                    let is_ok = report.is_watertight_manifold();
-                                    let summary = if is_ok {
-                                        format!("Analysis: Watertight ({} shell)", report.shell_count)
-                                    } else {
-                                        format!(
-                                            "Analysis: {} open · {} flipped · {} shells",
-                                            report.boundary_edge_count,
-                                            report.flipped_edge_count,
-                                            report.shell_count
-                                        )
-                                    };
-                                    ui.push_id(("analysis", proto.id.0), |ui| {
-                                        ui.collapsing(
-                                            egui::RichText::new(summary)
-                                                .size(t.font_small)
-                                                .color(if is_ok { t.form_dim } else { t.form_error }),
-                                            |ui| {
-                                                ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "Shells: {} | Boundary: {} | Non-manifold: {} | Flipped: {} | Degenerate: {}",
-                                                        report.shell_count,
-                                                        report.boundary_edge_count,
-                                                        report.non_manifold_edge_count,
-                                                        report.flipped_edge_count,
-                                                        report.degenerate_triangle_count,
-                                                    ))
-                                                    .size(t.font_small)
-                                                    .color(t.form_dim),
-                                                );
-                                                if report.shell_count > 1
-                                                    && button(ui, "Split Shells to Parts", Button::Small).clicked()
-                                                {
-                                                    actions.push(TreeAction::SplitShells(proto.id));
-                                                }
-                                            },
-                                        );
-                                    });
+                            if count == 1 {
+                                let inst = instances[0];
+                                tree_order.push(inst.id);
+                                let is_sel = self.selected_set.contains(&inst.id);
+                                let above_floor = self.job.is_instance_above_floor(inst.id);
+                                let in_nbz = self.job.is_instance_in_no_build_zone(inst.id);
+                                let visible = self.job.is_instance_visible(inst);
+                                let mut tag = String::new();
+                                if inst.hidden {
+                                    tag.push_str(" [H]");
                                 }
-
-                                for inst in self.job.instances.iter().filter(|i| i.part_id == proto.id) {
-                                    tree_order.push(inst.id);
-                                    let is_sel = self.selected_set.contains(&inst.id);
-                                    let above_floor = self.job.is_instance_above_floor(inst.id);
-                                    let in_nbz = self.job.is_instance_in_no_build_zone(inst.id);
-                                    let visible = self.job.is_instance_visible(inst);
-                                    let pos = inst.translation();
-                                    let mut tag = String::new();
-                                    if inst.hidden {
-                                        tag.push_str(" [HIDDEN]");
-                                    }
-                                    if inst.locked {
-                                        tag.push_str(" [LOCK]");
-                                    }
-                                    if !above_floor {
-                                        tag.push_str(" [Z<0]");
-                                    }
-                                    if in_nbz {
-                                        tag.push_str(" [NBZ]");
-                                    }
-                                    if let Some(gid) = inst.group_id
-                                        && let Some(g) = self.job.groups.iter().find(|g| g.id == gid)
-                                    {
-                                        tag.push_str(&format!(" [{}]", g.name));
-                                    }
-                                    let label = format!(
-                                        "#{:<3} ({:.1}, {:.1}, {:.1}){tag}",
-                                        inst.id.0, pos[0], pos[1], pos[2]
-                                    );
-                                    let rich = if !above_floor || in_nbz {
-                                        egui::RichText::new(label).color(t.form_error)
-                                    } else if !visible {
-                                        egui::RichText::new(label).color(t.form_dim)
-                                    } else {
-                                        egui::RichText::new(label)
-                                    };
-                                    let row_resp = ui.horizontal(|ui| {
+                                if inst.transparent {
+                                    tag.push_str(" [50%]");
+                                }
+                                if inst.locked {
+                                    tag.push_str(" [L]");
+                                }
+                                if !above_floor {
+                                    tag.push_str(" [Z<0]");
+                                }
+                                if in_nbz {
+                                    tag.push_str(" [NBZ]");
+                                }
+                                if report_info.as_ref().is_some_and(|(ok, _, _)| !ok) {
+                                    tag.push_str(" [!]");
+                                }
+                                let label = format!("#{} {}{tag}", inst.id.0, proto.name);
+                                let rich = if !above_floor || in_nbz {
+                                    egui::RichText::new(label).size(t.font_small).color(t.form_error)
+                                } else if !visible {
+                                    egui::RichText::new(label).size(t.font_small).color(t.form_dim)
+                                } else {
+                                    egui::RichText::new(label).size(t.font_small)
+                                };
+                                let thumb_tint = if let Some([r, g, b]) = inst.color {
+                                    egui::Color32::from_rgb(r, g, b)
+                                } else if !visible {
+                                    t.form_dim
+                                } else {
+                                    t.form_ink
+                                };
+                                let resp = ui
+                                    .horizontal(|ui| {
                                         if ui
                                             .small_button(if inst.hidden { "○" } else { "●" })
-                                            .on_hover_text(if inst.hidden { "Show instance" } else { "Hide instance" })
+                                            .on_hover_text(if inst.hidden { "Show" } else { "Hide" })
                                             .clicked()
                                         {
                                             actions.push(TreeAction::ToggleInstanceHidden(inst.id, !inst.hidden));
+                                        }
+                                        if let Some(tex) = self.part_thumbs.get(&proto.id) {
+                                            ui.add(
+                                                egui::Image::new(tex)
+                                                    .fit_to_exact_size(egui::vec2(18.0, 18.0))
+                                                    .tint(thumb_tint),
+                                            );
                                         }
                                         ui.selectable_label(is_sel, rich)
-                                    });
-                                    let resp = row_resp.inner;
-                                    if resp.clicked() {
-                                        let mods = ui.input(|i| i.modifiers);
-                                        if mods.shift {
-                                            actions.push(TreeAction::SelectRange(inst.id));
-                                        } else if mods.command {
-                                            actions.push(TreeAction::ToggleSelect(inst.id));
-                                        } else {
-                                            actions.push(TreeAction::Select(inst.id));
-                                        }
+                                    })
+                                    .inner
+                                    .on_hover_text(&tooltip);
+                                if resp.clicked() {
+                                    let mods = ui.input(|i| i.modifiers);
+                                    if mods.shift {
+                                        actions.push(TreeAction::SelectRange(inst.id));
+                                    } else if mods.command {
+                                        actions.push(TreeAction::ToggleSelect(inst.id));
+                                    } else {
+                                        actions.push(TreeAction::Select(inst.id));
                                     }
-                                    resp.context_menu(|ui| {
-                                        if ui.button("Duplicate").clicked() {
-                                            actions.push(TreeAction::Duplicate(inst.id));
-                                            ui.close();
-                                        }
-                                        if ui.button("Drop to Z = 0").clicked() {
-                                            actions.push(TreeAction::DropToFloor(inst.id));
-                                            ui.close();
-                                        }
-                                        if ui.button("Center XY").clicked() {
-                                            actions.push(TreeAction::CenterXy(inst.id));
-                                            ui.close();
-                                        }
-                                        ui.separator();
-                                        if ui.button(if inst.hidden { "Show" } else { "Hide" }).clicked() {
-                                            actions.push(TreeAction::ToggleInstanceHidden(inst.id, !inst.hidden));
-                                            ui.close();
-                                        }
-                                        if ui
-                                            .button(if inst.transparent {
-                                                "Opaque"
-                                            } else {
-                                                "Transparent (50%)"
-                                            })
-                                            .clicked()
-                                        {
-                                            actions.push(TreeAction::ToggleInstanceTransparent(
-                                                inst.id,
-                                                !inst.transparent,
-                                            ));
-                                            ui.close();
-                                        }
-                                        if ui.button(if inst.locked { "Unlock" } else { "Lock" }).clicked() {
-                                            actions.push(TreeAction::ToggleInstanceLock(inst.id, !inst.locked));
-                                            ui.close();
-                                        }
-                                        if let Some(choice) = show_color_submenu(ui) {
-                                            match choice {
-                                                ColorMenuChoice::OpenPicker => {
-                                                    actions.push(TreeAction::PickColor(inst.id));
-                                                }
-                                                ColorMenuChoice::Set(c) => {
-                                                    actions.push(TreeAction::SetColor(inst.id, c));
-                                                }
+                                }
+                                resp.context_menu(|ui| {
+                                    if ui.button("Duplicate").clicked() {
+                                        actions.push(TreeAction::Duplicate(inst.id));
+                                        ui.close();
+                                    }
+                                    if ui.button("Drop to Z = 0").clicked() {
+                                        actions.push(TreeAction::DropToFloor(inst.id));
+                                        ui.close();
+                                    }
+                                    if ui.button("Center XY").clicked() {
+                                        actions.push(TreeAction::CenterXy(inst.id));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button(if inst.hidden { "Show" } else { "Hide" }).clicked() {
+                                        actions.push(TreeAction::ToggleInstanceHidden(inst.id, !inst.hidden));
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .button(if inst.transparent {
+                                            "Opaque"
+                                        } else {
+                                            "Transparent (50%)"
+                                        })
+                                        .clicked()
+                                    {
+                                        actions.push(TreeAction::ToggleInstanceTransparent(
+                                            inst.id,
+                                            !inst.transparent,
+                                        ));
+                                        ui.close();
+                                    }
+                                    if ui.button(if inst.locked { "Unlock" } else { "Lock" }).clicked() {
+                                        actions.push(TreeAction::ToggleInstanceLock(inst.id, !inst.locked));
+                                        ui.close();
+                                    }
+                                    if let Some(choice) = show_color_submenu(ui) {
+                                        match choice {
+                                            ColorMenuChoice::OpenPicker => {
+                                                actions.push(TreeAction::PickColor(inst.id));
+                                            }
+                                            ColorMenuChoice::Set(c) => {
+                                                actions.push(TreeAction::SetColor(inst.id, c));
                                             }
                                         }
-                                        if !self.job.groups.is_empty() {
-                                            ui.menu_button("Assign to Group", |ui| {
-                                                for g in &self.job.groups {
-                                                    if ui.button(&g.name).clicked() {
-                                                        actions.push(TreeAction::SetInstanceGroup(inst.id, Some(g.id)));
-                                                        ui.close();
-                                                    }
-                                                }
-                                                if inst.group_id.is_some() && ui.button("None (Ungroup)").clicked() {
-                                                    actions.push(TreeAction::SetInstanceGroup(inst.id, None));
+                                    }
+                                    if ui.button("Group Selected").clicked() {
+                                        actions.push(TreeAction::GroupSelected(inst.id));
+                                        ui.close();
+                                    }
+                                    if inst.group_id.is_some() && ui.button("Ungroup").clicked() {
+                                        actions.push(TreeAction::UngroupSelected(inst.id));
+                                        ui.close();
+                                    }
+                                    if !self.job.groups.is_empty() {
+                                        ui.menu_button("Assign to Group", |ui| {
+                                            for g in &self.job.groups {
+                                                if ui.button(&g.name).clicked() {
+                                                    actions.push(TreeAction::SetInstanceGroup(inst.id, Some(g.id)));
                                                     ui.close();
                                                 }
-                                            });
-                                        }
-                                        ui.separator();
-                                        if ui.button("Shells to Parts").clicked() {
-                                            actions.push(TreeAction::ShellsToParts(inst.id));
-                                            ui.close();
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                self.selected_set.len() >= 2,
-                                                egui::Button::new("Merge Selected Parts"),
-                                            )
-                                            .clicked()
-                                        {
-                                            actions.push(TreeAction::MergeSelected);
-                                            ui.close();
-                                        }
-                                        let export_count = if is_sel { self.selected_set.len() } else { 1 };
-                                        if ui.button(export_part_menu_label(export_count)).clicked() {
-                                            actions.push(TreeAction::ExportParts(inst.id));
-                                            ui.close();
-                                        }
-                                        if ui.button("Delete").clicked() {
-                                            actions.push(TreeAction::DeleteInstance(inst.id));
-                                            ui.close();
-                                        }
-                                    });
+                                            }
+                                            if inst.group_id.is_some() && ui.button("Ungroup").clicked() {
+                                                actions.push(TreeAction::SetInstanceGroup(inst.id, None));
+                                                ui.close();
+                                            }
+                                        });
+                                    }
+                                    ui.separator();
+                                    if icon_label_button(ui, "Align Face to Z", "sls_orient_lock", true, false).clicked() {
+                                        actions.push(TreeAction::AlignFace(inst.id));
+                                        ui.close();
+                                    }
+                                    if ui.button("Shells to Parts").clicked() {
+                                        actions.push(TreeAction::ShellsToParts(inst.id));
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            self.selected_set.len() >= 2,
+                                            egui::Button::new("Merge Selected Parts"),
+                                        )
+                                        .clicked()
+                                    {
+                                        actions.push(TreeAction::MergeSelected);
+                                        ui.close();
+                                    }
+                                    let export_count = if is_sel { self.selected_set.len() } else { 1 };
+                                    if ui.button(export_part_menu_label(export_count)).clicked() {
+                                        actions.push(TreeAction::ExportParts(inst.id));
+                                        ui.close();
+                                    }
+                                    if ui.button("Delete").clicked() {
+                                        actions.push(TreeAction::DeleteInstance(inst.id));
+                                        ui.close();
+                                    }
+                                });
+                                continue;
+                            }
+
+                            let expanded = self.expanded_parts.contains(&proto.id);
+                            let header_resp = ui.horizontal(|ui| {
+                                let arrow = if expanded { "▾" } else { "▸" };
+                                if ui.small_button(arrow).clicked() {
+                                    toggle_expand = Some(proto.id);
+                                }
+                                if let Some(tex) = self.part_thumbs.get(&proto.id) {
+                                    ui.add(
+                                        egui::Image::new(tex)
+                                            .fit_to_exact_size(egui::vec2(18.0, 18.0))
+                                            .tint(t.form_ink),
+                                    );
+                                }
+                                let title = format!("{} (×{count})", proto.name);
+                                let mut text = egui::RichText::new(title).strong().size(t.font_small);
+                                if report_info.as_ref().is_some_and(|(ok, _, _)| !ok) {
+                                    text = text.color(t.form_error);
+                                } else {
+                                    text = text.color(t.form_ink);
+                                }
+                                if ui.selectable_label(false, text).on_hover_text(&tooltip).clicked() {
+                                    toggle_expand = Some(proto.id);
+                                }
+                                if report_info.as_ref().is_some_and(|(_, multi_shell, _)| *multi_shell)
+                                    && ui.small_button("Split").on_hover_text("Split shells into parts").clicked()
+                                {
+                                    actions.push(TreeAction::SplitShells(proto.id));
                                 }
                             });
+                            let _ = header_resp;
+
+                            if expanded {
+                                ui.indent(("proto_insts", proto.id.0), |ui| {
+                                    for inst in instances {
+                                        tree_order.push(inst.id);
+                                        let is_sel = self.selected_set.contains(&inst.id);
+                                        let above_floor = self.job.is_instance_above_floor(inst.id);
+                                        let in_nbz = self.job.is_instance_in_no_build_zone(inst.id);
+                                        let visible = self.job.is_instance_visible(inst);
+                                        let pos = inst.translation();
+                                        let mut tag = String::new();
+                                        if inst.hidden {
+                                            tag.push_str(" [H]");
+                                        }
+                                        if inst.transparent {
+                                            tag.push_str(" [50%]");
+                                        }
+                                        if inst.locked {
+                                            tag.push_str(" [L]");
+                                        }
+                                        if !above_floor {
+                                            tag.push_str(" [Z<0]");
+                                        }
+                                        if in_nbz {
+                                            tag.push_str(" [NBZ]");
+                                        }
+                                        let label = format!("#{} ({:.0}, {:.0}, {:.0}){tag}", inst.id.0, pos[0], pos[1], pos[2]);
+                                        let rich = if !above_floor || in_nbz {
+                                            egui::RichText::new(label).size(t.font_small).color(t.form_error)
+                                        } else if !visible {
+                                            egui::RichText::new(label).size(t.font_small).color(t.form_dim)
+                                        } else {
+                                            egui::RichText::new(label).size(t.font_small)
+                                        };
+                                        let row_resp = ui.horizontal(|ui| {
+                                            if ui
+                                                .small_button(if inst.hidden { "○" } else { "●" })
+                                                .on_hover_text(if inst.hidden { "Show" } else { "Hide" })
+                                                .clicked()
+                                            {
+                                                actions.push(TreeAction::ToggleInstanceHidden(inst.id, !inst.hidden));
+                                            }
+                                            ui.selectable_label(is_sel, rich)
+                                        });
+                                        let resp = row_resp.inner;
+                                        if resp.clicked() {
+                                            let mods = ui.input(|i| i.modifiers);
+                                            if mods.shift {
+                                                actions.push(TreeAction::SelectRange(inst.id));
+                                            } else if mods.command {
+                                                actions.push(TreeAction::ToggleSelect(inst.id));
+                                            } else {
+                                                actions.push(TreeAction::Select(inst.id));
+                                            }
+                                        }
+                                        resp.context_menu(|ui| {
+                                            if ui.button("Duplicate").clicked() {
+                                                actions.push(TreeAction::Duplicate(inst.id));
+                                                ui.close();
+                                            }
+                                            if ui.button("Drop to Z = 0").clicked() {
+                                                actions.push(TreeAction::DropToFloor(inst.id));
+                                                ui.close();
+                                            }
+                                            if ui.button("Center XY").clicked() {
+                                                actions.push(TreeAction::CenterXy(inst.id));
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                            if ui.button(if inst.hidden { "Show" } else { "Hide" }).clicked() {
+                                                actions.push(TreeAction::ToggleInstanceHidden(inst.id, !inst.hidden));
+                                                ui.close();
+                                            }
+                                            if ui
+                                                .button(if inst.transparent {
+                                                    "Opaque"
+                                                } else {
+                                                    "Transparent (50%)"
+                                                })
+                                                .clicked()
+                                            {
+                                                actions.push(TreeAction::ToggleInstanceTransparent(
+                                                    inst.id,
+                                                    !inst.transparent,
+                                                ));
+                                                ui.close();
+                                            }
+                                            if ui.button(if inst.locked { "Unlock" } else { "Lock" }).clicked() {
+                                                actions.push(TreeAction::ToggleInstanceLock(inst.id, !inst.locked));
+                                                ui.close();
+                                            }
+                                            if let Some(choice) = show_color_submenu(ui) {
+                                                match choice {
+                                                    ColorMenuChoice::OpenPicker => {
+                                                        actions.push(TreeAction::PickColor(inst.id));
+                                                    }
+                                                    ColorMenuChoice::Set(c) => {
+                                                        actions.push(TreeAction::SetColor(inst.id, c));
+                                                    }
+                                                }
+                                            }
+                                            if !self.job.groups.is_empty() {
+                                                ui.menu_button("Assign to Group", |ui| {
+                                                    for g in &self.job.groups {
+                                                        if ui.button(&g.name).clicked() {
+                                                            actions.push(TreeAction::SetInstanceGroup(inst.id, Some(g.id)));
+                                                            ui.close();
+                                                        }
+                                                    }
+                                                    if inst.group_id.is_some() && ui.button("None (Ungroup)").clicked() {
+                                                        actions.push(TreeAction::SetInstanceGroup(inst.id, None));
+                                                        ui.close();
+                                                    }
+                                                });
+                                            }
+                                            ui.separator();
+                                            if icon_label_button(ui, "Align Face to Z", "sls_orient_lock", true, false).clicked() {
+                                        actions.push(TreeAction::AlignFace(inst.id));
+                                        ui.close();
+                                    }
+                                    if ui.button("Shells to Parts").clicked() {
+                                                actions.push(TreeAction::ShellsToParts(inst.id));
+                                                ui.close();
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    self.selected_set.len() >= 2,
+                                                    egui::Button::new("Merge Selected Parts"),
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.push(TreeAction::MergeSelected);
+                                                ui.close();
+                                            }
+                                            let export_count = if is_sel { self.selected_set.len() } else { 1 };
+                                            if ui.button(export_part_menu_label(export_count)).clicked() {
+                                                actions.push(TreeAction::ExportParts(inst.id));
+                                                ui.close();
+                                            }
+                                            if ui.button("Delete").clicked() {
+                                                actions.push(TreeAction::DeleteInstance(inst.id));
+                                                ui.close();
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                        }
+                        if let Some(pid) = toggle_expand
+                            && !self.expanded_parts.remove(&pid)
+                        {
+                            self.expanded_parts.insert(pid);
                         }
                     });
 
@@ -2781,7 +3230,10 @@ impl NestCraftApp {
                             | TreeAction::SetColor(_, _)
                             | TreeAction::PickColor(_)
                             | TreeAction::ShellsToParts(_)
+                            | TreeAction::AlignFace(_)
                             | TreeAction::MergeSelected
+                            | TreeAction::GroupSelected(_)
+                            | TreeAction::UngroupSelected(_)
                     ) {
                         self.push_undo();
                     }
@@ -2867,6 +3319,18 @@ impl NestCraftApp {
                             let _ = self.job.set_instance_group(id, gid);
                             self.mark_dirty();
                         }
+                        TreeAction::GroupSelected(id) => {
+                            if !self.selected_set.contains(&id) {
+                                self.select_instance(Some(id));
+                            }
+                            self.group_selected_parts(String::new());
+                        }
+                        TreeAction::UngroupSelected(id) => {
+                            if !self.selected_set.contains(&id) {
+                                self.select_instance(Some(id));
+                            }
+                            self.ungroup_selected_parts();
+                        }
                         TreeAction::ToggleGroupHidden(gid, hidden) => {
                             if self.job.set_group_hidden(gid, hidden) {
                                 self.mark_dirty();
@@ -2876,6 +3340,14 @@ impl NestCraftApp {
                             if self.job.remove_group(gid) {
                                 self.mark_dirty();
                                 self.status = "Removed project group".to_owned();
+                            }
+                        }
+                        TreeAction::RemoveEmptyGroups => {
+                            let removed = self.job.remove_empty_groups();
+                            if removed > 0 {
+                                self.status = format!("Removed {removed} empty group(s)");
+                            } else {
+                                self.undo_stack.pop();
                             }
                         }
                         TreeAction::SplitShells(pid) => {
@@ -2888,6 +3360,10 @@ impl NestCraftApp {
                                 vec![id]
                             };
                             self.shells_to_parts_for(ids);
+                        }
+                        TreeAction::AlignFace(id) => {
+                            self.select_instance(Some(id));
+                            self.start_align_face_mode(id);
                         }
                         TreeAction::MergeSelected => {
                             self.merge_selected_parts();
@@ -4138,17 +4614,53 @@ impl NestCraftApp {
             if !over_compass
                 && !over_view_bar
                 && self.compass_drag.at.is_none()
+                && self.align_face_target.is_some()
+                && let Some(pos) = resp.hover_pos()
+            {
+                if let Some(pick) = viewport::pick_face(&self.job, &self.camera, rect, pos, self.align_face_target) {
+                    if self.hovered_face != Some((pick.instance_id, pick.tri_index)) {
+                        let hl = viewport::build_face_highlight_scene(&pick, t);
+                        if let Ok(mut guard) = self.hl_slot.lock() {
+                            *guard = Some(hl);
+                        }
+                        self.hl_key = self.hl_key.wrapping_add(1).max(1);
+                        self.hovered_face = Some((pick.instance_id, pick.tri_index));
+                    }
+                } else if self.hovered_face.is_some() {
+                    if let Ok(mut guard) = self.hl_slot.lock() {
+                        *guard = Some(GpuScene::default());
+                    }
+                    self.hl_key = self.hl_key.wrapping_add(1).max(1);
+                    self.hovered_face = None;
+                }
+            }
+
+            if !over_compass
+                && !over_view_bar
+                && self.compass_drag.at.is_none()
                 && resp.clicked_by(egui::PointerButton::Primary)
                 && let Some(pos) = resp.interact_pointer_pos()
             {
                 self.viewport_ctx_menu = None;
-                let hit = viewport::pick_instance(&self.job, &self.camera, rect, pos);
-                if ui.input(|i| i.modifiers.command) {
-                    if let Some(iid) = hit {
-                        self.toggle_select_instance(iid);
+                if let Some(target_id) = self.align_face_target {
+                    if let Some(pick) = viewport::pick_face(&self.job, &self.camera, rect, pos, Some(target_id)) {
+                        self.push_undo();
+                        self.job.align_instance_face_to_neg_z(pick.instance_id, pick.local_normal);
+                        self.job.clamp_instance_above_floor(pick.instance_id);
+                        self.euler_edit.remove(&pick.instance_id);
+                        self.mark_dirty();
+                        self.clear_align_face_mode();
+                        self.status = "Aligned selected face to -Z".to_owned();
                     }
                 } else {
-                    self.select_instance(hit);
+                    let hit = viewport::pick_instance(&self.job, &self.camera, rect, pos);
+                    if ui.input(|i| i.modifiers.command) {
+                        if let Some(iid) = hit {
+                            self.toggle_select_instance(iid);
+                        }
+                    } else {
+                        self.select_instance(hit);
+                    }
                 }
             }
 
@@ -4179,10 +4691,20 @@ impl NestCraftApp {
                 let mut toggle_transparent = false;
                 let mut toggle_lock = false;
                 let mut color_choice: Option<ColorMenuChoice> = None;
+                let mut group_sel = false;
+                let mut ungroup_sel = false;
+                let mut assign_group: Option<GroupId> = None;
+                let mut align_face = false;
                 let mut shells_to_parts = false;
                 let mut merge_parts = false;
                 let mut export_sel = false;
                 let mut delete_sel = false;
+
+                let any_in_group = self
+                    .job
+                    .instances
+                    .iter()
+                    .any(|i| self.selected_set.contains(&i.id) && i.group_id.is_some());
 
                 let is_hidden = self
                     .selected
@@ -4206,7 +4728,7 @@ impl NestCraftApp {
                         open_dup = true;
                         ui.close();
                     }
-                    if ui.button("Drop to Min Z (Z)").clicked() {
+                    if ui.button("Drop to Min Z (Ctrl+Down)").clicked() {
                         drop_floor = true;
                         ui.close();
                     }
@@ -4241,7 +4763,29 @@ impl NestCraftApp {
                     if let Some(choice) = show_color_submenu(ui) {
                         color_choice = Some(choice);
                     }
+                    if ui.button("Group Selected").clicked() {
+                        group_sel = true;
+                        ui.close();
+                    }
+                    if any_in_group && ui.button("Ungroup").clicked() {
+                        ungroup_sel = true;
+                        ui.close();
+                    }
+                    if !self.job.groups.is_empty() {
+                        ui.menu_button("Assign to Group", |ui| {
+                            for g in &self.job.groups {
+                                if ui.button(&g.name).clicked() {
+                                    assign_group = Some(g.id);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
                     ui.separator();
+                    if icon_label_button(ui, "Align Face to Z", "sls_orient_lock", true, false).clicked() {
+                        align_face = true;
+                        ui.close();
+                    }
                     if ui.button("Shells to Parts").clicked() {
                         shells_to_parts = true;
                         ui.close();
@@ -4310,6 +4854,25 @@ impl NestCraftApp {
                         ColorMenuChoice::OpenPicker => self.open_color_picker(),
                         ColorMenuChoice::Set(c) => self.set_selected_color(c),
                     }
+                } else if group_sel {
+                    self.viewport_ctx_menu = None;
+                    self.group_selected_parts(String::new());
+                } else if ungroup_sel {
+                    self.viewport_ctx_menu = None;
+                    self.ungroup_selected_parts();
+                } else if let Some(gid) = assign_group {
+                    self.viewport_ctx_menu = None;
+                    self.push_undo();
+                    let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+                    for id in ids {
+                        let _ = self.job.set_instance_group(id, Some(gid));
+                    }
+                    self.mark_dirty();
+                } else if align_face {
+                    self.viewport_ctx_menu = None;
+                    if let Some(sel) = self.selected {
+                        self.start_align_face_mode(sel);
+                    }
                 } else if shells_to_parts {
                     self.viewport_ctx_menu = None;
                     let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
@@ -4349,7 +4912,7 @@ impl NestCraftApp {
                 slot: self.scene_slot.clone(),
                 sketch_key: 0,
                 sketch_slot: self.empty_slot.clone(),
-                hl_key: 0,
+                hl_key: self.hl_key,
                 hl_slot: self.hl_slot.clone(),
                 pv_key: 0,
                 pv_slot: self.empty_slot.clone(),
@@ -5086,5 +5649,65 @@ mod tests {
         assert!((cx - 110.0).abs() < 1e-3, "cx={cx}");
         assert!((cy - 60.0).abs() < 1e-3, "cy={cy}");
         assert!((cz - 20.0).abs() < 1e-3, "cz={cz}");
+
+        app.rotate_selected_by(0, 45.0);
+        let euler = app.job.instances[0].euler_deg();
+        assert!((euler[0] - 45.0).abs() < 1e-3);
+        assert!((euler[2] - 90.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn render_part_thumbnail_produces_shaded_20x20_image() {
+        let mesh = create_sample_bracket_mesh(0).expect("sample mesh");
+        let img = render_part_thumbnail(&mesh);
+        assert_eq!(img.size, [THUMB_PX, THUMB_PX]);
+        let opaque_pixels = img.pixels.iter().filter(|c| c.a() == 255).count();
+        assert!(opaque_pixels > 20 && opaque_pixels < THUMB_PX * THUMB_PX);
+    }
+
+    #[test]
+    fn group_and_ungroup_selected_parts_with_undo() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        let i1 = app.selected.expect("i1");
+        app.add_sample_part();
+        let i2 = app.selected.expect("i2");
+        app.select_instance(Some(i1));
+        app.toggle_select_instance(i2);
+
+        app.group_selected_parts("My Group".to_owned());
+        assert_eq!(app.job.groups.len(), 1);
+        assert!(app.job.instances.iter().all(|i| i.group_id.is_some()));
+
+        app.ungroup_selected_parts();
+        assert!(app.job.instances.iter().all(|i| i.group_id.is_none()));
+
+        assert!(app.undo());
+        assert!(app.job.instances.iter().all(|i| i.group_id.is_some()));
+        assert!(app.undo());
+        assert!(app.job.groups.is_empty());
+        assert!(app.job.instances.iter().all(|i| i.group_id.is_none()));
+
+        app.job.create_group("Empty 1");
+        app.job.create_group("Empty 2");
+        assert_eq!(app.job.remove_empty_groups(), 2);
+        assert!(app.job.groups.is_empty());
+    }
+
+    #[test]
+    fn align_instance_face_to_neg_z_rotates_top_face_downward() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        let iid = app.selected.expect("selected");
+        let bounds = app.job.part(app.job.instances[0].part_id).expect("part").mesh.bounds;
+        let top_before = app.job.instances[0].world_bounds(bounds)[1][2];
+
+        // Aligning +Z top face to -Z flips the part upside down by 180 deg.
+        assert!(app.job.align_instance_face_to_neg_z(iid, [0.0, 0.0, 1.0]));
+        let m = app.job.instances[0].transform;
+        let wn_z = m[2][2];
+        assert!((wn_z + 1.0).abs() < 1e-4, "expected -1.0, got {wn_z}");
+        let top_after = app.job.instances[0].world_bounds(bounds)[1][2];
+        assert!((top_before - top_after).abs() < 1e-3);
     }
 }

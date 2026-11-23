@@ -899,6 +899,14 @@ impl BuildJob {
         true
     }
 
+    /// Remove all groups that currently contain zero instances. Returns the number removed.
+    pub fn remove_empty_groups(&mut self) -> usize {
+        let used: std::collections::HashSet<GroupId> = self.instances.iter().filter_map(|i| i.group_id).collect();
+        let before = self.groups.len();
+        self.groups.retain(|g| used.contains(&g.id));
+        before - self.groups.len()
+    }
+
     /// Toggle or set a group's `hidden` flag.
     pub fn set_group_hidden(&mut self, id: GroupId, hidden: bool) -> bool {
         let Some(group) = self.groups.iter_mut().find(|g| g.id == id) else {
@@ -968,6 +976,74 @@ impl BuildJob {
         let center_before = transform_point(&inst.transform, local_center);
         let pos = inst.translation();
         inst.transform = transform_from_translation_euler_deg(pos, euler_deg);
+        let center_after = transform_point(&inst.transform, local_center);
+        inst.transform[0][3] += center_before[0] - center_after[0];
+        inst.transform[1][3] += center_before[1] - center_after[1];
+        inst.transform[2][3] += center_before[2] - center_after[2];
+        true
+    }
+
+    /// Rotate `inst_id` so the face with `local_normal` points along `-Z` (`[0, 0, -1]`),
+    /// keeping the instance's local bounding-box center fixed in world space.
+    pub fn align_instance_face_to_neg_z(&mut self, inst_id: InstanceId, local_normal: [f32; 3]) -> bool {
+        let Some(part_id) = self.instances.iter().find(|i| i.id == inst_id).map(|i| i.part_id) else {
+            return false;
+        };
+        let Some(bounds) = self.part(part_id).map(|p| p.mesh.bounds) else {
+            return false;
+        };
+        let local_center = [
+            (bounds[0][0] + bounds[1][0]) * 0.5,
+            (bounds[0][1] + bounds[1][1]) * 0.5,
+            (bounds[0][2] + bounds[1][2]) * 0.5,
+        ];
+        let Some(inst) = self.instances.iter_mut().find(|i| i.id == inst_id) else {
+            return false;
+        };
+        let m = &inst.transform;
+        let wx = m[0][0] * local_normal[0] + m[0][1] * local_normal[1] + m[0][2] * local_normal[2];
+        let wy = m[1][0] * local_normal[0] + m[1][1] * local_normal[1] + m[1][2] * local_normal[2];
+        let wz = m[2][0] * local_normal[0] + m[2][1] * local_normal[1] + m[2][2] * local_normal[2];
+        let len = (wx * wx + wy * wy + wz * wz).sqrt();
+        if len < 1e-6 {
+            return false;
+        }
+        let wn = [wx / len, wy / len, wz / len];
+        let target = [0.0_f32, 0.0, -1.0];
+        let c = wn[0] * target[0] + wn[1] * target[1] + wn[2] * target[2];
+
+        let q: [[f32; 3]; 3] = if c > 0.999_999 {
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        } else if c < -0.999_999 {
+            // 180 deg around X
+            [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]]
+        } else {
+            // Rodrigues rotation from wn to target: v = wn x target
+            let vx = wn[1] * target[2] - wn[2] * target[1];
+            let vy = wn[2] * target[0] - wn[0] * target[2];
+            let vz = wn[0] * target[1] - wn[1] * target[0];
+            let k = 1.0 / (1.0 + c);
+            [
+                [1.0 - (vy * vy + vz * vz) * k, vx * vy * k - vz, vx * vz * k + vy],
+                [vx * vy * k + vz, 1.0 - (vx * vx + vz * vz) * k, vy * vz * k - vx],
+                [vx * vz * k - vy, vy * vz * k + vx, 1.0 - (vx * vx + vy * vy) * k],
+            ]
+        };
+
+        let center_before = transform_point(&inst.transform, local_center);
+        let r_old = [
+            [m[0][0], m[0][1], m[0][2]],
+            [m[1][0], m[1][1], m[1][2]],
+            [m[2][0], m[2][1], m[2][2]],
+        ];
+        let mut next = IDENTITY_TRANSFORM;
+        for row in 0..3 {
+            for col in 0..3 {
+                next[row][col] =
+                    q[row][0] * r_old[0][col] + q[row][1] * r_old[1][col] + q[row][2] * r_old[2][col];
+            }
+        }
+        inst.transform = next;
         let center_after = transform_point(&inst.transform, local_center);
         inst.transform[0][3] += center_before[0] - center_after[0];
         inst.transform[1][3] += center_before[1] - center_after[1];

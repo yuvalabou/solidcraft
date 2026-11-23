@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use nestcraft_core::model::{Aabb, BedOrigin, BuildJob, InstanceId, MachineProfile, PartId, Transform3x4, TriMesh};
+use nestcraft_core::model::{
+    Aabb, BedOrigin, BuildJob, InstanceId, MachineProfile, PartId, Transform3x4, TriMesh, transform_point,
+};
 use solidcraft_theme::Tokens;
 use solidcraft_viewport::{Camera, StandardView, UpAxis};
 use solidcraft_viewport_gpu::view::{GpuScene, InstanceLook, InstancedMesh, Palette, PaletteIndex, SharedTris};
@@ -570,6 +572,112 @@ pub fn pick_instance(
         }
     }
     best.map(|(_, id)| id)
+}
+
+/// Result of picking a face (triangle + coplanar face) on a part instance.
+#[derive(Debug, Clone)]
+pub struct FacePick {
+    pub instance_id: InstanceId,
+    pub tri_index: usize,
+    pub local_normal: [f32; 3],
+    pub world_tris: Vec<[[f32; 3]; 3]>,
+    pub world_normal: [f32; 3],
+}
+
+/// Pick the closest triangle under `pointer` (optionally restricted to `filter_instance`)
+/// and collect coplanar triangles on that face for highlighting.
+pub fn pick_face(
+    job: &BuildJob,
+    cam: &Camera,
+    rect: egui::Rect,
+    pointer: egui::Pos2,
+    filter_instance: Option<InstanceId>,
+) -> Option<FacePick> {
+    let (ray_origin, ray_dir) = screen_ray(cam, rect, pointer)?;
+    let mut best: Option<(f32, InstanceId, usize)> = None;
+
+    for inst in &job.instances {
+        if filter_instance.is_some_and(|id| id != inst.id) || !job.is_instance_visible(inst) {
+            continue;
+        }
+        let Some(proto) = job.part(inst.part_id) else {
+            continue;
+        };
+        let wb = inst.world_bounds(proto.mesh.bounds);
+        if ray_aabb_intersect(ray_origin, ray_dir, wb).is_none() {
+            continue;
+        }
+        let (local_origin, local_dir) = inverse_transform_ray(&inst.transform, ray_origin, ray_dir);
+        for (tri_i, tri) in proto.mesh.indices.iter().enumerate() {
+            let a = proto.mesh.positions[tri[0] as usize];
+            let b = proto.mesh.positions[tri[1] as usize];
+            let c = proto.mesh.positions[tri[2] as usize];
+            if let Some(t) = ray_triangle_intersect(local_origin, local_dir, a, b, c)
+                && best.is_none_or(|(best_t, _, _)| t < best_t)
+            {
+                best = Some((t, inst.id, tri_i));
+            }
+        }
+    }
+
+    let (_, inst_id, hit_tri) = best?;
+    let inst = job.instances.iter().find(|i| i.id == inst_id)?;
+    let proto = job.part(inst.part_id)?;
+    let local_n = proto.mesh.tri_normals.get(hit_tri).copied().unwrap_or([0.0, 0.0, 1.0]);
+    let hit_v0 = proto.mesh.positions[proto.mesh.indices[hit_tri][0] as usize];
+    let hit_d = local_n[0] * hit_v0[0] + local_n[1] * hit_v0[1] + local_n[2] * hit_v0[2];
+
+    let mut world_tris = Vec::new();
+    for (tri_i, tri) in proto.mesh.indices.iter().enumerate() {
+        let n = proto.mesh.tri_normals.get(tri_i).copied().unwrap_or([0.0, 0.0, 1.0]);
+        let dot = n[0] * local_n[0] + n[1] * local_n[1] + n[2] * local_n[2];
+        if dot < 0.998 {
+            continue;
+        }
+        let v0 = proto.mesh.positions[tri[0] as usize];
+        let d = local_n[0] * v0[0] + local_n[1] * v0[1] + local_n[2] * v0[2];
+        if (d - hit_d).abs() > 0.05 {
+            continue;
+        }
+        world_tris.push([
+            transform_point(&inst.transform, v0),
+            transform_point(&inst.transform, proto.mesh.positions[tri[1] as usize]),
+            transform_point(&inst.transform, proto.mesh.positions[tri[2] as usize]),
+        ]);
+    }
+    if world_tris.is_empty() {
+        let tri = proto.mesh.indices[hit_tri];
+        world_tris.push([
+            transform_point(&inst.transform, proto.mesh.positions[tri[0] as usize]),
+            transform_point(&inst.transform, proto.mesh.positions[tri[1] as usize]),
+            transform_point(&inst.transform, proto.mesh.positions[tri[2] as usize]),
+        ]);
+    }
+    let m = &inst.transform;
+    let wn = [
+        m[0][0] * local_n[0] + m[0][1] * local_n[1] + m[0][2] * local_n[2],
+        m[1][0] * local_n[0] + m[1][1] * local_n[1] + m[1][2] * local_n[2],
+        m[2][0] * local_n[0] + m[2][1] * local_n[1] + m[2][2] * local_n[2],
+    ];
+    Some(FacePick {
+        instance_id: inst_id,
+        tri_index: hit_tri,
+        local_normal: local_n,
+        world_tris,
+        world_normal: wn,
+    })
+}
+
+/// Build a highlight [`GpuScene`] for `pick`'s coplanar triangles.
+pub fn build_face_highlight_scene(pick: &FacePick, tokens: &Tokens) -> GpuScene {
+    let mut scene = GpuScene::with_palette(Palette::default());
+    let col = scene.color([tokens.accent.r(), tokens.accent.g(), tokens.accent.b(), 180]);
+    for &[a, b, c] in &pick.world_tris {
+        scene.hover_face_tri(a, pick.world_normal, col);
+        scene.hover_face_tri(b, pick.world_normal, col);
+        scene.hover_face_tri(c, pick.world_normal, col);
+    }
+    scene
 }
 
 /// Return `true` when the screen-space pointer ray hits the visible [`NoBuildZone`] mesh.
