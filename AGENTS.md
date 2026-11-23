@@ -5,6 +5,12 @@ SolidCraft is a clean-room, pure-Rust parametric 3D CAD app (sketch solver, feat
 ## Start here
 Work: ROADMAP.md, "Where help is wanted most" in CONTRIBUTING.md, issues labelled `help wanted`, `good first issue`, `needs-triage`; architecture in `docs/architecture.md`.
 
+## NestCraft (`sls-dev` branch)
+This branch hosts NestCraft (`apps/nestcraft`, `crates/nestcraft-core`).
+Docs: `docs/sls-feature-matrix.md`, `docs/sls-nesting-migration.md`, `docs/sls-nesting-plan.md`.
+Sibling `ferroform` crates are available at "C:\Users\Degamim-I9\Desktop\SLS_wiki\raw\Software\ferroform" if needed.
+After every finished NestCraft task, run `cargo build -p nestcraft` alongside `cargo test -p nestcraft-core -p nestcraft`.
+
 ## Hard rules (what enforces each)
 - Integrations with other platforms need the maintainer's yes first: `.agents/skills/solidcraft-packaging/SKILL.md`.
 - Independent: never copy another product's code, icons, text or templates; never drive or take data from commercial CAD. `.agents/skills/solidcraft-ground-rules/SKILL.md`.
