@@ -34,18 +34,76 @@ pub fn mesh_to_shared_tris(mesh: &TriMesh) -> Arc<SharedTris> {
     })
 }
 
+/// Cached GPU triangle meshes for parts and the optional no-build zone.
+#[derive(Default)]
+pub struct SceneCache {
+    pub parts: HashMap<PartId, Arc<SharedTris>>,
+    pub no_build_zone: Option<(Arc<TriMesh>, Arc<SharedTris>)>,
+}
+
+impl SceneCache {
+    fn part_tris(&mut self, part_id: PartId, mesh: &TriMesh) -> Arc<SharedTris> {
+        self.parts
+            .entry(part_id)
+            .or_insert_with(|| mesh_to_shared_tris(mesh))
+            .clone()
+    }
+
+    fn no_build_zone_tris(&mut self, mesh: &Arc<TriMesh>) -> Arc<SharedTris> {
+        if let Some((cached_mesh, tris)) = &self.no_build_zone
+            && Arc::ptr_eq(cached_mesh, mesh)
+        {
+            return tris.clone();
+        }
+        let tris = mesh_to_shared_tris(mesh);
+        self.no_build_zone = Some((mesh.clone(), tris.clone()));
+        tris
+    }
+}
+
+/// Item(s) currently being dragged in a separate [`solidcraft_viewport_gpu::view::MovingLayer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DragExclude {
+    Instances(Vec<InstanceId>),
+    NoBuildZone,
+}
+
+impl DragExclude {
+    fn contains_instance(&self, id: InstanceId) -> bool {
+        match self {
+            Self::Instances(ids) => ids.contains(&id),
+            Self::NoBuildZone => false,
+        }
+    }
+}
+
 /// Build the [`GpuScene`] for `job`, including build-chamber wireframe, floor grid, and instanced parts.
+#[cfg(test)]
 pub fn build_gpu_scene(
     job: &BuildJob,
     selected: &HashSet<InstanceId>,
     tokens: &Tokens,
-    cache: &mut HashMap<PartId, Arc<SharedTris>>,
+    cache: &mut SceneCache,
+) -> GpuScene {
+    build_gpu_scene_with_exclude(job, selected, tokens, cache, None)
+}
+
+/// Build the static [`GpuScene`] for `job`, optionally excluding an item rendered in `MovingLayer`.
+pub fn build_gpu_scene_with_exclude(
+    job: &BuildJob,
+    selected: &HashSet<InstanceId>,
+    tokens: &Tokens,
+    cache: &mut SceneCache,
+    exclude: Option<&DragExclude>,
 ) -> GpuScene {
     let mut scene = GpuScene::with_palette(Palette::default());
 
     let part_color = scene.color(tokens.text.to_array());
     let selected_color = scene.color(tokens.accent.to_array());
     let oob_color = scene.color(tokens.form_error.to_array());
+    let part_faded = scene.color([tokens.text.r(), tokens.text.g(), tokens.text.b(), 128]);
+    let selected_faded = scene.color([tokens.accent.r(), tokens.accent.g(), tokens.accent.b(), 128]);
+    let oob_faded = scene.color([tokens.form_error.r(), tokens.form_error.g(), tokens.form_error.b(), 128]);
     let box_color = scene.color(tokens.grid_major.to_array());
     let grid_color = scene.color(tokens.grid.to_array());
     let margin_color = scene.color(tokens.text_dim.gamma_multiply(0.75).to_array());
@@ -64,54 +122,57 @@ pub fn build_gpu_scene(
         [axis_x, axis_y, axis_z],
     );
 
-    let mut per_part: HashMap<PartId, InstancedMesh> = HashMap::new();
+    let mut per_part: HashMap<(PartId, bool), InstancedMesh> = HashMap::new();
     for inst in &job.instances {
-        if !job.is_instance_visible(inst) {
+        if exclude.is_some_and(|e| e.contains_instance(inst.id)) || !job.is_instance_visible(inst) {
             continue;
         }
         let Some(proto) = job.part(inst.part_id) else {
             continue;
         };
-        let tris = cache
-            .entry(proto.id)
-            .or_insert_with(|| mesh_to_shared_tris(&proto.mesh))
-            .clone();
-        let entry = per_part.entry(proto.id).or_insert_with(|| InstancedMesh {
+        let tris = cache.part_tris(proto.id, &proto.mesh);
+        let entry = per_part.entry((proto.id, inst.transparent)).or_insert_with(|| InstancedMesh {
             key: u64::from(proto.id.0),
             tris,
             instances: Vec::new(),
-            look: InstanceLook::Opaque,
+            look: if inst.transparent {
+                InstanceLook::Faded
+            } else {
+                InstanceLook::Opaque
+            },
             levels: Vec::new(),
             closed: true,
             edges: None,
         });
 
-        let above_floor = job.is_instance_above_floor(inst.id);
-        let in_nbz = job.is_instance_in_no_build_zone(inst.id);
+        let wb = inst.world_bounds(proto.mesh.bounds);
+        let above_floor = job.world_bounds_above_floor(wb);
+        let in_nbz = job.world_bounds_in_no_build_zone(wb);
         let valid = above_floor && !in_nbz;
         let is_selected = selected.contains(&inst.id);
-        let color = if !valid {
-            oob_color
-        } else if is_selected {
-            selected_color
-        } else {
-            part_color
+        let color = match (valid, is_selected, inst.transparent) {
+            (false, _, true) => oob_faded,
+            (false, _, false) => oob_color,
+            (true, true, true) => selected_faded,
+            (true, true, false) => selected_color,
+            (true, false, true) => part_faded,
+            (true, false, false) => part_color,
         };
         entry.place(inst.transform, color);
 
         if is_selected {
-            let [lo, hi] = inst.world_bounds(proto.mesh.bounds);
-            draw_box_wireframe(&mut scene, lo, hi, if valid { selected_color } else { oob_color }, 1.6);
+            draw_box_wireframe(&mut scene, wb[0], wb[1], if valid { selected_color } else { oob_color }, 1.6);
         }
     }
 
     scene.instanced = per_part.into_values().collect();
 
-    if let Some(zone) = &job.no_build_zone
+    if exclude != Some(&DragExclude::NoBuildZone)
+        && let Some(zone) = &job.no_build_zone
         && zone.visible
     {
         let zone_color = scene.color([tokens.form_error.r(), tokens.form_error.g(), tokens.form_error.b(), 110]);
-        let tris = mesh_to_shared_tris(&zone.mesh);
+        let tris = cache.no_build_zone_tris(&zone.mesh);
         let mut nbz_mesh = InstancedMesh {
             key: u64::MAX,
             tris,
@@ -125,6 +186,91 @@ pub fn build_gpu_scene(
         scene.instanced.push(nbz_mesh);
         let [lo, hi] = zone.world_bounds();
         draw_box_wireframe(&mut scene, lo, hi, oob_color, 1.2);
+    }
+
+    scene
+}
+
+/// Build a [`GpuScene`] containing only `target` at its current transform for [`solidcraft_viewport_gpu::view::MovingLayer`].
+pub fn build_moving_scene(
+    job: &BuildJob,
+    selected: &HashSet<InstanceId>,
+    tokens: &Tokens,
+    cache: &mut SceneCache,
+    target: &DragExclude,
+) -> GpuScene {
+    let mut scene = GpuScene::with_palette(Palette::default());
+
+    let part_color = scene.color(tokens.text.to_array());
+    let selected_color = scene.color(tokens.accent.to_array());
+    let oob_color = scene.color(tokens.form_error.to_array());
+    let part_faded = scene.color([tokens.text.r(), tokens.text.g(), tokens.text.b(), 128]);
+    let selected_faded = scene.color([tokens.accent.r(), tokens.accent.g(), tokens.accent.b(), 128]);
+    let oob_faded = scene.color([tokens.form_error.r(), tokens.form_error.g(), tokens.form_error.b(), 128]);
+
+    match target {
+        DragExclude::Instances(ids) => {
+            let mut per_part: HashMap<(PartId, bool), InstancedMesh> = HashMap::new();
+            for inst in &job.instances {
+                if !ids.contains(&inst.id) || !job.is_instance_visible(inst) {
+                    continue;
+                }
+                let Some(proto) = job.part(inst.part_id) else {
+                    continue;
+                };
+                let tris = cache.part_tris(proto.id, &proto.mesh);
+                let entry = per_part.entry((proto.id, inst.transparent)).or_insert_with(|| InstancedMesh {
+                    key: u64::from(proto.id.0),
+                    tris,
+                    instances: Vec::new(),
+                    look: if inst.transparent {
+                        InstanceLook::Faded
+                    } else {
+                        InstanceLook::Opaque
+                    },
+                    levels: Vec::new(),
+                    closed: true,
+                    edges: None,
+                });
+                let wb = inst.world_bounds(proto.mesh.bounds);
+                let valid = job.world_bounds_above_floor(wb) && !job.world_bounds_in_no_build_zone(wb);
+                let is_selected = selected.contains(&inst.id);
+                let color = match (valid, is_selected, inst.transparent) {
+                    (false, _, true) => oob_faded,
+                    (false, _, false) => oob_color,
+                    (true, true, true) => selected_faded,
+                    (true, true, false) => selected_color,
+                    (true, false, true) => part_faded,
+                    (true, false, false) => part_color,
+                };
+                entry.place(inst.transform, color);
+                if is_selected {
+                    draw_box_wireframe(&mut scene, wb[0], wb[1], if valid { selected_color } else { oob_color }, 1.6);
+                }
+            }
+            scene.instanced = per_part.into_values().collect();
+        }
+        DragExclude::NoBuildZone => {
+            if let Some(zone) = &job.no_build_zone
+                && zone.visible
+            {
+                let zone_color = scene.color([tokens.form_error.r(), tokens.form_error.g(), tokens.form_error.b(), 110]);
+                let tris = cache.no_build_zone_tris(&zone.mesh);
+                let mut nbz_mesh = InstancedMesh {
+                    key: u64::MAX,
+                    tris,
+                    instances: Vec::new(),
+                    look: InstanceLook::Faded,
+                    levels: Vec::new(),
+                    closed: true,
+                    edges: None,
+                };
+                nbz_mesh.place(zone.transform(), zone_color);
+                scene.instanced.push(nbz_mesh);
+                let [lo, hi] = zone.world_bounds();
+                draw_box_wireframe(&mut scene, lo, hi, oob_color, 1.2);
+            }
+        }
     }
 
     scene
@@ -568,12 +714,75 @@ mod tests {
         let i1 = job.add_instance(pid, IDENTITY_TRANSFORM).expect("i1");
         let _ = job.duplicate_instance(i1, 3).expect("duplicated");
 
-        let mut cache = HashMap::new();
+        let mut cache = SceneCache::default();
         let selected = HashSet::from([i1]);
         let scene = build_gpu_scene(&job, &selected, &Tokens::get(), &mut cache);
         assert_eq!(scene.instanced.len(), 1);
         assert_eq!(scene.instanced[0].instances.len(), 4 * INSTANCE_SIZE);
         assert!(!scene.lines.is_empty());
+    }
+
+    #[test]
+    fn drag_splits_moving_instance_and_caches_no_build_zone_tris() {
+        let mesh = Arc::new(
+            TriMesh::from_indexed(
+                vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]],
+                vec![[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]],
+            )
+            .expect("valid mesh"),
+        );
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        let pid = job.add_part("bracket", mesh.clone());
+        let i1 = job.add_instance(pid, IDENTITY_TRANSFORM).expect("i1");
+        let i2 = job.add_instance(pid, IDENTITY_TRANSFORM).expect("i2");
+        job.no_build_zone = Some(nestcraft_core::model::NoBuildZone::new("nbz", mesh));
+
+        let mut cache = SceneCache::default();
+        let selected = HashSet::from([i1]);
+        let tokens = Tokens::get();
+        let exclude = DragExclude::Instances(vec![i1]);
+        let static_scene = build_gpu_scene_with_exclude(
+            &job,
+            &selected,
+            &tokens,
+            &mut cache,
+            Some(&exclude),
+        );
+        let moving_scene = build_moving_scene(&job, &selected, &tokens, &mut cache, &exclude);
+        assert_eq!(static_scene.instanced.len(), 2); // i2 + no_build_zone
+        assert_eq!(static_scene.instanced[0].instances.len(), INSTANCE_SIZE);
+        assert_eq!(moving_scene.instanced.len(), 1);
+        assert_eq!(moving_scene.instanced[0].instances.len(), INSTANCE_SIZE);
+        assert!(Arc::ptr_eq(&static_scene.instanced[0].tris, &moving_scene.instanced[0].tris));
+
+        let second_static = build_gpu_scene(&job, &selected, &tokens, &mut cache);
+        let nbz_a = static_scene.instanced.iter().find(|m| m.key == u64::MAX).expect("nbz a");
+        let nbz_b = second_static.instanced.iter().find(|m| m.key == u64::MAX).expect("nbz b");
+        assert!(Arc::ptr_eq(&nbz_a.tris, &nbz_b.tris));
+        let _ = i2;
+    }
+
+    #[test]
+    fn transparent_instance_uses_faded_look_separate_from_opaque_siblings() {
+        let mesh = Arc::new(
+            TriMesh::from_indexed(
+                vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]],
+                vec![[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]],
+            )
+            .expect("valid mesh"),
+        );
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        let pid = job.add_part("bracket", mesh);
+        let i1 = job.add_instance(pid, IDENTITY_TRANSFORM).expect("i1");
+        let i2 = job.add_instance(pid, IDENTITY_TRANSFORM).expect("i2");
+        assert!(job.set_instance_transparent(i2, true));
+
+        let mut cache = SceneCache::default();
+        let scene = build_gpu_scene(&job, &HashSet::from([i1]), &Tokens::get(), &mut cache);
+        assert_eq!(scene.instanced.len(), 2);
+        assert!(scene.instanced.iter().any(|m| m.look == InstanceLook::Opaque));
+        assert!(scene.instanced.iter().any(|m| m.look == InstanceLook::Faded));
+        assert!(Arc::ptr_eq(&scene.instanced[0].tris, &scene.instanced[1].tris));
     }
 
     #[test]

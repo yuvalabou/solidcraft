@@ -259,6 +259,8 @@ pub struct PartInstance {
     pub locked: bool,
     /// Whether this instance is hidden in the 3D viewport.
     pub hidden: bool,
+    /// Whether this instance is rendered 50% transparent in the 3D viewport.
+    pub transparent: bool,
     /// Optional project-tree group membership.
     pub group_id: Option<GroupId>,
 }
@@ -520,6 +522,7 @@ impl BuildJob {
             constraint,
             locked: false,
             hidden: false,
+            transparent: false,
             group_id: None,
         });
         Ok(id)
@@ -709,7 +712,11 @@ impl BuildJob {
         let Some(proto) = self.part(inst.part_id) else {
             return false;
         };
-        let wb = inst.world_bounds(proto.mesh.bounds);
+        self.world_bounds_above_floor(inst.world_bounds(proto.mesh.bounds))
+    }
+
+    /// Check whether a world-space bounding box rests on or above `self.min_z_mm` (default `0.0`).
+    pub fn world_bounds_above_floor(&self, wb: Aabb) -> bool {
         const EPS: f32 = 1e-3;
         wb[0][2] >= self.min_z_mm.max(0.0) - EPS
     }
@@ -737,22 +744,55 @@ impl BuildJob {
         }
     }
 
-    /// Return `true` when `id` intersects the active [`NoBuildZone`] (including its `clearance_mm`).
-    pub fn is_instance_in_no_build_zone(&self, id: InstanceId) -> bool {
-        let Some(zone) = &self.no_build_zone else {
+    /// Return the lowest world-space Z coordinate of `id`, if found.
+    pub fn instance_min_z(&self, id: InstanceId) -> Option<f32> {
+        let inst = self.instances.iter().find(|i| i.id == id)?;
+        let proto = self.part(inst.part_id)?;
+        Some(inst.world_bounds(proto.mesh.bounds)[0][2])
+    }
+
+    /// Shift `id` vertically so its lowest world-space Z is `0.0`, keeping X and Y unchanged.
+    ///
+    /// Returns `true` when the instance was found and adjusted.
+    pub fn reset_instance_z_to_zero(&mut self, id: InstanceId) -> bool {
+        let Some(part_id) = self.instances.iter().find(|i| i.id == id).map(|i| i.part_id) else {
             return false;
         };
-        if !zone.enabled {
+        let Some(local_bounds) = self.part(part_id).map(|p| p.mesh.bounds) else {
             return false;
+        };
+        let Some(inst) = self.instances.iter_mut().find(|i| i.id == id) else {
+            return false;
+        };
+        let min_z = inst.world_bounds(local_bounds)[0][2];
+        if min_z.abs() > 1e-6 {
+            inst.transform[2][3] -= min_z;
+            true
+        } else {
+            false
         }
+    }
+
+    /// Return `true` when `id` intersects the active [`NoBuildZone`] (including its `clearance_mm`).
+    pub fn is_instance_in_no_build_zone(&self, id: InstanceId) -> bool {
         let Some(inst) = self.instances.iter().find(|i| i.id == id) else {
             return false;
         };
         let Some(proto) = self.part(inst.part_id) else {
             return false;
         };
+        self.world_bounds_in_no_build_zone(inst.world_bounds(proto.mesh.bounds))
+    }
+
+    /// Return `true` when `wb` intersects the active [`NoBuildZone`] (including its `clearance_mm`).
+    pub fn world_bounds_in_no_build_zone(&self, wb: Aabb) -> bool {
+        let Some(zone) = &self.no_build_zone else {
+            return false;
+        };
+        if !zone.enabled {
+            return false;
+        }
         let pad = zone.clearance_mm.max(0.0);
-        let wb = inst.world_bounds(proto.mesh.bounds);
         let zb = zone.world_bounds();
         let wb_pad = [
             [wb[0][0] - pad, wb[0][1] - pad, wb[0][2] - pad],
@@ -888,6 +928,15 @@ impl BuildJob {
         true
     }
 
+    /// Set `transparent` (50% opacity) on a single instance.
+    pub fn set_instance_transparent(&mut self, inst_id: InstanceId, transparent: bool) -> bool {
+        let Some(inst) = self.instances.iter_mut().find(|i| i.id == inst_id) else {
+            return false;
+        };
+        inst.transparent = transparent;
+        true
+    }
+
     /// Return `true` when `inst` is visible (neither itself nor its group is hidden).
     pub fn is_instance_visible(&self, inst: &PartInstance) -> bool {
         if inst.hidden {
@@ -976,6 +1025,7 @@ mod tests {
             constraint: RotationConstraint::Free,
             locked: false,
             hidden: false,
+            transparent: false,
             group_id: None,
         };
         let out = inst.euler_deg();

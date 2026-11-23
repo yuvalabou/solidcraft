@@ -18,6 +18,11 @@ pub static NESTCRAFT_ICONS: IconSet = IconSet::extended(
             ("sls_slice_z", "section", "mesh"),
             ("sls_collision", "interference", "constraint"),
             ("sls_thermal_map", "curvature_map", "surface"),
+            ("sls_zoom_parts", "select_parts", ""),
+            ("sls_zoom_selected", "select_bodies", ""),
+            ("sls_zoom_platform", "box", ""),
+            ("sls_zoom_all", "fit", ""),
+            ("sls_zoom_selection", "zoom", ""),
         ],
         icon_accents: &[],
     },
@@ -51,6 +56,11 @@ mod tests {
             "sls_slice_z",
             "sls_collision",
             "sls_thermal_map",
+            "sls_zoom_parts",
+            "sls_zoom_selected",
+            "sls_zoom_platform",
+            "sls_zoom_all",
+            "sls_zoom_selection",
         ] {
             let entry = NESTCRAFT_ICONS
                 .extension()

@@ -13,8 +13,9 @@
 mod icons;
 mod viewport;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
@@ -22,8 +23,8 @@ use nestcraft_core::io::threemf::ThreeMfLoadedItem;
 use nestcraft_core::io::{nestc, stl, threemf};
 use nestcraft_core::manifold::{self, ManifoldReport};
 use nestcraft_core::model::{
-    BedOrigin, BuildJob, GroupId, InstanceId, MachineProfile, NoBuildZone, PartId, RotationConstraint, TriMesh,
-    transform_from_translation_euler_deg,
+    BedOrigin, BuildJob, GroupId, IDENTITY_TRANSFORM, InstanceId, MachineProfile, NoBuildZone, PartId,
+    RotationConstraint, TriMesh, transform_from_translation_euler_deg,
 };
 use serde::{Deserialize, Serialize};
 use solidcraft_theme::Tokens;
@@ -33,10 +34,10 @@ use solidcraft_ui_kit::{
     Button, Segments, StageBar, StatusTone, button, catalog_footer_with_tip, checkbox_row,
     icon_label_button, row, scope, section, section_count, segmented, status_line, value_row,
 };
-use solidcraft_viewport::vec::Vec3Ops as _;
+use solidcraft_viewport::vec::{Bounds, Vec3Ops as _};
 use solidcraft_viewport::{Camera, StandardView};
 use solidcraft_viewport_egui::{ViewportCallback, paint_background};
-use solidcraft_viewport_gpu::view::{Frame, GpuTarget, SceneSlot, SharedTris};
+use solidcraft_viewport_gpu::view::{Frame, GpuTarget, MovingLayer, SceneSlot, SharedTris};
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -79,10 +80,10 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DragState {
-    instance_id: InstanceId,
-    start_translation: [f32; 3],
+    anchor_id: InstanceId,
+    instances: Vec<(InstanceId, [f32; 3])>,
     start_hit: [f32; 3],
     plane_z: f32,
 }
@@ -102,8 +103,8 @@ struct BoxSelectState {
 }
 
 enum ImportedKind {
-    Stl(TriMesh),
-    ThreeMf(Vec<ThreeMfLoadedItem>),
+    Stl(Arc<TriMesh>, Arc<SharedTris>),
+    ThreeMf(Vec<(ThreeMfLoadedItem, Arc<SharedTris>)>),
 }
 
 enum BackgroundLoadOutcome {
@@ -132,7 +133,82 @@ struct ActiveLoadTask {
     current_label: String,
     imported_files: usize,
     imported_items: usize,
+    below_zero_instances: Vec<(InstanceId, f32)>,
+    pushed_undo: bool,
     errors: Vec<String>,
+}
+
+#[derive(Clone)]
+struct UndoSnapshot {
+    job: BuildJob,
+    selected: Option<InstanceId>,
+    selected_set: HashSet<InstanceId>,
+    selection_anchor: Option<InstanceId>,
+}
+
+fn load_single_file_outcome(path: &Path) -> BackgroundLoadOutcome {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return BackgroundLoadOutcome::Failed(format!("Failed to read {}: {e}", path.display())),
+    };
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if ext == "nestc" {
+        match nestc::read_nestc(&bytes) {
+            Ok(job) => BackgroundLoadOutcome::OpenedBed {
+                job,
+                path_display: path.display().to_string(),
+            },
+            Err(e) => BackgroundLoadOutcome::Failed(format!("Open bed error: {e}")),
+        }
+    } else if ext == "3mf" {
+        match threemf::read_threemf(&bytes) {
+            Ok(items) => {
+                let prepared = items
+                    .into_iter()
+                    .map(|item| {
+                        let tris = viewport::mesh_to_shared_tris(&item.mesh);
+                        (item, tris)
+                    })
+                    .collect();
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("file")
+                    .to_owned();
+                BackgroundLoadOutcome::Imported {
+                    name,
+                    kind: ImportedKind::ThreeMf(prepared),
+                }
+            }
+            Err(e) => BackgroundLoadOutcome::Failed(format!("3MF import error: {e}")),
+        }
+    } else if ext == "stl" {
+        match stl::parse_stl(&bytes) {
+            Ok(mesh) => {
+                let mesh = Arc::new(mesh);
+                let tris = viewport::mesh_to_shared_tris(&mesh);
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("part")
+                    .to_owned();
+                BackgroundLoadOutcome::Imported {
+                    name: stem,
+                    kind: ImportedKind::Stl(mesh, tris),
+                }
+            }
+            Err(e) => BackgroundLoadOutcome::Failed(format!("STL import error: {e}")),
+        }
+    } else {
+        BackgroundLoadOutcome::Failed(format!(
+            "Unsupported file '{}' (expected .stl, .3mf, or .nestc)",
+            path.display()
+        ))
+    }
 }
 
 struct NestCraftApp {
@@ -141,11 +217,14 @@ struct NestCraftApp {
     selected_set: HashSet<InstanceId>,
     selection_anchor: Option<InstanceId>,
     camera: Camera,
-    shared_cache: HashMap<PartId, Arc<SharedTris>>,
+    scene_cache: viewport::SceneCache,
     scene_slot: SceneSlot,
+    moving_slot: SceneSlot,
     hl_slot: SceneSlot,
     empty_slot: SceneSlot,
     scene_key: u64,
+    moving_key: u64,
+    moving_target: Option<viewport::DragExclude>,
     scene_dirty: bool,
     status: String,
     euler_edit: HashMap<InstanceId, [f32; 3]>,
@@ -167,7 +246,13 @@ struct NestCraftApp {
     drag_state: Option<DragState>,
     drag_zone: Option<DragZoneState>,
     box_select: Option<BoxSelectState>,
+    zoom_rect_mode: bool,
+    zoom_rect: Option<(egui::Pos2, egui::Pos2)>,
+    viewport_aspect: f64,
     load_task: Option<ActiveLoadTask>,
+    below_zero_import_dialog: Vec<(InstanceId, f32)>,
+    undo_stack: Vec<UndoSnapshot>,
+    redo_stack: Vec<UndoSnapshot>,
     viewport_ctx_menu: Option<InstanceId>,
     compass_drag: CompassDrag,
     sample_counter: u32,
@@ -313,6 +398,14 @@ fn sanitize_ascii_filename_part(s: &str) -> String {
         .collect()
 }
 
+fn export_part_menu_label(selected_count: usize) -> &'static str {
+    if selected_count > 1 {
+        "Export Parts..."
+    } else {
+        "Export Part..."
+    }
+}
+
 fn format_export_stl_stem(
     prefix: &str,
     part_name: &str,
@@ -456,11 +549,14 @@ impl NestCraftApp {
             selected_set: HashSet::new(),
             selection_anchor: None,
             camera,
-            shared_cache: HashMap::new(),
+            scene_cache: viewport::SceneCache::default(),
             scene_slot: Arc::new(Mutex::new(None)),
+            moving_slot: Arc::new(Mutex::new(None)),
             hl_slot: Arc::new(Mutex::new(None)),
             empty_slot: Arc::new(Mutex::new(None)),
             scene_key: 1,
+            moving_key: 1,
+            moving_target: None,
             scene_dirty: true,
             status: "Ready — import an STL/3MF or add a sample part.".to_owned(),
             euler_edit: HashMap::new(),
@@ -482,7 +578,13 @@ impl NestCraftApp {
             drag_state: None,
             drag_zone: None,
             box_select: None,
+            zoom_rect_mode: false,
+            zoom_rect: None,
+            viewport_aspect: 16.0 / 9.0,
             load_task: None,
+            below_zero_import_dialog: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             viewport_ctx_menu: None,
             compass_drag: CompassDrag::default(),
             sample_counter: 0,
@@ -617,6 +719,7 @@ impl NestCraftApp {
         self.sample_counter += 1;
         let idx = self.sample_counter;
         if let Ok(mesh) = create_sample_bracket_mesh(idx) {
+            self.push_undo();
             let name = format!("Sample Bracket #{idx}");
             let pid = self.job.add_part(name.clone(), Arc::new(mesh));
             if let Ok(iid) = self.job.add_instance_on_floor_next(pid) {
@@ -631,6 +734,7 @@ impl NestCraftApp {
         if ids.is_empty() {
             return;
         }
+        self.push_undo();
         for sel_id in ids {
             if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == sel_id) {
                 let pos = inst.translation();
@@ -673,6 +777,7 @@ impl NestCraftApp {
         } else {
             xyz
         };
+        self.push_undo();
 
         let mut moved = 0usize;
         for id in ids {
@@ -704,10 +809,62 @@ impl NestCraftApp {
         self.dup_dialog_open = true;
     }
 
+    fn snapshot(&self) -> UndoSnapshot {
+        UndoSnapshot {
+            job: self.job.clone(),
+            selected: self.selected,
+            selected_set: self.selected_set.clone(),
+            selection_anchor: self.selection_anchor,
+        }
+    }
+
+    fn push_undo(&mut self) {
+        self.undo_stack.push(self.snapshot());
+        self.redo_stack.clear();
+    }
+
+    fn restore_snapshot(&mut self, snap: UndoSnapshot) {
+        self.job = snap.job;
+        self.selected = snap.selected;
+        self.selected_set = snap.selected_set;
+        self.selection_anchor = snap.selection_anchor;
+        self.euler_edit.clear();
+        self.drag_state = None;
+        self.drag_zone = None;
+        self.moving_target = None;
+        self.below_zero_import_dialog.clear();
+        self.mark_dirty();
+    }
+
+    fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo_stack.pop() else {
+            self.status = "Nothing to undo".to_owned();
+            return false;
+        };
+        let cur = self.snapshot();
+        self.redo_stack.push(cur);
+        self.restore_snapshot(prev);
+        self.status = format!("Undo ({} step(s) left)", self.undo_stack.len());
+        true
+    }
+
+    fn redo(&mut self) -> bool {
+        let Some(next) = self.redo_stack.pop() else {
+            self.status = "Nothing to redo".to_owned();
+            return false;
+        };
+        let cur = self.snapshot();
+        self.undo_stack.push(cur);
+        self.restore_snapshot(next);
+        self.status = format!("Redo ({} step(s) left)", self.redo_stack.len());
+        true
+    }
+
     fn duplicate_selected(&mut self) {
         let Some(sel) = self.selected else {
             return;
         };
+        self.push_undo();
         let counts = [
             if self.dup_axes[0] { self.dup_counts[0].max(1) } else { 1 },
             if self.dup_axes[1] { self.dup_counts[1].max(1) } else { 1 },
@@ -730,6 +887,7 @@ impl NestCraftApp {
         if ids.is_empty() {
             return;
         }
+        self.push_undo();
         let mut removed = 0usize;
         for id in ids {
             if self.job.remove_instance(id) {
@@ -755,6 +913,7 @@ impl NestCraftApp {
         if ids.is_empty() {
             return;
         }
+        self.push_undo();
         for sel_id in ids {
             if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == sel_id) {
                 let mut pos = inst.translation();
@@ -774,6 +933,7 @@ impl NestCraftApp {
         let Some(primary) = self.selected else {
             return;
         };
+        self.push_undo();
         let currently_hidden = self
             .job
             .instances
@@ -797,10 +957,39 @@ impl NestCraftApp {
         }
     }
 
+    fn toggle_selected_transparent(&mut self) {
+        let Some(primary) = self.selected else {
+            return;
+        };
+        self.push_undo();
+        let currently_transparent = self
+            .job
+            .instances
+            .iter()
+            .find(|i| i.id == primary)
+            .is_some_and(|i| i.transparent);
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        let mut changed = 0usize;
+        for id in ids {
+            if self.job.set_instance_transparent(id, !currently_transparent) {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.mark_dirty();
+            self.status = if currently_transparent {
+                format!("Set {changed} instance(s) opaque")
+            } else {
+                format!("Set {changed} instance(s) 50% transparent")
+            };
+        }
+    }
+
     fn toggle_selected_locked(&mut self) {
         let Some(primary) = self.selected else {
             return;
         };
+        self.push_undo();
         let target_locked = !self
             .job
             .instances
@@ -875,6 +1064,7 @@ impl NestCraftApp {
             || self.dup_dialog_open
             || self.move_dialog_open
             || self.export_stl_dialog_open
+            || !self.below_zero_import_dialog.is_empty()
         {
             return;
         }
@@ -883,6 +1073,14 @@ impl NestCraftApp {
             let shift = i.modifiers.shift;
             let alt = i.modifiers.alt;
 
+            if cmd && !shift && i.key_pressed(egui::Key::Z) {
+                self.undo();
+                return;
+            }
+            if (cmd && i.key_pressed(egui::Key::Y)) || (cmd && shift && i.key_pressed(egui::Key::Z)) {
+                self.redo();
+                return;
+            }
             if cmd && i.key_pressed(egui::Key::S) {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("NestCraft Bed", &["nestc"])
@@ -901,22 +1099,36 @@ impl NestCraftApp {
                 self.open_move_dialog();
                 return;
             }
+            if !cmd && !alt && i.key_pressed(egui::Key::Escape) && (self.zoom_rect_mode || self.zoom_rect.is_some()) {
+                self.zoom_rect_mode = false;
+                self.zoom_rect = None;
+                self.status = "Cancelled zoom to selection".to_owned();
+                return;
+            }
             if !cmd && !alt && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
                 self.delete_selected();
             }
             if !cmd && !alt && i.key_pressed(egui::Key::Z)
                 && let Some(sel) = self.selected
-                && self.job.drop_instance_to_floor(sel)
             {
-                self.mark_dirty();
-                self.status = "Dropped part to Z = 0".to_owned();
+                self.push_undo();
+                if self.job.drop_instance_to_floor(sel) {
+                    self.mark_dirty();
+                    self.status = "Dropped part to Z = 0".to_owned();
+                } else {
+                    self.undo_stack.pop();
+                }
             }
             if !cmd && !alt && i.key_pressed(egui::Key::C)
                 && let Some(sel) = self.selected
-                && self.job.center_instance_xy(sel)
             {
-                self.mark_dirty();
-                self.status = "Centered part in XY".to_owned();
+                self.push_undo();
+                if self.job.center_instance_xy(sel) {
+                    self.mark_dirty();
+                    self.status = "Centered part in XY".to_owned();
+                } else {
+                    self.undo_stack.pop();
+                }
             }
             if !cmd && i.key_pressed(egui::Key::R) {
                 let axis = if shift {
@@ -1055,7 +1267,12 @@ impl NestCraftApp {
         self.selected_set.clear();
         self.selection_anchor = None;
         self.euler_edit.clear();
-        self.shared_cache.clear();
+        self.scene_cache = viewport::SceneCache::default();
+        self.drag_state = None;
+        self.drag_zone = None;
+        self.moving_target = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         self.manifold_cache.clear();
         self.camera = viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
         self.mark_dirty();
@@ -1096,81 +1313,46 @@ impl NestCraftApp {
             current_label: format!("Starting import ({total} file(s))..."),
             imported_files: 0,
             imported_items: 0,
+            below_zero_instances: Vec::new(),
+            pushed_undo: false,
             errors: Vec::new(),
         });
 
-        std::thread::spawn(move || {
-            for (idx, path) in paths.into_iter().enumerate() {
-                let file_name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("file")
-                    .to_owned();
-                let _ = tx.send(LoadProgressMsg {
-                    completed: idx,
-                    total,
-                    current_label: format!("Loading {file_name}..."),
-                    outcome: None,
-                });
-                ctx_bg.request_repaint();
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(total)
+            .clamp(1, 16);
+        let queue = Arc::new(Mutex::new(VecDeque::from(paths)));
+        let completed = Arc::new(AtomicUsize::new(0));
 
-                let outcome = match std::fs::read(&path) {
-                    Err(e) => BackgroundLoadOutcome::Failed(format!("Failed to read {}: {e}", path.display())),
-                    Ok(bytes) => {
-                        let ext = path
-                            .extension()
-                            .and_then(|s| s.to_str())
-                            .map(str::to_ascii_lowercase)
-                            .unwrap_or_default();
-                        if ext == "nestc" {
-                            match nestc::read_nestc(&bytes) {
-                                Ok(job) => BackgroundLoadOutcome::OpenedBed {
-                                    job,
-                                    path_display: path.display().to_string(),
-                                },
-                                Err(e) => BackgroundLoadOutcome::Failed(format!("Open bed error: {e}")),
-                            }
-                        } else if ext == "3mf" {
-                            match threemf::read_threemf(&bytes) {
-                                Ok(items) => BackgroundLoadOutcome::Imported {
-                                    name: file_name.clone(),
-                                    kind: ImportedKind::ThreeMf(items),
-                                },
-                                Err(e) => BackgroundLoadOutcome::Failed(format!("3MF import error: {e}")),
-                            }
-                        } else if ext == "stl" {
-                            match stl::parse_stl(&bytes) {
-                                Ok(mesh) => {
-                                    let stem = path
-                                        .file_stem()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("part")
-                                        .to_owned();
-                                    BackgroundLoadOutcome::Imported {
-                                        name: stem,
-                                        kind: ImportedKind::Stl(mesh),
-                                    }
-                                }
-                                Err(e) => BackgroundLoadOutcome::Failed(format!("STL import error: {e}")),
-                            }
-                        } else {
-                            BackgroundLoadOutcome::Failed(format!(
-                                "Unsupported file '{}' (expected .stl, .3mf, or .nestc)",
-                                path.display()
-                            ))
-                        }
-                    }
-                };
-
-                let _ = tx.send(LoadProgressMsg {
-                    completed: idx + 1,
-                    total,
-                    current_label: format!("Loaded {file_name}"),
-                    outcome: Some(outcome),
-                });
-                ctx_bg.request_repaint();
-            }
-        });
+        for _ in 0..workers {
+            let queue = Arc::clone(&queue);
+            let completed = Arc::clone(&completed);
+            let tx = tx.clone();
+            let ctx_bg = ctx_bg.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let next_path = queue.lock().ok().and_then(|mut q| q.pop_front());
+                    let Some(path) = next_path else {
+                        break;
+                    };
+                    let file_name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("file")
+                        .to_owned();
+                    let outcome = load_single_file_outcome(&path);
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = tx.send(LoadProgressMsg {
+                        completed: done,
+                        total,
+                        current_label: format!("Loaded {file_name}"),
+                        outcome: Some(outcome),
+                    });
+                    ctx_bg.request_repaint();
+                }
+            });
+        }
     }
 
     fn start_open_bed(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -1183,36 +1365,54 @@ impl NestCraftApp {
         };
         let mut disconnected = false;
         let mut opened_bed = false;
+        let mut last_imported_id = None;
+        let mut any_imported = false;
         loop {
             match task.rx.try_recv() {
                 Ok(msg) => {
-                    task.completed = msg.completed;
+                    task.completed = msg.completed.max(task.completed);
                     task.total = msg.total;
                     task.current_label = msg.current_label;
                     if let Some(outcome) = msg.outcome {
                         match outcome {
                             BackgroundLoadOutcome::Imported { name, kind } => {
+                                if !task.pushed_undo {
+                                    self.push_undo();
+                                    task.pushed_undo = true;
+                                }
                                 task.imported_files += 1;
                                 match kind {
-                                    ImportedKind::Stl(mesh) => {
-                                        let pid = self.job.add_part(name, Arc::new(mesh));
-                                        if let Ok(iid) = self.job.add_instance_on_floor_next(pid) {
-                                            self.select_instance(Some(iid));
+                                    ImportedKind::Stl(mesh, shared_tris) => {
+                                        let pid = self.job.add_part(name, mesh);
+                                        self.scene_cache.parts.insert(pid, shared_tris);
+                                        if let Ok(iid) = self.job.add_instance(pid, IDENTITY_TRANSFORM) {
+                                            if let Some(min_z) = self.job.instance_min_z(iid)
+                                                && min_z < -1e-4
+                                            {
+                                                task.below_zero_instances.push((iid, min_z));
+                                            }
+                                            last_imported_id = Some(iid);
                                             task.imported_items += 1;
+                                            any_imported = true;
                                         }
                                     }
                                     ImportedKind::ThreeMf(items) => {
-                                        for item in items {
+                                        for (item, shared_tris) in items {
                                             let pid = self.job.add_part(item.name, item.mesh);
+                                            self.scene_cache.parts.insert(pid, shared_tris);
                                             if let Ok(iid) = self.job.add_instance(pid, item.transform) {
-                                                self.job.clamp_instance_above_floor(iid);
-                                                self.select_instance(Some(iid));
+                                                if let Some(min_z) = self.job.instance_min_z(iid)
+                                                    && min_z < -1e-4
+                                                {
+                                                    task.below_zero_instances.push((iid, min_z));
+                                                }
+                                                last_imported_id = Some(iid);
                                                 task.imported_items += 1;
+                                                any_imported = true;
                                             }
                                         }
                                     }
                                 }
-                                self.mark_dirty();
                             }
                             BackgroundLoadOutcome::OpenedBed { job, path_display } => {
                                 self.apply_loaded_bed(job, &path_display);
@@ -1231,9 +1431,17 @@ impl NestCraftApp {
                 }
             }
         }
+        if let Some(iid) = last_imported_id {
+            self.select_instance(Some(iid));
+        } else if any_imported {
+            self.mark_dirty();
+        }
 
         if disconnected || task.completed >= task.total {
             if !opened_bed {
+                if !task.below_zero_instances.is_empty() {
+                    self.below_zero_import_dialog.extend(task.below_zero_instances);
+                }
                 if task.imported_items > 0 {
                     self.status = if task.errors.is_empty() {
                         format!("Imported {} item(s) from {} file(s)", task.imported_items, task.imported_files)
@@ -1336,7 +1544,11 @@ impl NestCraftApp {
             for item in items {
                 let pid = self.job.add_part(item.name, item.mesh);
                 if let Ok(iid) = self.job.add_instance(pid, item.transform) {
-                    self.job.clamp_instance_above_floor(iid);
+                    if let Some(min_z) = self.job.instance_min_z(iid)
+                        && min_z < -1e-4
+                    {
+                        self.below_zero_import_dialog.push((iid, min_z));
+                    }
                     self.select_instance(Some(iid));
                 }
             }
@@ -1349,7 +1561,12 @@ impl NestCraftApp {
                 .unwrap_or("part")
                 .to_owned();
             let pid = self.job.add_part(name.clone(), Arc::new(mesh));
-            if let Ok(iid) = self.job.add_instance_on_floor_next(pid) {
+            if let Ok(iid) = self.job.add_instance(pid, IDENTITY_TRANSFORM) {
+                if let Some(min_z) = self.job.instance_min_z(iid)
+                    && min_z < -1e-4
+                {
+                    self.below_zero_import_dialog.push((iid, min_z));
+                }
                 self.select_instance(Some(iid));
             }
             Ok((1, format!("Imported '{name}'")))
@@ -1462,12 +1679,67 @@ impl NestCraftApp {
         }
     }
 
+    fn start_moving_layer(&mut self, target: viewport::DragExclude) {
+        let tokens = Tokens::get();
+        let scene = viewport::build_moving_scene(&self.job, &self.selected_set, &tokens, &mut self.scene_cache, &target);
+        if let Ok(mut guard) = self.moving_slot.lock() {
+            *guard = Some(scene);
+        }
+        self.moving_key = self.moving_key.wrapping_add(1).max(1);
+        self.moving_target = Some(target);
+        self.mark_dirty();
+    }
+
+    fn current_moving_layer(&self) -> Option<MovingLayer> {
+        let target = self.moving_target.as_ref()?;
+        let delta = match target {
+            viewport::DragExclude::Instances(_) => {
+                let ds = self.drag_state.as_ref()?;
+                let (_, start_tr) = ds.instances.iter().find(|(id, _)| *id == ds.anchor_id)?;
+                let inst = self.job.instances.iter().find(|i| i.id == ds.anchor_id)?;
+                let cur = inst.translation();
+                [cur[0] - start_tr[0], cur[1] - start_tr[1], cur[2] - start_tr[2]]
+            }
+            viewport::DragExclude::NoBuildZone => {
+                let dz = self.drag_zone?;
+                let zone = self.job.no_build_zone.as_ref()?;
+                [
+                    zone.position[0] - dz.start_position[0],
+                    zone.position[1] - dz.start_position[1],
+                    zone.position[2] - dz.start_position[2],
+                ]
+            }
+        };
+        Some(MovingLayer {
+            key: self.moving_key,
+            slot: self.moving_slot.clone(),
+            transform: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [delta[0], delta[1], delta[2], 1.0],
+            ],
+        })
+    }
+
     fn sync_scene_if_dirty(&mut self) {
         if !self.scene_dirty {
             return;
         }
+        if let Some(viewport::DragExclude::Instances(ids)) = &self.moving_target
+            && !ids.iter().any(|id| self.job.instances.iter().any(|i| i.id == *id))
+        {
+            self.moving_target = None;
+            self.drag_state = None;
+        }
         let tokens = Tokens::get();
-        let scene = viewport::build_gpu_scene(&self.job, &self.selected_set, &tokens, &mut self.shared_cache);
+        let scene = viewport::build_gpu_scene_with_exclude(
+            &self.job,
+            &self.selected_set,
+            &tokens,
+            &mut self.scene_cache,
+            self.moving_target.as_ref(),
+        );
         if let Ok(mut guard) = self.scene_slot.lock() {
             *guard = Some(scene);
         }
@@ -1641,6 +1913,169 @@ impl NestCraftApp {
         });
     }
 
+    fn add_aabb_to_bounds(bounds: &mut Bounds, aabb: [[f32; 3]; 2]) {
+        bounds.add([f64::from(aabb[0][0]), f64::from(aabb[0][1]), f64::from(aabb[0][2])].into());
+        bounds.add([f64::from(aabb[1][0]), f64::from(aabb[1][1]), f64::from(aabb[1][2])].into());
+    }
+
+    fn platform_bounds(&self) -> Bounds {
+        let ([x0, y0], [x1, y1]) = self.job.bed_xy_bounds();
+        let [_, _, h] = self.job.machine.size_mm();
+        let mut bounds = Bounds::EMPTY;
+        Self::add_aabb_to_bounds(&mut bounds, [[x0, y0, 0.0], [x1, y1, h.max(1.0)]]);
+        bounds
+    }
+
+    fn all_parts_bounds(&self) -> Bounds {
+        let mut bounds = Bounds::EMPTY;
+        for inst in &self.job.instances {
+            if !self.job.is_instance_visible(inst) {
+                continue;
+            }
+            if let Some(proto) = self.job.part(inst.part_id) {
+                Self::add_aabb_to_bounds(&mut bounds, inst.world_bounds(proto.mesh.bounds));
+            }
+        }
+        bounds
+    }
+
+    fn selected_parts_bounds(&self) -> Bounds {
+        let mut bounds = Bounds::EMPTY;
+        for inst in &self.job.instances {
+            if !self.selected_set.contains(&inst.id) {
+                continue;
+            }
+            if let Some(proto) = self.job.part(inst.part_id) {
+                Self::add_aabb_to_bounds(&mut bounds, inst.world_bounds(proto.mesh.bounds));
+            }
+        }
+        bounds
+    }
+
+    fn zoom_to_all_parts(&mut self) {
+        let bounds = self.all_parts_bounds();
+        if self.camera.fit_aspect(&bounds, self.viewport_aspect) {
+            self.status = "Zoomed to all parts".to_owned();
+        }
+    }
+
+    fn zoom_to_selected(&mut self) {
+        let bounds = self.selected_parts_bounds();
+        if self.camera.fit_aspect(&bounds, self.viewport_aspect) {
+            self.status = "Zoomed to selected part(s)".to_owned();
+        }
+    }
+
+    fn zoom_to_platform(&mut self) {
+        let bounds = self.platform_bounds();
+        if self.camera.fit_aspect(&bounds, self.viewport_aspect) {
+            self.status = "Zoomed to platform".to_owned();
+        }
+    }
+
+    fn zoom_to_all(&mut self) {
+        let mut bounds = self.platform_bounds();
+        let parts = self.all_parts_bounds();
+        if !parts.is_empty() {
+            bounds.add(parts.min);
+            bounds.add(parts.max);
+        }
+        if let Some(zone) = &self.job.no_build_zone
+            && zone.visible
+        {
+            Self::add_aabb_to_bounds(&mut bounds, zone.world_bounds());
+        }
+        if self.camera.fit_aspect(&bounds, self.viewport_aspect) {
+            self.status = "Zoomed to all".to_owned();
+        }
+    }
+
+    fn zoom_to_screen_rect(&mut self, viewport_rect: egui::Rect, sel_rect: egui::Rect) {
+        let w = f64::from(viewport_rect.width().max(1.0));
+        let h = f64::from(viewport_rect.height().max(1.0));
+        let half_h = self.camera.half_height();
+        let half_w = half_h * (w / h);
+        let dx_ndc = f64::from(sel_rect.center().x - viewport_rect.center().x) / (w * 0.5);
+        let dy_ndc = -f64::from(sel_rect.center().y - viewport_rect.center().y) / (h * 0.5);
+        let (right, up, _) = self.camera.basis();
+        self.camera.target = self.camera.target + right * (dx_ndc * half_w) + up * (dy_ndc * half_h);
+        let scale = f64::from(sel_rect.width() / viewport_rect.width().max(1.0))
+            .max(f64::from(sel_rect.height() / viewport_rect.height().max(1.0)))
+            .clamp(0.02, 1.0);
+        self.camera.distance = (self.camera.distance * scale).clamp(15.0, 5000.0);
+        self.status = "Zoomed to selection rectangle".to_owned();
+    }
+
+    fn draw_view_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
+        let chrome = Container::new(ctx, Surface::Chrome);
+        let view_panel = chrome.edge("sls_view_bar", Edge::Top).exact_size(36.0).resizable(false);
+        chrome.show_edge(ui, view_panel, chrome.edge_frame(t.toolbar), |ui| {
+            scope(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("sls_view_scroll")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.label(egui::RichText::new("View").strong().color(t.text));
+                            StageBar::separator(ui);
+
+                            let has_visible_parts = self.job.instances.iter().any(|i| self.job.is_instance_visible(i));
+                            if icon_label_button(ui, "Zoom to All Parts", "sls_zoom_parts", has_visible_parts, false)
+                                .backing_on_hover_text("Frame all visible parts in the viewport")
+                                .clicked()
+                            {
+                                self.zoom_to_all_parts();
+                            }
+                            if icon_label_button(
+                                ui,
+                                "Zoom to Selected",
+                                "sls_zoom_selected",
+                                !self.selected_set.is_empty(),
+                                false,
+                            )
+                            .backing_on_hover_text("Frame the currently selected part(s)")
+                            .clicked()
+                            {
+                                self.zoom_to_selected();
+                            }
+                            if icon_label_button(ui, "Zoom to Platform", "sls_zoom_platform", true, false)
+                                .backing_on_hover_text("Frame the machine build platform")
+                                .clicked()
+                            {
+                                self.zoom_to_platform();
+                            }
+                            if icon_label_button(ui, "Zoom to All", "sls_zoom_all", true, false)
+                                .backing_on_hover_text("Frame the platform and all visible parts")
+                                .clicked()
+                            {
+                                self.zoom_to_all();
+                            }
+                            if icon_label_button(
+                                ui,
+                                "Zoom to Selection",
+                                "sls_zoom_selection",
+                                true,
+                                self.zoom_rect_mode,
+                            )
+                            .backing_on_hover_text(
+                                "Toggle rectangle zoom: right-drag a rectangle in the viewport to zoom into it (Esc to cancel)",
+                            )
+                            .clicked()
+                            {
+                                self.zoom_rect_mode = !self.zoom_rect_mode;
+                                self.zoom_rect = None;
+                                self.status = if self.zoom_rect_mode {
+                                    "Right-drag a rectangle in the viewport to zoom (Esc to cancel)".to_owned()
+                                } else {
+                                    "Cancelled zoom to selection".to_owned()
+                                };
+                            }
+                        });
+                    });
+            });
+        });
+    }
+
     fn draw_bottom_bar(&self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
         let chrome = Container::new(ctx, Surface::Chrome);
         let bottom_panel = chrome.edge("sls_status_bar", Edge::Bottom).exact_size(30.0).resizable(false);
@@ -1689,10 +2124,12 @@ impl NestCraftApp {
             ToggleSelect(InstanceId),
             SelectRange(InstanceId),
             ToggleInstanceHidden(InstanceId, bool),
+            ToggleInstanceTransparent(InstanceId, bool),
             ToggleInstanceLock(InstanceId, bool),
             Duplicate(InstanceId),
             DropToFloor(InstanceId),
             CenterXy(InstanceId),
+            ExportParts(InstanceId),
             DeleteInstance(InstanceId),
             SetInstanceGroup(InstanceId, Option<GroupId>),
             ToggleGroupHidden(GroupId, bool),
@@ -1794,6 +2231,9 @@ impl NestCraftApp {
                                         if inst.hidden {
                                             tag.push_str(" [HIDDEN]");
                                         }
+                                        if inst.transparent {
+                                            tag.push_str(" [50%]");
+                                        }
                                         if inst.locked {
                                             tag.push_str(" [LOCK]");
                                         }
@@ -1840,6 +2280,20 @@ impl NestCraftApp {
                                                 actions.push(TreeAction::ToggleInstanceHidden(inst.id, !inst.hidden));
                                                 ui.close();
                                             }
+                                            if ui
+                                                .button(if inst.transparent {
+                                                    "Opaque"
+                                                } else {
+                                                    "Transparent (50%)"
+                                                })
+                                                .clicked()
+                                            {
+                                                actions.push(TreeAction::ToggleInstanceTransparent(
+                                                    inst.id,
+                                                    !inst.transparent,
+                                                ));
+                                                ui.close();
+                                            }
                                             if ui.button(if inst.locked { "Unlock" } else { "Lock" }).clicked() {
                                                 actions.push(TreeAction::ToggleInstanceLock(inst.id, !inst.locked));
                                                 ui.close();
@@ -1849,6 +2303,11 @@ impl NestCraftApp {
                                                 ui.close();
                                             }
                                             ui.separator();
+                                            let export_count = if is_sel { self.selected_set.len() } else { 1 };
+                                            if ui.button(export_part_menu_label(export_count)).clicked() {
+                                                actions.push(TreeAction::ExportParts(inst.id));
+                                                ui.close();
+                                            }
                                             if ui.button("Delete").clicked() {
                                                 actions.push(TreeAction::DeleteInstance(inst.id));
                                                 ui.close();
@@ -1989,6 +2448,20 @@ impl NestCraftApp {
                                             actions.push(TreeAction::ToggleInstanceHidden(inst.id, !inst.hidden));
                                             ui.close();
                                         }
+                                        if ui
+                                            .button(if inst.transparent {
+                                                "Opaque"
+                                            } else {
+                                                "Transparent (50%)"
+                                            })
+                                            .clicked()
+                                        {
+                                            actions.push(TreeAction::ToggleInstanceTransparent(
+                                                inst.id,
+                                                !inst.transparent,
+                                            ));
+                                            ui.close();
+                                        }
                                         if ui.button(if inst.locked { "Unlock" } else { "Lock" }).clicked() {
                                             actions.push(TreeAction::ToggleInstanceLock(inst.id, !inst.locked));
                                             ui.close();
@@ -2008,6 +2481,11 @@ impl NestCraftApp {
                                             });
                                         }
                                         ui.separator();
+                                        let export_count = if is_sel { self.selected_set.len() } else { 1 };
+                                        if ui.button(export_part_menu_label(export_count)).clicked() {
+                                            actions.push(TreeAction::ExportParts(inst.id));
+                                            ui.close();
+                                        }
                                         if ui.button("Delete").clicked() {
                                             actions.push(TreeAction::DeleteInstance(inst.id));
                                             ui.close();
@@ -2019,6 +2497,15 @@ impl NestCraftApp {
                     });
 
                 for action in actions {
+                    if !matches!(
+                        action,
+                        TreeAction::Select(_)
+                            | TreeAction::ToggleSelect(_)
+                            | TreeAction::SelectRange(_)
+                            | TreeAction::ExportParts(_)
+                    ) {
+                        self.push_undo();
+                    }
                     match action {
                         TreeAction::Select(id) => self.select_instance(Some(id)),
                         TreeAction::ToggleSelect(id) => self.toggle_select_instance(id),
@@ -2030,6 +2517,16 @@ impl NestCraftApp {
                                     format!("Hidden instance #{}", id.0)
                                 } else {
                                     format!("Shown instance #{}", id.0)
+                                };
+                            }
+                        }
+                        TreeAction::ToggleInstanceTransparent(id, transparent) => {
+                            if self.job.set_instance_transparent(id, transparent) {
+                                self.mark_dirty();
+                                self.status = if transparent {
+                                    format!("Set instance #{} 50% transparent", id.0)
+                                } else {
+                                    format!("Set instance #{} opaque", id.0)
                                 };
                             }
                         }
@@ -2056,6 +2553,13 @@ impl NestCraftApp {
                                 self.mark_dirty();
                                 self.status = format!("Centered #{} in XY", id.0);
                             }
+                        }
+                        TreeAction::ExportParts(id) => {
+                            if !self.selected_set.contains(&id) {
+                                self.select_instance(Some(id));
+                            }
+                            self.export_stl_selected_only = true;
+                            self.export_stl_dialog_open = true;
                         }
                         TreeAction::DeleteInstance(id) => {
                             if self.job.remove_instance(id) {
@@ -2541,6 +3045,75 @@ impl NestCraftApp {
         }
     }
 
+    fn reset_below_zero_imported_parts(&mut self) {
+        let items = std::mem::take(&mut self.below_zero_import_dialog);
+        if items.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let mut adjusted = 0usize;
+        for (id, _) in items {
+            if self.job.reset_instance_z_to_zero(id) {
+                adjusted += 1;
+            }
+        }
+        if adjusted > 0 {
+            self.mark_dirty();
+            self.status = format!("Reset Z = 0 (kept XY) for {adjusted} imported part(s)");
+        }
+    }
+
+    fn draw_below_zero_import_modal(&mut self, ctx: &egui::Context) {
+        if self.below_zero_import_dialog.is_empty() {
+            return;
+        }
+        let count = self.below_zero_import_dialog.len();
+        let lowest_z = self
+            .below_zero_import_dialog
+            .iter()
+            .map(|(_, z)| *z)
+            .fold(f32::INFINITY, f32::min);
+
+        let mut open = true;
+        let mut reset_zero = false;
+        let mut keep_location = false;
+
+        egui::Window::new("Imported Part(s) Below Z = 0")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                status_line(
+                    ui,
+                    &format!("{count} imported part(s) extend below Z = 0 (lowest Z: {lowest_z:.2} mm)."),
+                    StatusTone::Error,
+                );
+                ui.add_space(4.0);
+                ui.label("Keep the imported model location, or reset Z = 0 while keeping XY?");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if button(ui, "Reset Z = 0 (Keep XY)", Button::Primary).clicked() {
+                        reset_zero = true;
+                    }
+                    if button(ui, "Keep Model Location", Button::Small).clicked() {
+                        keep_location = true;
+                    }
+                });
+            });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            keep_location = true;
+        }
+
+        if reset_zero {
+            self.reset_below_zero_imported_parts();
+        } else if keep_location || !open {
+            self.below_zero_import_dialog.clear();
+            self.status = format!("Kept imported model location for {count} part(s) below Z = 0");
+        }
+    }
+
     fn draw_load_progress_modal(&self, ctx: &egui::Context) {
         let Some(task) = &self.load_task else {
             return;
@@ -3018,6 +3591,7 @@ impl NestCraftApp {
         let central = Container::new(ctx, Surface::Viewport).central();
         central.show(ui, |ui| {
             let rect = ui.available_rect_before_wrap();
+            self.viewport_aspect = f64::from(rect.width() / rect.height().max(1.0));
             let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
             let compass_centre = egui::pos2(rect.right() - 62.0, rect.top() + 62.0);
@@ -3029,16 +3603,33 @@ impl NestCraftApp {
                 .hover_pos()
                 .is_some_and(|p| self.view_bar_rect.is_some_and(|r| r.contains(p)));
 
+            if !over_compass
+                && !over_view_bar
+                && self.compass_drag.at.is_none()
+                && self.zoom_rect_mode
+                && resp.drag_started_by(egui::PointerButton::Secondary)
+                && let Some(pos) = resp.interact_pointer_pos()
+            {
+                self.viewport_ctx_menu = None;
+                self.zoom_rect = Some((pos, pos));
+            }
+
             if resp.dragged_by(egui::PointerButton::Middle) {
                 let delta = resp.drag_delta();
                 self.camera.pan(f64::from(delta.x), f64::from(delta.y), f64::from(rect.height().max(1.0)));
             } else if resp.dragged_by(egui::PointerButton::Secondary) {
                 self.viewport_ctx_menu = None;
-                let delta = resp.drag_delta();
-                if ui.input(|i| i.modifiers.shift) {
-                    self.camera.pan(f64::from(delta.x), f64::from(delta.y), f64::from(rect.height().max(1.0)));
-                } else {
-                    self.camera.orbit_unlimited_through_roll(f64::from(-delta.x) * 0.75, f64::from(delta.y) * 0.75);
+                if let Some((_, cur)) = &mut self.zoom_rect {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        *cur = pos;
+                    }
+                } else if !self.zoom_rect_mode {
+                    let delta = resp.drag_delta();
+                    if ui.input(|i| i.modifiers.shift) {
+                        self.camera.pan(f64::from(delta.x), f64::from(delta.y), f64::from(rect.height().max(1.0)));
+                    } else {
+                        self.camera.orbit_unlimited_through_roll(f64::from(-delta.x) * 0.75, f64::from(delta.y) * 0.75);
+                    }
                 }
             }
 
@@ -3067,26 +3658,41 @@ impl NestCraftApp {
                     {
                         let tr = inst.translation();
                         let plane_z = tr[2];
-                        if let Some(hit_pt) = viewport::intersect_camera_plane(&self.camera, rect, pos, tr) {
+                        let drag_instances: Vec<(InstanceId, [f32; 3])> = self
+                            .job
+                            .instances
+                            .iter()
+                            .filter(|i| self.selected_set.contains(&i.id) && !i.locked)
+                            .map(|i| (i.id, i.translation()))
+                            .collect();
+                        if !drag_instances.is_empty()
+                            && let Some(hit_pt) = viewport::intersect_camera_plane(&self.camera, rect, pos, tr)
+                        {
+                            self.push_undo();
+                            let drag_ids: Vec<InstanceId> = drag_instances.iter().map(|(id, _)| *id).collect();
                             self.drag_state = Some(DragState {
-                                instance_id: iid,
-                                start_translation: tr,
+                                anchor_id: iid,
+                                instances: drag_instances,
                                 start_hit: hit_pt,
                                 plane_z,
                             });
+                            self.start_moving_layer(viewport::DragExclude::Instances(drag_ids));
                         }
                     }
                 } else if viewport::pick_no_build_zone(&self.job, &self.camera, rect, pos) {
                     if let Some(zone) = &self.job.no_build_zone
                         && !zone.locked
                     {
-                        let plane_z = zone.position[2];
-                        if let Some(hit_pt) = viewport::intersect_camera_plane(&self.camera, rect, pos, zone.position) {
+                        let zone_pos = zone.position;
+                        let plane_z = zone_pos[2];
+                        if let Some(hit_pt) = viewport::intersect_camera_plane(&self.camera, rect, pos, zone_pos) {
+                            self.push_undo();
                             self.drag_zone = Some(DragZoneState {
-                                start_position: zone.position,
+                                start_position: zone_pos,
                                 start_hit: hit_pt,
                                 plane_z,
                             });
+                            self.start_moving_layer(viewport::DragExclude::NoBuildZone);
                         }
                     }
                 } else {
@@ -3110,7 +3716,6 @@ impl NestCraftApp {
                             && let Some(zone) = &mut self.job.no_build_zone
                         {
                             zone.position[2] = dz.start_position[2] + (z_now - dz.plane_z);
-                            self.mark_dirty();
                         }
                     } else if let Some(hit_now) = viewport::intersect_camera_plane(&self.camera, rect, pos, dz.start_hit)
                         && let Some(zone) = &mut self.job.no_build_zone
@@ -3118,31 +3723,46 @@ impl NestCraftApp {
                         zone.position[0] = dz.start_position[0] + (hit_now[0] - dz.start_hit[0]);
                         zone.position[1] = dz.start_position[1] + (hit_now[1] - dz.start_hit[1]);
                         zone.position[2] = dz.start_position[2] + (hit_now[2] - dz.start_hit[2]);
-                        self.mark_dirty();
                     }
-                } else if let Some(ds) = self.drag_state {
+                } else if let Some(ds) = &self.drag_state {
                     let shift = ui.input(|i| i.modifiers.shift);
-                    if shift {
-                        if let Some(z_now) = viewport::intersect_vertical_plane(&self.camera, rect, pos, ds.start_hit)
-                            && let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == ds.instance_id)
-                        {
-                            let mut tr = inst.translation();
-                            tr[2] = ds.start_translation[2] + (z_now - ds.plane_z);
-                            inst.set_translation(tr);
-                            self.job.clamp_instance_above_floor(ds.instance_id);
-                            self.mark_dirty();
+                    let raw_delta = if shift {
+                        viewport::intersect_vertical_plane(&self.camera, rect, pos, ds.start_hit)
+                            .map(|z_now| [0.0, 0.0, z_now - ds.plane_z])
+                    } else {
+                        viewport::intersect_camera_plane(&self.camera, rect, pos, ds.start_hit).map(|hit_now| {
+                            [
+                                hit_now[0] - ds.start_hit[0],
+                                hit_now[1] - ds.start_hit[1],
+                                hit_now[2] - ds.start_hit[2],
+                            ]
+                        })
+                    };
+                    if let Some(mut delta) = raw_delta {
+                        let floor_z = self.job.min_z_mm.max(0.0);
+                        let mut min_allowed_dz = f32::NEG_INFINITY;
+                        for (id, start_tr) in &ds.instances {
+                            if let Some(inst) = self.job.instances.iter().find(|i| i.id == *id)
+                                && let Some(proto) = self.job.part(inst.part_id)
+                            {
+                                let cur_tr = inst.translation();
+                                let cur_min_z = inst.world_bounds(proto.mesh.bounds)[0][2];
+                                let start_min_z = cur_min_z - cur_tr[2] + start_tr[2];
+                                min_allowed_dz = min_allowed_dz.max(floor_z - start_min_z);
+                            }
                         }
-                    } else if let Some(hit_now) = viewport::intersect_camera_plane(&self.camera, rect, pos, ds.start_hit)
-                        && let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == ds.instance_id)
-                    {
-                        let tr = [
-                            ds.start_translation[0] + (hit_now[0] - ds.start_hit[0]),
-                            ds.start_translation[1] + (hit_now[1] - ds.start_hit[1]),
-                            ds.start_translation[2] + (hit_now[2] - ds.start_hit[2]),
-                        ];
-                        inst.set_translation(tr);
-                        self.job.clamp_instance_above_floor(ds.instance_id);
-                        self.mark_dirty();
+                        if min_allowed_dz.is_finite() {
+                            delta[2] = delta[2].max(min_allowed_dz);
+                        }
+                        for (id, start_tr) in &ds.instances {
+                            if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == *id) {
+                                inst.set_translation([
+                                    start_tr[0] + delta[0],
+                                    start_tr[1] + delta[1],
+                                    start_tr[2] + delta[2],
+                                ]);
+                            }
+                        }
                     }
                 }
             }
@@ -3167,10 +3787,20 @@ impl NestCraftApp {
                         self.mark_dirty();
                     }
                 }
+                if let Some((start, end)) = self.zoom_rect.take() {
+                    let sel_rect = egui::Rect::from_two_pos(start, end);
+                    if sel_rect.width() > 4.0 && sel_rect.height() > 4.0 {
+                        self.zoom_to_screen_rect(rect, sel_rect);
+                        self.zoom_rect_mode = false;
+                    }
+                }
                 if self.drag_zone.take().is_some() {
                     self.persist_no_build_zone();
                 }
                 self.drag_state = None;
+                if self.moving_target.take().is_some() {
+                    self.mark_dirty();
+                }
             }
 
             if !over_compass
@@ -3214,13 +3844,19 @@ impl NestCraftApp {
                 let mut center_xy = false;
                 let mut rot_z = false;
                 let mut toggle_hide = false;
+                let mut toggle_transparent = false;
                 let mut toggle_lock = false;
+                let mut export_sel = false;
                 let mut delete_sel = false;
 
                 let is_hidden = self
                     .selected
                     .and_then(|id| self.job.instances.iter().find(|i| i.id == id))
                     .is_some_and(|i| i.hidden);
+                let is_transparent = self
+                    .selected
+                    .and_then(|id| self.job.instances.iter().find(|i| i.id == id))
+                    .is_some_and(|i| i.transparent);
                 let is_locked = self
                     .selected
                     .and_then(|id| self.job.instances.iter().find(|i| i.id == id))
@@ -3252,11 +3888,26 @@ impl NestCraftApp {
                         toggle_hide = true;
                         ui.close();
                     }
+                    if ui
+                        .button(if is_transparent {
+                            "Opaque"
+                        } else {
+                            "Transparent (50%)"
+                        })
+                        .clicked()
+                    {
+                        toggle_transparent = true;
+                        ui.close();
+                    }
                     if ui.button(if is_locked { "Unlock (L)" } else { "Lock (L)" }).clicked() {
                         toggle_lock = true;
                         ui.close();
                     }
                     ui.separator();
+                    if ui.button(export_part_menu_label(self.selected_set.len())).clicked() {
+                        export_sel = true;
+                        ui.close();
+                    }
                     if ui.button("Delete (Del)").clicked() {
                         delete_sel = true;
                         ui.close();
@@ -3271,6 +3922,7 @@ impl NestCraftApp {
                     self.open_duplicate_dialog();
                 } else if drop_floor {
                     self.viewport_ctx_menu = None;
+                    self.push_undo();
                     let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
                     for id in ids {
                         self.job.drop_instance_to_floor(id);
@@ -3279,11 +3931,14 @@ impl NestCraftApp {
                     self.status = "Dropped selection to Min Z".to_owned();
                 } else if center_xy {
                     self.viewport_ctx_menu = None;
-                    if let Some(sel) = self.selected
-                        && self.job.center_instance_xy(sel)
-                    {
-                        self.mark_dirty();
-                        self.status = "Centered part in XY".to_owned();
+                    if let Some(sel) = self.selected {
+                        self.push_undo();
+                        if self.job.center_instance_xy(sel) {
+                            self.mark_dirty();
+                            self.status = "Centered part in XY".to_owned();
+                        } else {
+                            self.undo_stack.pop();
+                        }
                     }
                 } else if rot_z {
                     self.viewport_ctx_menu = None;
@@ -3291,9 +3946,16 @@ impl NestCraftApp {
                 } else if toggle_hide {
                     self.viewport_ctx_menu = None;
                     self.toggle_selected_hidden();
+                } else if toggle_transparent {
+                    self.viewport_ctx_menu = None;
+                    self.toggle_selected_transparent();
                 } else if toggle_lock {
                     self.viewport_ctx_menu = None;
                     self.toggle_selected_locked();
+                } else if export_sel {
+                    self.viewport_ctx_menu = None;
+                    self.export_stl_selected_only = true;
+                    self.export_stl_dialog_open = true;
                 } else if delete_sel {
                     self.viewport_ctx_menu = None;
                     self.delete_selected();
@@ -3350,7 +4012,7 @@ impl NestCraftApp {
                 selection_tint: [0.93, 0.70, 0.22],
                 hatch: [[0.5, 0.5, 0.5]; solidcraft_viewport::hatch::HATCH_COLOURS],
                 sky: [0.0, 0.0, 1.0, 1.0],
-                moving: None,
+                moving: self.current_moving_layer(),
                 motions: Default::default(),
                 ground: None,
             });
@@ -3362,6 +4024,16 @@ impl NestCraftApp {
                     sel_rect,
                     0.0,
                     t.accent.gamma_multiply(0.16),
+                    egui::Stroke::new(1.5, t.accent),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if let Some((start, end)) = self.zoom_rect {
+                let sel_rect = egui::Rect::from_two_pos(start, end);
+                painter.rect(
+                    sel_rect,
+                    0.0,
+                    t.accent.gamma_multiply(0.14),
                     egui::Stroke::new(1.5, t.accent),
                     egui::StrokeKind::Inside,
                 );
@@ -3460,6 +4132,7 @@ impl eframe::App for NestCraftApp {
         self.handle_shortcuts(&ctx);
         self.handle_dropped_files(&ctx);
         self.draw_top_bar(ui, &ctx, &t);
+        self.draw_view_bar(ui, &ctx, &t);
         self.draw_bottom_bar(ui, &ctx, &t);
         self.draw_parts_browser(ui, &ctx, &t);
         self.draw_inspector(ui, &ctx, &t);
@@ -3468,6 +4141,7 @@ impl eframe::App for NestCraftApp {
         self.draw_duplicate_modal(&ctx);
         self.draw_move_modal(&ctx);
         self.draw_export_stl_modal(&ctx);
+        self.draw_below_zero_import_modal(&ctx);
         self.draw_load_progress_modal(&ctx);
         self.draw_drop_overlay(&ctx, window_rect, &t);
     }
@@ -3508,11 +4182,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn export_part_menu_label_pluralizes_for_multi_selection() {
+        assert_eq!(export_part_menu_label(0), "Export Part...");
+        assert_eq!(export_part_menu_label(1), "Export Part...");
+        assert_eq!(export_part_menu_label(2), "Export Parts...");
+    }
+
+    #[test]
+    fn view_zoom_helpers_frame_parts_platform_and_screen_rect() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        let iid = app.selected.expect("selected");
+        app.job.instances[0].set_translation([10.0, 10.0, 0.0]);
+
+        app.zoom_to_selected();
+        let selected_dist = app.camera.distance;
+
+        app.zoom_to_platform();
+        let platform_dist = app.camera.distance;
+        assert!(platform_dist > selected_dist);
+
+        app.zoom_to_all_parts();
+        assert!((app.camera.distance - selected_dist).abs() < 1e-4);
+
+        app.zoom_to_all();
+        assert!(app.camera.distance >= platform_dist - 1e-4);
+
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let half_rect = egui::Rect::from_center_size(viewport.center(), egui::vec2(400.0, 300.0));
+        let before_dist = app.camera.distance;
+        app.zoom_to_screen_rect(viewport, half_rect);
+        assert!((app.camera.distance - before_dist * 0.5).abs() < 1e-4);
+        let _ = iid;
+    }
+
+    #[test]
     fn app_initializes_and_syncs_scene() {
         let mut app = NestCraftApp::new();
         app.sync_scene_if_dirty();
         assert!(!app.scene_dirty);
         assert!(app.scene_slot.lock().is_ok_and(|g| g.is_some()));
+    }
+
+    #[test]
+    fn dragging_instance_uses_moving_layer_without_dirtying_scene() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        let iid = app.selected.expect("selected");
+        let start = app.job.instances[0].translation();
+        app.sync_scene_if_dirty();
+        let key_before = app.scene_key;
+
+        app.drag_state = Some(DragState {
+            anchor_id: iid,
+            instances: vec![(iid, start)],
+            start_hit: start,
+            plane_z: start[2],
+        });
+        app.start_moving_layer(viewport::DragExclude::Instances(vec![iid]));
+        app.sync_scene_if_dirty();
+        assert!(!app.scene_dirty);
+        assert_ne!(app.scene_key, key_before);
+        let key_during_drag = app.scene_key;
+
+        // Simulated drag frame: update translation without marking scene dirty.
+        app.job.instances[0].set_translation([start[0] + 15.0, start[1] - 5.0, start[2] + 3.0]);
+        assert!(!app.scene_dirty);
+        app.sync_scene_if_dirty();
+        assert_eq!(app.scene_key, key_during_drag);
+
+        let mv = app.current_moving_layer().expect("moving layer active");
+        assert_eq!(mv.key, app.moving_key);
+        assert!((mv.transform[3][0] - 15.0).abs() < 1e-4);
+        assert!((mv.transform[3][1] + 5.0).abs() < 1e-4);
+        assert!((mv.transform[3][2] - 3.0).abs() < 1e-4);
     }
 
     #[test]
@@ -3542,6 +4285,10 @@ mod tests {
 
         app.toggle_selected_hidden();
         assert!(app.job.instances[0].hidden);
+        app.toggle_selected_transparent();
+        assert!(app.job.instances[0].transparent);
+        app.toggle_selected_transparent();
+        assert!(!app.job.instances[0].transparent);
         app.toggle_selected_locked();
         assert!(app.job.instances[0].locked);
 
@@ -3813,6 +4560,90 @@ mod tests {
         }
         assert!(app.load_task.is_none());
         assert_eq!(app.job.instances.len(), 2);
+        assert!(app.below_zero_import_dialog.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn importing_stl_preserves_model_location_and_prompts_below_zero() {
+        let dir = std::env::temp_dir().join(format!("nestcraft_model_loc_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let above_stl = dir.join("above.stl");
+        let above_txt = b"solid tri\nfacet normal 0 0 1\nouter loop\nvertex 40 55 12\nvertex 50 55 12\nvertex 40 65 22\nendloop\nendfacet\nendsolid tri\n";
+        assert!(std::fs::write(&above_stl, above_txt).is_ok());
+
+        let below_stl = dir.join("below.stl");
+        let below_txt = b"solid tri\nfacet normal 0 0 1\nouter loop\nvertex 40 55 -8\nvertex 50 55 -8\nvertex 40 65 2\nendloop\nendfacet\nendsolid tri\n";
+        assert!(std::fs::write(&below_stl, below_txt).is_ok());
+
+        let mut app = NestCraftApp::new();
+        assert!(app.import_single_file(&above_stl).is_ok());
+        assert!(app.below_zero_import_dialog.is_empty());
+        let id_above = app.job.instances[0].id;
+        assert!((app.job.instance_min_z(id_above).expect("min_z") - 12.0).abs() < 1e-4);
+
+        assert!(app.import_single_file(&below_stl).is_ok());
+        assert_eq!(app.below_zero_import_dialog.len(), 1);
+        let id_below = app.job.instances[1].id;
+        assert!((app.job.instance_min_z(id_below).expect("min_z") + 8.0).abs() < 1e-4);
+
+        app.reset_below_zero_imported_parts();
+        assert!(app.below_zero_import_dialog.is_empty());
+        assert!(app.job.instance_min_z(id_below).expect("min_z").abs() < 1e-4);
+        let proto = app.job.part(app.job.instances[1].part_id).expect("part");
+        let wb = app.job.instances[1].world_bounds(proto.mesh.bounds);
+        assert!((wb[0][0] - 40.0).abs() < 1e-4);
+        assert!((wb[0][1] - 55.0).abs() < 1e-4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_and_redo_restore_unlimited_steps() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        let iid = app.selected.expect("selected");
+        let p0 = app.job.instances[0].translation();
+
+        app.nudge_selected([10.0, 0.0, 0.0]);
+        let p1 = app.job.instances[0].translation();
+        assert!((p1[0] - (p0[0] + 10.0)).abs() < 1e-4);
+
+        app.toggle_selected_transparent();
+        assert!(app.job.instances[0].transparent);
+
+        app.delete_selected();
+        assert!(app.job.instances.is_empty());
+
+        // Undo delete -> transparent -> nudge -> add_sample_part
+        assert!(app.undo());
+        assert_eq!(app.job.instances.len(), 1);
+        assert_eq!(app.job.instances[0].id, iid);
+        assert!(app.job.instances[0].transparent);
+
+        assert!(app.undo());
+        assert!(!app.job.instances[0].transparent);
+
+        assert!(app.undo());
+        assert!((app.job.instances[0].translation()[0] - p0[0]).abs() < 1e-4);
+
+        assert!(app.undo());
+        assert!(app.job.instances.is_empty());
+
+        // Stack exhausted
+        assert!(!app.undo());
+
+        // Redo all the way back
+        assert!(app.redo());
+        assert_eq!(app.job.instances.len(), 1);
+        assert!(app.redo());
+        assert!((app.job.instances[0].translation()[0] - (p0[0] + 10.0)).abs() < 1e-4);
+        assert!(app.redo());
+        assert!(app.job.instances[0].transparent);
+        assert!(app.redo());
+        assert!(app.job.instances.is_empty());
+        assert!(!app.redo());
     }
 }

@@ -73,6 +73,8 @@ struct NestcInstance {
     constraint: NestcRotationConstraint,
     locked: bool,
     hidden: bool,
+    #[serde(default)]
+    transparent: bool,
     group_id: Option<u32>,
 }
 
@@ -149,6 +151,7 @@ pub fn write_nestc(job: &BuildJob) -> Result<Vec<u8>> {
             constraint: to_nestc_constraint(i.constraint),
             locked: i.locked,
             hidden: i.hidden,
+            transparent: i.transparent,
             group_id: i.group_id.map(|g| g.0),
         })
         .collect();
@@ -254,6 +257,7 @@ pub fn read_nestc(bytes: &[u8]) -> Result<BuildJob> {
             constraint: from_nestc_constraint(i.constraint),
             locked: i.locked,
             hidden: i.hidden,
+            transparent: i.transparent,
             group_id: i.group_id.map(GroupId),
         });
     }
