@@ -85,6 +85,7 @@ pub fn build_gpu_scene(
             look: InstanceLook::Opaque,
             levels: Vec::new(),
             closed: true,
+            edges: None,
         });
 
         let in_bounds = job.is_instance_in_bounds(inst.id);

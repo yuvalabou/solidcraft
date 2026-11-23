@@ -61,6 +61,7 @@ fn main() -> eframe::Result<()> {
                     samples: 1,
                     tess: false,
                     oit: false,
+                    edges: false,
                 };
                 let scene = GpuTarget {
                     depth: Some(solidcraft_viewport_gpu::depth_format(&rs.device, true)),
@@ -1491,7 +1492,8 @@ impl NestCraftApp {
                 turned_depth: Some(vp.turned_depth_f32()),
                 back,
                 size_px,
-                clip: [0.0; 4],
+                clip: Default::default(),
+                clip_hatch: Default::default(),
                 cap: [0.0; 4],
                 images: Vec::new(),
                 clouds: Vec::new(),
@@ -1502,12 +1504,15 @@ impl NestCraftApp {
                 eye: [e[0], e[1], e[2], 1.0],
                 ao_radius: 0.0,
                 ao_samples: 0,
+                edge_px: 0.0,
                 ssaa: 1.0,
                 hover_tint: [0.08, 0.08, 0.08],
                 selection_tint: [0.93, 0.70, 0.22],
                 hatch: [[0.5, 0.5, 0.5]; solidcraft_viewport::hatch::HATCH_COLOURS],
                 sky: [0.0, 0.0, 1.0, 1.0],
                 moving: None,
+                motions: Default::default(),
+                ground: None,
             });
             painter.add(egui_wgpu::Callback::new_paint_callback(rect, cb));
 
