@@ -341,9 +341,9 @@ All SLS development uses `sls-dev` as the protected integration branch, while `m
   - **Fast Multi-Part Drag (`MovingLayer`):** Switched viewport part & no-build-zone dragging to `Frame::moving` (`MovingLayer`), cached `no_build_zone` `SharedTris`, and eliminated $O(N^2)$ bounds scans in `build_gpu_scene_with_exclude`. Group-dragging a multi-selection moves all unlocked selected parts together.
   - **View Banner & Zoom Tools:** Added the `View` banner below the top bar with `Zoom to All Parts`, `Zoom to Selected`, `Zoom to Platform`, `Zoom to All`, and `Zoom to Selection` (right-drag rectangle zoom).
   - **Import & Undo:** Parallelized STL/3MF parsing and `SharedTris` packing across CPU cores (`start_import_files`), preserved original model locations on import with a below-`Z = 0` prompt (`Reset Z = 0 (Keep XY)` vs `Keep Model Location`), and added unlimited `Ctrl+Z` / `Ctrl+Y` / `Ctrl+Shift+Z` undo/redo.
-  - **Part Visualization, Context Menus & Shortcuts:** Added 50% transparency (`InstanceLook::Faded`), per-part RGB color picker (inspector + context menu), `Export Part(s)...`, `Group Selected` / `Ungroup` / `Remove Empty Groups`, `Shells to Parts`, `Merge Selected Parts`, interactive `Align Face to Z` (`-Z` normal snap with coplanar face hover highlight), centroid-preserving rotation (`X`/`Y`/`Z` ±45°, `Ctrl+Down` Z-snap), and compact single-occurrence parts tree with 20×20 shaded thumbnails.
-- **Tests Run (`52 passed; 0 failed`):**
+  - **Part Visualization, Context Menus & Shortcuts:** Added 50% transparency (`InstanceLook::Faded`), per-part RGB color picker (inspector + context menu), `Export Part(s)...`, `Group Selected` / `Ungroup` / `Remove Empty Groups`, `Shells to Parts`, `Merge Selected Parts`, interactive `Align Face to Z` (`-Z` normal snap with coplanar face hover highlight), centroid-preserving rotation (`X`/`Y`/`Z` ±45°, `Ctrl+Down` Z-snap), **Scale Part(s)** (`Ctrl+S` popup: Uniform/Per-Axis, Percent/Absolute/Factor, `in ↔ mm`, Keep Open, Reset Scale, `Ctrl+Z` undo), and compact single-occurrence parts tree with 20×20 shaded thumbnails.
+- **Tests Run (`53 passed; 0 failed`):**
   - `nestcraft-core`: `22 passed; 0 failed`
-  - `nestcraft`: `30 passed; 0 failed`
+  - `nestcraft`: `31 passed; 0 failed`
   - `cargo build -p nestcraft` and `cargo clippy -p nestcraft-core -p nestcraft --all-targets -- -D warnings`: passed (0 warnings in `nestcraft-core` / `nestcraft`).
 

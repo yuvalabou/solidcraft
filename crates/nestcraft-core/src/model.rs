@@ -1051,6 +1051,54 @@ impl BuildJob {
         true
     }
 
+    /// Scale `inst_id`'s mesh by `factors = [sx, sy, sz]` (> 0) around its local bounding-box center.
+    ///
+    /// If other instances share the same `PartId`, a new `PartProto` is created for `inst_id`
+    /// so un-selected siblings stay untouched. Returns the `PartId` holding the scaled mesh.
+    pub fn scale_instance(&mut self, inst_id: InstanceId, factors: [f32; 3]) -> Result<PartId> {
+        if factors.iter().any(|f| !f.is_finite() || *f <= 1e-6) {
+            return Err(NestCraftError::InvalidInput(
+                "Scale factors must be finite positive numbers".to_owned(),
+            ));
+        }
+        let old_part_id = self
+            .instances
+            .iter()
+            .find(|i| i.id == inst_id)
+            .map(|i| i.part_id)
+            .ok_or_else(|| NestCraftError::InvalidInput(format!("unknown instance id {}", inst_id.0)))?;
+        let proto = self
+            .part(old_part_id)
+            .cloned()
+            .ok_or_else(|| NestCraftError::InvalidInput(format!("unknown part id {}", old_part_id.0)))?;
+
+        let b = proto.mesh.bounds;
+        let lc = [
+            (b[0][0] + b[1][0]) * 0.5,
+            (b[0][1] + b[1][1]) * 0.5,
+            (b[0][2] + b[1][2]) * 0.5,
+        ];
+        let scaled_positions: Vec<[f32; 3]> = proto
+            .mesh
+            .positions
+            .iter()
+            .map(|p| {
+                [
+                    lc[0] + (p[0] - lc[0]) * factors[0],
+                    lc[1] + (p[1] - lc[1]) * factors[1],
+                    lc[2] + (p[2] - lc[2]) * factors[2],
+                ]
+            })
+            .collect();
+        let scaled_mesh = Arc::new(TriMesh::from_indexed(scaled_positions, proto.mesh.indices.clone())?);
+        let target_part_id = self.add_part(proto.name, scaled_mesh);
+        if let Some(inst) = self.instances.iter_mut().find(|i| i.id == inst_id) {
+            inst.part_id = target_part_id;
+        }
+        self.clamp_instance_above_floor(inst_id);
+        Ok(target_part_id)
+    }
+
     /// Split a multi-shell instance into separate parts/instances at the same transform.
     ///
     /// Returns the newly created instance IDs, or an empty `Vec` if the mesh has <= 1 shell.

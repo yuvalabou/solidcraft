@@ -240,6 +240,17 @@ struct NestCraftApp {
     move_dialog_open: bool,
     move_mode_idx: usize,
     move_xyz: [f32; 3],
+    scale_dialog_open: bool,
+    scale_uniform: bool,
+    scale_keep_open: bool,
+    scale_mode_idx: usize,
+    scale_pct: [f32; 3],
+    scale_abs_mm: [f32; 3],
+    scale_factor: [f32; 3],
+    scale_base_dims: [f32; 3],
+    scale_initial_dims: [f32; 3],
+    scale_initial_snapshot: Option<UndoSnapshot>,
+    scale_applied_in_session: usize,
     color_picker_open: bool,
     color_picker_rgb: [u8; 3],
     color_picker_undo_pushed: bool,
@@ -711,6 +722,17 @@ impl NestCraftApp {
             move_dialog_open: false,
             move_mode_idx: 0,
             move_xyz: [0.0, 0.0, 0.0],
+            scale_dialog_open: false,
+            scale_uniform: true,
+            scale_keep_open: false,
+            scale_mode_idx: 0,
+            scale_pct: [100.0, 100.0, 100.0],
+            scale_abs_mm: [10.0, 10.0, 10.0],
+            scale_factor: [1.0, 1.0, 1.0],
+            scale_base_dims: [10.0, 10.0, 10.0],
+            scale_initial_dims: [10.0, 10.0, 10.0],
+            scale_initial_snapshot: None,
+            scale_applied_in_session: 0,
             color_picker_open: false,
             color_picker_rgb: [220, 220, 220],
             color_picker_undo_pushed: false,
@@ -1012,6 +1034,85 @@ impl NestCraftApp {
             self.move_xyz = inst.translation();
         }
         self.move_dialog_open = true;
+    }
+
+    fn selected_primary_dims(&self) -> [f32; 3] {
+        self.selected
+            .or_else(|| self.selected_set.iter().copied().next())
+            .and_then(|id| self.job.instances.iter().find(|i| i.id == id))
+            .and_then(|inst| {
+                self.job.part(inst.part_id).map(|p| {
+                    let wb = inst.world_bounds(p.mesh.bounds);
+                    [
+                        (wb[1][0] - wb[0][0]).max(0.01),
+                        (wb[1][1] - wb[0][1]).max(0.01),
+                        (wb[1][2] - wb[0][2]).max(0.01),
+                    ]
+                })
+            })
+            .unwrap_or([10.0, 10.0, 10.0])
+    }
+
+    fn open_scale_dialog(&mut self) {
+        if self.selected_set.is_empty() {
+            self.status = "Select part(s) to scale".to_owned();
+            return;
+        }
+        let dims = self.selected_primary_dims();
+        self.scale_pct = [100.0, 100.0, 100.0];
+        self.scale_factor = [1.0, 1.0, 1.0];
+        self.scale_abs_mm = dims;
+        self.scale_base_dims = dims;
+        self.scale_initial_dims = dims;
+        self.scale_initial_snapshot = Some(self.snapshot());
+        self.scale_applied_in_session = 0;
+        self.scale_dialog_open = true;
+    }
+
+    fn reset_scale_in_dialog(&mut self) {
+        if self.scale_applied_in_session > 0
+            && let Some(initial) = self.scale_initial_snapshot.clone()
+        {
+            self.push_undo();
+            self.restore_snapshot(initial);
+            self.scale_applied_in_session = 0;
+            self.status = "Reset scale to original dimensions".to_owned();
+        }
+        self.scale_pct = [100.0, 100.0, 100.0];
+        self.scale_factor = [1.0, 1.0, 1.0];
+        self.scale_abs_mm = self.scale_initial_dims;
+        self.scale_base_dims = self.scale_initial_dims;
+    }
+
+    fn apply_scale_selection(&mut self, factors: [f32; 3]) {
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let mut scaled = 0usize;
+        for id in ids {
+            match self.job.scale_instance(id, factors) {
+                Ok(pid) => {
+                    self.scene_cache.parts.remove(&pid);
+                    self.manifold_cache.remove(&pid);
+                    self.part_thumbs.remove(&pid);
+                    scaled += 1;
+                }
+                Err(e) => {
+                    self.undo_stack.pop();
+                    self.status = format!("Scale failed: {e}");
+                    return;
+                }
+            }
+        }
+        if scaled > 0 {
+            self.mark_dirty();
+            self.status = format!(
+                "Scaled {scaled} part(s) by ({:.3}×, {:.3}×, {:.3}×)",
+                factors[0], factors[1], factors[2]
+            );
+        }
     }
 
     fn apply_move_selection(&mut self, absolute: bool, xyz: [f32; 3]) {
@@ -1431,6 +1532,7 @@ impl NestCraftApp {
             || self.custom_platform_open
             || self.dup_dialog_open
             || self.move_dialog_open
+            || self.scale_dialog_open
             || self.color_picker_open
             || self.export_stl_dialog_open
             || !self.below_zero_import_dialog.is_empty()
@@ -1450,7 +1552,7 @@ impl NestCraftApp {
                 self.redo();
                 return;
             }
-            if cmd && i.key_pressed(egui::Key::S) {
+            if cmd && shift && i.key_pressed(egui::Key::S) {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("NestCraft Bed", &["nestc"])
                     .set_file_name("bed.nestc")
@@ -1458,6 +1560,10 @@ impl NestCraftApp {
                 {
                     self.save_bed_file(&path);
                 }
+                return;
+            }
+            if cmd && !shift && i.key_pressed(egui::Key::S) {
+                self.open_scale_dialog();
                 return;
             }
             if cmd && i.key_pressed(egui::Key::D) {
@@ -2197,7 +2303,7 @@ impl NestCraftApp {
                                 self.start_open_bed(path, ctx);
                             }
                             if icon_label_button(ui, "Save Bed", "save", true, false)
-                                .backing_on_hover_text("Save current bed, parts, and settings as .nestc (Ctrl+S)")
+                                .backing_on_hover_text("Save current bed, parts, and settings as .nestc (Ctrl+Shift+S)")
                                 .clicked()
                                 && let Some(path) = rfd::FileDialog::new()
                                     .add_filter("NestCraft Bed", &["nestc"])
@@ -2246,6 +2352,12 @@ impl NestCraftApp {
                                 .clicked()
                             {
                                 self.open_move_dialog();
+                            }
+                            if icon_label_button(ui, "Scale", "resize", !self.selected_set.is_empty(), false)
+                                .backing_on_hover_text("Scale selected part(s) uniformly or per-axis (Ctrl+S)")
+                                .clicked()
+                            {
+                                self.open_scale_dialog();
                             }
                             if icon_label_button(ui, "Duplicate", "sls_duplicate", self.selected.is_some(), false)
                                 .backing_on_hover_text("Duplicate selected part in X/Y/Z grid (Ctrl+D)")
@@ -2588,6 +2700,7 @@ impl NestCraftApp {
             SplitShells(PartId),
             ShellsToParts(InstanceId),
             AlignFace(InstanceId),
+            OpenScale(InstanceId),
             MergeSelected,
         }
 
@@ -2794,6 +2907,10 @@ impl NestCraftApp {
                                             ui.separator();
                                             if icon_label_button(ui, "Align Face to Z", "sls_orient_lock", true, false).clicked() {
                                         actions.push(TreeAction::AlignFace(inst.id));
+                                        ui.close();
+                                    }
+                                    if ui.button("Scale... (Ctrl+S)").clicked() {
+                                        actions.push(TreeAction::OpenScale(inst.id));
                                         ui.close();
                                     }
                                     if ui.button("Shells to Parts").clicked() {
@@ -3008,6 +3125,10 @@ impl NestCraftApp {
                                         actions.push(TreeAction::AlignFace(inst.id));
                                         ui.close();
                                     }
+                                    if ui.button("Scale... (Ctrl+S)").clicked() {
+                                        actions.push(TreeAction::OpenScale(inst.id));
+                                        ui.close();
+                                    }
                                     if ui.button("Shells to Parts").clicked() {
                                         actions.push(TreeAction::ShellsToParts(inst.id));
                                         ui.close();
@@ -3185,6 +3306,10 @@ impl NestCraftApp {
                                         actions.push(TreeAction::AlignFace(inst.id));
                                         ui.close();
                                     }
+                                    if ui.button("Scale... (Ctrl+S)").clicked() {
+                                        actions.push(TreeAction::OpenScale(inst.id));
+                                        ui.close();
+                                    }
                                     if ui.button("Shells to Parts").clicked() {
                                                 actions.push(TreeAction::ShellsToParts(inst.id));
                                                 ui.close();
@@ -3231,6 +3356,7 @@ impl NestCraftApp {
                             | TreeAction::PickColor(_)
                             | TreeAction::ShellsToParts(_)
                             | TreeAction::AlignFace(_)
+                            | TreeAction::OpenScale(_)
                             | TreeAction::MergeSelected
                             | TreeAction::GroupSelected(_)
                             | TreeAction::UngroupSelected(_)
@@ -3364,6 +3490,12 @@ impl NestCraftApp {
                         TreeAction::AlignFace(id) => {
                             self.select_instance(Some(id));
                             self.start_align_face_mode(id);
+                        }
+                        TreeAction::OpenScale(id) => {
+                            if !self.selected_set.contains(&id) {
+                                self.select_instance(Some(id));
+                            }
+                            self.open_scale_dialog();
                         }
                         TreeAction::MergeSelected => {
                             self.merge_selected_parts();
@@ -3710,6 +3842,238 @@ impl NestCraftApp {
             self.move_dialog_open = false;
         } else if cancel || !open {
             self.move_dialog_open = false;
+        }
+    }
+
+    fn draw_scale_modal(&mut self, ctx: &egui::Context) {
+        if !self.scale_dialog_open {
+            return;
+        }
+        let mut open = self.scale_dialog_open;
+        let mut apply_factors: Option<[f32; 3]> = None;
+        let mut reset_scale = false;
+        let mut undo_scale = false;
+        let mut cancel = false;
+
+        egui::Window::new("Scale Part(s)")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let mut axis_mode = usize::from(!self.scale_uniform);
+                row(ui, "Axis Mode", |ui| {
+                    ui.push_id("scale_axis_mode", |ui| {
+                        segmented(
+                            ui,
+                            &mut axis_mode,
+                            &["Uniform", "Per-Axis"],
+                            Segments {
+                                dense: true,
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .inner
+                });
+                self.scale_uniform = axis_mode == 0;
+
+                row(ui, "Input Mode", |ui| {
+                    ui.push_id("scale_input_mode", |ui| {
+                        segmented(
+                            ui,
+                            &mut self.scale_mode_idx,
+                            &["Percent (%)", "Absolute (mm)", "Factor (×)"],
+                            Segments {
+                                dense: true,
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .inner
+                });
+
+                match self.scale_mode_idx {
+                    0 => {
+                        if self.scale_uniform {
+                            row(ui, "Scale", |ui| {
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.scale_pct[0])
+                                            .range(0.1..=10000.0)
+                                            .speed(1.0)
+                                            .suffix(" %"),
+                                    )
+                                    .changed()
+                                {
+                                    self.scale_pct[1] = self.scale_pct[0];
+                                    self.scale_pct[2] = self.scale_pct[0];
+                                }
+                            });
+                        } else {
+                            for (k, lbl) in [(0, "X"), (1, "Y"), (2, "Z")] {
+                                row(ui, lbl, |ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.scale_pct[k])
+                                            .range(0.1..=10000.0)
+                                            .speed(1.0)
+                                            .suffix(" %"),
+                                    );
+                                });
+                            }
+                        }
+                    }
+                    1 => {
+                        for (k, lbl) in [(0, "Size X"), (1, "Size Y"), (2, "Size Z")] {
+                            row(ui, lbl, |ui| {
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.scale_abs_mm[k])
+                                            .range(0.01..=5000.0)
+                                            .speed(0.5)
+                                            .suffix(" mm"),
+                                    )
+                                    .changed()
+                                    && self.scale_uniform
+                                {
+                                    let ratio = self.scale_abs_mm[k] / self.scale_base_dims[k].max(1e-4);
+                                    for j in 0..3 {
+                                        if j != k {
+                                            self.scale_abs_mm[j] = (self.scale_base_dims[j] * ratio).max(0.01);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    _ => {
+                        if self.scale_uniform {
+                            row(ui, "Factor", |ui| {
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.scale_factor[0])
+                                            .range(0.001..=1000.0)
+                                            .speed(0.05)
+                                            .suffix(" ×"),
+                                    )
+                                    .changed()
+                                {
+                                    self.scale_factor[1] = self.scale_factor[0];
+                                    self.scale_factor[2] = self.scale_factor[0];
+                                }
+                            });
+                        } else {
+                            for (k, lbl) in [(0, "Factor X"), (1, "Factor Y"), (2, "Factor Z")] {
+                                row(ui, lbl, |ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.scale_factor[k])
+                                            .range(0.001..=1000.0)
+                                            .speed(0.05)
+                                            .suffix(" ×"),
+                                    );
+                                });
+                            }
+                        }
+                    }
+                }
+
+                row(ui, "Units Quick", |ui| {
+                    ui.horizontal(|ui| {
+                        if button(ui, "in → mm (×25.4)", Button::Small)
+                            .backing_on_hover_text("Convert imperial inches to millimetres (× 25.4)")
+                            .clicked()
+                        {
+                            apply_factors = Some([25.4, 25.4, 25.4]);
+                        }
+                        if button(ui, "mm → in (÷25.4)", Button::Small)
+                            .backing_on_hover_text("Convert millimetres to imperial inches (× 1/25.4)")
+                            .clicked()
+                        {
+                            let inv = 1.0_f32 / 25.4;
+                            apply_factors = Some([inv, inv, inv]);
+                        }
+                    });
+                });
+
+                if checkbox_row(ui, "scale_keep_open", "Keep Open (Test Final Dim)", self.scale_keep_open) {
+                    self.scale_keep_open = !self.scale_keep_open;
+                }
+                let cur_dims = self.selected_primary_dims();
+                status_line(
+                    ui,
+                    &format!("Current: {:.2} × {:.2} × {:.2} mm", cur_dims[0], cur_dims[1], cur_dims[2]),
+                    StatusTone::Dim,
+                );
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if button(ui, "Apply", Button::Primary).clicked() {
+                        let f = match self.scale_mode_idx {
+                            0 => [
+                                self.scale_pct[0] / 100.0,
+                                self.scale_pct[1] / 100.0,
+                                self.scale_pct[2] / 100.0,
+                            ],
+                            1 => [
+                                self.scale_abs_mm[0] / self.scale_base_dims[0].max(1e-4),
+                                self.scale_abs_mm[1] / self.scale_base_dims[1].max(1e-4),
+                                self.scale_abs_mm[2] / self.scale_base_dims[2].max(1e-4),
+                            ],
+                            _ => self.scale_factor,
+                        };
+                        apply_factors = Some(if self.scale_uniform { [f[0]; 3] } else { f });
+                    }
+                    if button(ui, "Reset Scale", Button::Small)
+                        .backing_on_hover_text("Reset scale inputs and restore original dimensions")
+                        .clicked()
+                    {
+                        reset_scale = true;
+                    }
+                    if button(ui, "Close", Button::Small).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
+            undo_scale = true;
+        } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+
+        if undo_scale {
+            if self.scale_applied_in_session > 0 && self.undo() {
+                self.scale_applied_in_session -= 1;
+                let dims = self.selected_primary_dims();
+                self.scale_pct = [100.0, 100.0, 100.0];
+                self.scale_factor = [1.0, 1.0, 1.0];
+                self.scale_abs_mm = dims;
+                self.scale_base_dims = dims;
+            } else {
+                self.scale_dialog_open = false;
+                self.scale_initial_snapshot = None;
+                self.scale_applied_in_session = 0;
+            }
+        } else if reset_scale {
+            self.reset_scale_in_dialog();
+        } else if let Some(factors) = apply_factors {
+            self.apply_scale_selection(factors);
+            self.scale_applied_in_session += 1;
+            if self.scale_keep_open {
+                let dims = self.selected_primary_dims();
+                self.scale_pct = [100.0, 100.0, 100.0];
+                self.scale_factor = [1.0, 1.0, 1.0];
+                self.scale_abs_mm = dims;
+                self.scale_base_dims = dims;
+            } else {
+                self.scale_dialog_open = false;
+                self.scale_initial_snapshot = None;
+                self.scale_applied_in_session = 0;
+            }
+        } else if cancel || !open {
+            self.scale_dialog_open = false;
+            self.scale_initial_snapshot = None;
+            self.scale_applied_in_session = 0;
         }
     }
 
@@ -4683,6 +5047,7 @@ impl NestCraftApp {
 
             if self.viewport_ctx_menu.is_some() {
                 let mut open_move = false;
+                let mut open_scale = false;
                 let mut open_dup = false;
                 let mut drop_floor = false;
                 let mut center_xy = false;
@@ -4722,6 +5087,10 @@ impl NestCraftApp {
                 resp.context_menu(|ui| {
                     if ui.button("Move... (M)").clicked() {
                         open_move = true;
+                        ui.close();
+                    }
+                    if ui.button("Scale... (Ctrl+S)").clicked() {
+                        open_scale = true;
                         ui.close();
                     }
                     if ui.button("Duplicate... (Ctrl+D)").clicked() {
@@ -4813,6 +5182,9 @@ impl NestCraftApp {
                 if open_move {
                     self.viewport_ctx_menu = None;
                     self.open_move_dialog();
+                } else if open_scale {
+                    self.viewport_ctx_menu = None;
+                    self.open_scale_dialog();
                 } else if open_dup {
                     self.viewport_ctx_menu = None;
                     self.open_duplicate_dialog();
@@ -5068,6 +5440,7 @@ impl eframe::App for NestCraftApp {
         self.draw_custom_platform_modal(&ctx);
         self.draw_duplicate_modal(&ctx);
         self.draw_move_modal(&ctx);
+        self.draw_scale_modal(&ctx);
         self.draw_color_picker_modal(&ctx);
         self.draw_export_stl_modal(&ctx);
         self.draw_below_zero_import_modal(&ctx);
@@ -5709,5 +6082,41 @@ mod tests {
         assert!((wn_z + 1.0).abs() < 1e-4, "expected -1.0, got {wn_z}");
         let top_after = app.job.instances[0].world_bounds(bounds)[1][2];
         assert!((top_before - top_after).abs() < 1e-3);
+    }
+
+    #[test]
+    fn scaling_part_supports_uniform_per_axis_and_imperial_metric_with_undo() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        let iid = app.selected.expect("selected");
+        let dims0 = {
+            let b = app.job.part(app.job.instances[0].part_id).expect("part").mesh.bounds;
+            app.job.instances[0].world_bounds(b)
+        };
+        let dx0 = dims0[1][0] - dims0[0][0];
+        let dy0 = dims0[1][1] - dims0[0][1];
+        let dz0 = dims0[1][2] - dims0[0][2];
+
+        // Per-axis scale (2x X, 1x Y, 0.5x Z)
+        app.apply_scale_selection([2.0, 1.0, 0.5]);
+        let b1 = app.job.part(app.job.instances[0].part_id).expect("part").mesh.bounds;
+        let wb1 = app.job.instances[0].world_bounds(b1);
+        assert!(((wb1[1][0] - wb1[0][0]) - dx0 * 2.0).abs() < 1e-3);
+        assert!(((wb1[1][1] - wb1[0][1]) - dy0).abs() < 1e-3);
+        assert!(((wb1[1][2] - wb1[0][2]) - dz0 * 0.5).abs() < 1e-3);
+
+        // Imperial -> Metric (x 25.4)
+        app.apply_scale_selection([25.4, 25.4, 25.4]);
+        let b2 = app.job.part(app.job.instances[0].part_id).expect("part").mesh.bounds;
+        let wb2 = app.job.instances[0].world_bounds(b2);
+        assert!(((wb2[1][0] - wb2[0][0]) - dx0 * 2.0 * 25.4).abs() < 1e-2);
+
+        // Undo back to original size
+        assert!(app.undo());
+        assert!(app.undo());
+        let b_undo = app.job.part(app.job.instances[0].part_id).expect("part").mesh.bounds;
+        let wb_undo = app.job.instances[0].world_bounds(b_undo);
+        assert!(((wb_undo[1][0] - wb_undo[0][0]) - dx0).abs() < 1e-3);
+        let _ = iid;
     }
 }
