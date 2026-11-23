@@ -24,7 +24,7 @@ use nestcraft_core::io::{nestc, stl, threemf};
 use nestcraft_core::manifold::{self, ManifoldReport};
 use nestcraft_core::model::{
     BedOrigin, BuildJob, GroupId, IDENTITY_TRANSFORM, InstanceId, MachineProfile, NoBuildZone, PartId,
-    RotationConstraint, TriMesh, transform_from_translation_euler_deg,
+    RotationConstraint, TriMesh,
 };
 use serde::{Deserialize, Serialize};
 use solidcraft_theme::Tokens;
@@ -237,6 +237,9 @@ struct NestCraftApp {
     move_dialog_open: bool,
     move_mode_idx: usize,
     move_xyz: [f32; 3],
+    color_picker_open: bool,
+    color_picker_rgb: [u8; 3],
+    color_picker_undo_pushed: bool,
     export_stl_dialog_open: bool,
     export_stl_selected_only: bool,
     export_stl_prefix: String,
@@ -406,6 +409,49 @@ fn export_part_menu_label(selected_count: usize) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ColorMenuChoice {
+    OpenPicker,
+    Set(Option<[u8; 3]>),
+}
+
+fn show_color_submenu(ui: &mut egui::Ui) -> Option<ColorMenuChoice> {
+    const PRESETS: &[(&str, [u8; 3])] = &[
+        ("Red", [224, 72, 72]),
+        ("Orange", [235, 140, 52]),
+        ("Yellow", [235, 200, 56]),
+        ("Green", [72, 188, 108]),
+        ("Cyan", [56, 188, 212]),
+        ("Blue", [72, 136, 236]),
+        ("Purple", [168, 104, 232]),
+        ("White", [232, 234, 238]),
+    ];
+    let mut choice = None;
+    ui.menu_button("Color", |ui| {
+        if ui.button("Color Picker...").clicked() {
+            choice = Some(ColorMenuChoice::OpenPicker);
+            ui.close();
+        }
+        ui.separator();
+        for &(label, rgb) in PRESETS {
+            let swatch = egui::RichText::new("■").color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+            ui.horizontal(|ui| {
+                ui.label(swatch);
+                if ui.button(label).clicked() {
+                    choice = Some(ColorMenuChoice::Set(Some(rgb)));
+                    ui.close();
+                }
+            });
+        }
+        ui.separator();
+        if ui.button("Reset Default").clicked() {
+            choice = Some(ColorMenuChoice::Set(None));
+            ui.close();
+        }
+    });
+    choice
+}
+
 fn format_export_stl_stem(
     prefix: &str,
     part_name: &str,
@@ -569,6 +615,9 @@ impl NestCraftApp {
             move_dialog_open: false,
             move_mode_idx: 0,
             move_xyz: [0.0, 0.0, 0.0],
+            color_picker_open: false,
+            color_picker_rgb: [220, 220, 220],
+            color_picker_undo_pushed: false,
             export_stl_dialog_open: false,
             export_stl_selected_only: false,
             export_stl_prefix: String::new(),
@@ -663,6 +712,64 @@ impl NestCraftApp {
         self.status = format!("Split '{}' into {count} shell parts.", proto.name);
     }
 
+    fn shells_to_parts_for(&mut self, ids: Vec<InstanceId>) {
+        if ids.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let mut split_sources = 0usize;
+        let mut created_all = Vec::new();
+        for id in ids {
+            if let Ok(created) = self.job.split_instance_shells(id)
+                && !created.is_empty()
+            {
+                split_sources += 1;
+                self.euler_edit.remove(&id);
+                self.selected_set.remove(&id);
+                created_all.extend(created);
+            }
+        }
+        if created_all.is_empty() {
+            self.undo_stack.pop();
+            self.status = "Selected part(s) have only 1 shell.".to_owned();
+            return;
+        }
+        self.selected_set.clear();
+        for &id in &created_all {
+            self.selected_set.insert(id);
+        }
+        self.selected = created_all.last().copied();
+        self.selection_anchor = self.selected;
+        self.mark_dirty();
+        self.status = format!(
+            "Split {split_sources} part(s) into {} shell parts.",
+            created_all.len()
+        );
+    }
+
+    fn merge_selected_parts(&mut self) {
+        if self.selected_set.len() < 2 {
+            self.status = "Select at least 2 parts to merge.".to_owned();
+            return;
+        }
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        self.push_undo();
+        match self.job.merge_instances(&ids) {
+            Ok(merged_id) => {
+                for id in &ids {
+                    self.euler_edit.remove(id);
+                }
+                self.select_instance(Some(merged_id));
+                self.mark_dirty();
+                self.status = format!("Merged {} parts into #{}", ids.len(), merged_id.0);
+            }
+            Err(e) => {
+                self.undo_stack.pop();
+                self.status = format!("Merge failed: {e}");
+            }
+        }
+    }
+
     fn select_instance(&mut self, id: Option<InstanceId>) {
         self.selected_set.clear();
         if let Some(iid) = id {
@@ -736,11 +843,15 @@ impl NestCraftApp {
         }
         self.push_undo();
         for sel_id in ids {
-            if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == sel_id) {
-                let pos = inst.translation();
+            let new_euler = if let Some(inst) = self.job.instances.iter().find(|i| i.id == sel_id) {
                 let euler = self.euler_edit.entry(sel_id).or_insert_with(|| inst.euler_deg());
                 euler[axis] = (euler[axis] + 90.0).rem_euclid(360.0);
-                inst.transform = transform_from_translation_euler_deg(pos, *euler);
+                Some(*euler)
+            } else {
+                None
+            };
+            if let Some(euler) = new_euler {
+                self.job.set_instance_euler_around_center(sel_id, euler);
                 self.job.clamp_instance_above_floor(sel_id);
             }
         }
@@ -985,6 +1096,104 @@ impl NestCraftApp {
         }
     }
 
+    fn set_selected_color(&mut self, color: Option<[u8; 3]>) {
+        if self.selected_set.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        let mut changed = 0usize;
+        for id in ids {
+            if self.job.set_instance_color(id, color) {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.mark_dirty();
+            self.status = match color {
+                Some([r, g, b]) => format!("Set color #{r:02X}{g:02X}{b:02X} on {changed} instance(s)"),
+                None => format!("Reset color on {changed} instance(s)"),
+            };
+        }
+    }
+
+    fn open_color_picker(&mut self) {
+        let fallback = {
+            let t = Tokens::get();
+            [t.text.r(), t.text.g(), t.text.b()]
+        };
+        let current = self
+            .selected
+            .and_then(|id| self.job.instances.iter().find(|i| i.id == id))
+            .and_then(|i| i.color)
+            .unwrap_or(fallback);
+        self.color_picker_rgb = current;
+        self.color_picker_undo_pushed = false;
+        self.color_picker_open = true;
+    }
+
+    fn draw_color_picker_modal(&mut self, ctx: &egui::Context) {
+        if !self.color_picker_open {
+            return;
+        }
+        let mut open = self.color_picker_open;
+        let mut close_now = false;
+        let mut reset_now = false;
+        let mut new_rgb = None;
+
+        egui::Window::new("Part Color")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let mut c = egui::Color32::from_rgb(
+                    self.color_picker_rgb[0],
+                    self.color_picker_rgb[1],
+                    self.color_picker_rgb[2],
+                );
+                if egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque) {
+                    new_rgb = Some([c.r(), c.g(), c.b()]);
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if button(ui, "Done", Button::Primary).clicked() {
+                        close_now = true;
+                    }
+                    if button(ui, "Reset Default", Button::Small).clicked() {
+                        reset_now = true;
+                    }
+                });
+            });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close_now = true;
+        }
+
+        if let Some(rgb) = new_rgb {
+            self.color_picker_rgb = rgb;
+            if !self.color_picker_undo_pushed {
+                self.push_undo();
+                self.color_picker_undo_pushed = true;
+            }
+            let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+            for id in ids {
+                self.job.set_instance_color(id, Some(rgb));
+            }
+            self.mark_dirty();
+            self.status = format!("Set color #{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+        }
+
+        if reset_now {
+            self.set_selected_color(None);
+            self.color_picker_open = false;
+            self.color_picker_undo_pushed = false;
+        } else if close_now || !open {
+            self.color_picker_open = false;
+            self.color_picker_undo_pushed = false;
+        }
+    }
+
     fn toggle_selected_locked(&mut self) {
         let Some(primary) = self.selected else {
             return;
@@ -1063,6 +1272,7 @@ impl NestCraftApp {
             || self.custom_platform_open
             || self.dup_dialog_open
             || self.move_dialog_open
+            || self.color_picker_open
             || self.export_stl_dialog_open
             || !self.below_zero_import_dialog.is_empty()
         {
@@ -1873,6 +2083,19 @@ impl NestCraftApp {
                             {
                                 self.delete_selected();
                             }
+                            if icon_label_button(ui, "Shells to Parts", "mesh_body", !self.selected_set.is_empty(), false)
+                                .backing_on_hover_text("Split disconnected STL shells in selected part(s) into separate parts")
+                                .clicked()
+                            {
+                                let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+                                self.shells_to_parts_for(ids);
+                            }
+                            if icon_label_button(ui, "Merge Parts", "sls_auto_nest", self.selected_set.len() >= 2, false)
+                                .backing_on_hover_text("Combine selected parts into a single merged mesh part")
+                                .clicked()
+                            {
+                                self.merge_selected_parts();
+                            }
 
                             StageBar::separator(ui);
                             icon_label_button(ui, "Auto-Nest", "sls_auto_nest", false, false)
@@ -2126,6 +2349,8 @@ impl NestCraftApp {
             ToggleInstanceHidden(InstanceId, bool),
             ToggleInstanceTransparent(InstanceId, bool),
             ToggleInstanceLock(InstanceId, bool),
+            SetColor(InstanceId, Option<[u8; 3]>),
+            PickColor(InstanceId),
             Duplicate(InstanceId),
             DropToFloor(InstanceId),
             CenterXy(InstanceId),
@@ -2135,6 +2360,8 @@ impl NestCraftApp {
             ToggleGroupHidden(GroupId, bool),
             DeleteGroup(GroupId),
             SplitShells(PartId),
+            ShellsToParts(InstanceId),
+            MergeSelected,
         }
 
         // Pre-populate manifold reports so the immutable render pass can read them cleanly.
@@ -2298,11 +2525,35 @@ impl NestCraftApp {
                                                 actions.push(TreeAction::ToggleInstanceLock(inst.id, !inst.locked));
                                                 ui.close();
                                             }
+                                            if let Some(choice) = show_color_submenu(ui) {
+                                                match choice {
+                                                    ColorMenuChoice::OpenPicker => {
+                                                        actions.push(TreeAction::PickColor(inst.id));
+                                                    }
+                                                    ColorMenuChoice::Set(c) => {
+                                                        actions.push(TreeAction::SetColor(inst.id, c));
+                                                    }
+                                                }
+                                            }
                                             if ui.button("Remove from Group").clicked() {
                                                 actions.push(TreeAction::SetInstanceGroup(inst.id, None));
                                                 ui.close();
                                             }
                                             ui.separator();
+                                            if ui.button("Shells to Parts").clicked() {
+                                                actions.push(TreeAction::ShellsToParts(inst.id));
+                                                ui.close();
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    self.selected_set.len() >= 2,
+                                                    egui::Button::new("Merge Selected Parts"),
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.push(TreeAction::MergeSelected);
+                                                ui.close();
+                                            }
                                             let export_count = if is_sel { self.selected_set.len() } else { 1 };
                                             if ui.button(export_part_menu_label(export_count)).clicked() {
                                                 actions.push(TreeAction::ExportParts(inst.id));
@@ -2466,6 +2717,16 @@ impl NestCraftApp {
                                             actions.push(TreeAction::ToggleInstanceLock(inst.id, !inst.locked));
                                             ui.close();
                                         }
+                                        if let Some(choice) = show_color_submenu(ui) {
+                                            match choice {
+                                                ColorMenuChoice::OpenPicker => {
+                                                    actions.push(TreeAction::PickColor(inst.id));
+                                                }
+                                                ColorMenuChoice::Set(c) => {
+                                                    actions.push(TreeAction::SetColor(inst.id, c));
+                                                }
+                                            }
+                                        }
                                         if !self.job.groups.is_empty() {
                                             ui.menu_button("Assign to Group", |ui| {
                                                 for g in &self.job.groups {
@@ -2481,6 +2742,20 @@ impl NestCraftApp {
                                             });
                                         }
                                         ui.separator();
+                                        if ui.button("Shells to Parts").clicked() {
+                                            actions.push(TreeAction::ShellsToParts(inst.id));
+                                            ui.close();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                self.selected_set.len() >= 2,
+                                                egui::Button::new("Merge Selected Parts"),
+                                            )
+                                            .clicked()
+                                        {
+                                            actions.push(TreeAction::MergeSelected);
+                                            ui.close();
+                                        }
                                         let export_count = if is_sel { self.selected_set.len() } else { 1 };
                                         if ui.button(export_part_menu_label(export_count)).clicked() {
                                             actions.push(TreeAction::ExportParts(inst.id));
@@ -2503,6 +2778,10 @@ impl NestCraftApp {
                             | TreeAction::ToggleSelect(_)
                             | TreeAction::SelectRange(_)
                             | TreeAction::ExportParts(_)
+                            | TreeAction::SetColor(_, _)
+                            | TreeAction::PickColor(_)
+                            | TreeAction::ShellsToParts(_)
+                            | TreeAction::MergeSelected
                     ) {
                         self.push_undo();
                     }
@@ -2534,6 +2813,18 @@ impl NestCraftApp {
                             if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == id) {
                                 inst.locked = locked;
                             }
+                        }
+                        TreeAction::SetColor(id, color) => {
+                            if !self.selected_set.contains(&id) {
+                                self.select_instance(Some(id));
+                            }
+                            self.set_selected_color(color);
+                        }
+                        TreeAction::PickColor(id) => {
+                            if !self.selected_set.contains(&id) {
+                                self.select_instance(Some(id));
+                            }
+                            self.open_color_picker();
                         }
                         TreeAction::Duplicate(id) => {
                             if let Ok(ids) = self.job.duplicate_instance(id, 1) {
@@ -2589,6 +2880,17 @@ impl NestCraftApp {
                         }
                         TreeAction::SplitShells(pid) => {
                             self.split_part_shells(pid);
+                        }
+                        TreeAction::ShellsToParts(id) => {
+                            let ids = if self.selected_set.contains(&id) {
+                                self.selected_set.iter().copied().collect()
+                            } else {
+                                vec![id]
+                            };
+                            self.shells_to_parts_for(ids);
+                        }
+                        TreeAction::MergeSelected => {
+                            self.merge_selected_parts();
                         }
                     }
                 }
@@ -3442,6 +3744,33 @@ impl NestCraftApp {
                         let mut center_xy = false;
                         let mut rot_step: Option<usize> = None;
 
+                        let part_color_opt = self
+                            .job
+                            .instances
+                            .iter()
+                            .find(|i| i.id == sel_id)
+                            .and_then(|i| i.color);
+                        let mut color_action: Option<Option<[u8; 3]>> = None;
+                        row(ui, "Color", |ui| {
+                            ui.horizontal(|ui| {
+                                let mut rgb = part_color_opt.unwrap_or([t.text.r(), t.text.g(), t.text.b()]);
+                                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                    color_action = Some(Some(rgb));
+                                }
+                                if part_color_opt.is_some()
+                                    && button(ui, "Reset", Button::Small)
+                                        .backing_on_hover_text("Reset part color to theme default")
+                                        .clicked()
+                                {
+                                    color_action = Some(None);
+                                }
+                            });
+                        });
+                        if let Some(new_color) = color_action {
+                            self.set_selected_color(new_color);
+                        }
+
+                        let mut applied_euler = None;
                         if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == sel_id) {
                             let mut pos = inst.translation();
                             let mut changed = false;
@@ -3510,7 +3839,7 @@ impl NestCraftApp {
                             });
 
                             if rot_changed {
-                                inst.transform = transform_from_translation_euler_deg(pos, *euler);
+                                applied_euler = Some(*euler);
                                 clamp_floor = true;
                                 changed = true;
                             } else if changed {
@@ -3569,6 +3898,9 @@ impl NestCraftApp {
                             }
                         }
 
+                        if let Some(new_euler) = applied_euler {
+                            self.job.set_instance_euler_around_center(sel_id, new_euler);
+                        }
                         if drop_floor && self.job.drop_instance_to_floor(sel_id) {
                             self.mark_dirty();
                         }
@@ -3846,6 +4178,9 @@ impl NestCraftApp {
                 let mut toggle_hide = false;
                 let mut toggle_transparent = false;
                 let mut toggle_lock = false;
+                let mut color_choice: Option<ColorMenuChoice> = None;
+                let mut shells_to_parts = false;
+                let mut merge_parts = false;
                 let mut export_sel = false;
                 let mut delete_sel = false;
 
@@ -3903,7 +4238,24 @@ impl NestCraftApp {
                         toggle_lock = true;
                         ui.close();
                     }
+                    if let Some(choice) = show_color_submenu(ui) {
+                        color_choice = Some(choice);
+                    }
                     ui.separator();
+                    if ui.button("Shells to Parts").clicked() {
+                        shells_to_parts = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.selected_set.len() >= 2,
+                            egui::Button::new("Merge Selected Parts"),
+                        )
+                        .clicked()
+                    {
+                        merge_parts = true;
+                        ui.close();
+                    }
                     if ui.button(export_part_menu_label(self.selected_set.len())).clicked() {
                         export_sel = true;
                         ui.close();
@@ -3952,6 +4304,19 @@ impl NestCraftApp {
                 } else if toggle_lock {
                     self.viewport_ctx_menu = None;
                     self.toggle_selected_locked();
+                } else if let Some(choice) = color_choice {
+                    self.viewport_ctx_menu = None;
+                    match choice {
+                        ColorMenuChoice::OpenPicker => self.open_color_picker(),
+                        ColorMenuChoice::Set(c) => self.set_selected_color(c),
+                    }
+                } else if shells_to_parts {
+                    self.viewport_ctx_menu = None;
+                    let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+                    self.shells_to_parts_for(ids);
+                } else if merge_parts {
+                    self.viewport_ctx_menu = None;
+                    self.merge_selected_parts();
                 } else if export_sel {
                     self.viewport_ctx_menu = None;
                     self.export_stl_selected_only = true;
@@ -4140,6 +4505,7 @@ impl eframe::App for NestCraftApp {
         self.draw_custom_platform_modal(&ctx);
         self.draw_duplicate_modal(&ctx);
         self.draw_move_modal(&ctx);
+        self.draw_color_picker_modal(&ctx);
         self.draw_export_stl_modal(&ctx);
         self.draw_below_zero_import_modal(&ctx);
         self.draw_load_progress_modal(&ctx);
@@ -4289,6 +4655,10 @@ mod tests {
         assert!(app.job.instances[0].transparent);
         app.toggle_selected_transparent();
         assert!(!app.job.instances[0].transparent);
+        app.set_selected_color(Some([0x22, 0xAA, 0xFF]));
+        assert_eq!(app.job.instances[0].color, Some([0x22, 0xAA, 0xFF]));
+        app.set_selected_color(None);
+        assert_eq!(app.job.instances[0].color, None);
         app.toggle_selected_locked();
         assert!(app.job.instances[0].locked);
 
@@ -4645,5 +5015,76 @@ mod tests {
         assert!(app.redo());
         assert!(app.job.instances.is_empty());
         assert!(!app.redo());
+    }
+
+    #[test]
+    fn merge_selected_parts_and_shells_to_parts_roundtrip_with_undo() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        let i1 = app.selected.expect("i1");
+        app.add_sample_part();
+        let i2 = app.selected.expect("i2");
+        assert_eq!(app.job.instances.len(), 2);
+
+        app.select_instance(Some(i1));
+        app.toggle_select_instance(i2);
+        app.merge_selected_parts();
+        assert_eq!(app.job.instances.len(), 1);
+        let merged_id = app.selected.expect("merged");
+
+        app.shells_to_parts_for(vec![merged_id]);
+        assert_eq!(app.job.instances.len(), 2);
+        assert_eq!(app.selected_set.len(), 2);
+
+        assert!(app.undo());
+        assert_eq!(app.job.instances.len(), 1);
+        assert!(app.undo());
+        assert_eq!(app.job.instances.len(), 2);
+    }
+
+    #[test]
+    fn rotating_off_origin_part_keeps_its_own_centroid_fixed() {
+        let mut app = NestCraftApp::new();
+        // Box with local coordinates far from (0, 0, 0): [100..120, 50..70, 10..30]
+        let mesh = TriMesh::from_indexed(
+            vec![
+                [100.0, 50.0, 10.0],
+                [120.0, 50.0, 10.0],
+                [120.0, 70.0, 10.0],
+                [100.0, 70.0, 10.0],
+                [100.0, 50.0, 30.0],
+                [120.0, 50.0, 30.0],
+                [120.0, 70.0, 30.0],
+                [100.0, 70.0, 30.0],
+            ],
+            vec![
+                [0, 2, 1],
+                [0, 3, 2],
+                [4, 5, 6],
+                [4, 6, 7],
+                [0, 1, 5],
+                [0, 5, 4],
+                [1, 2, 6],
+                [1, 6, 5],
+                [2, 3, 7],
+                [2, 7, 6],
+                [3, 0, 4],
+                [3, 4, 7],
+            ],
+        )
+        .expect("valid box");
+        let pid = app.job.add_part("off_origin", Arc::new(mesh));
+        let iid = app.job.add_instance(pid, IDENTITY_TRANSFORM).expect("placed");
+        app.select_instance(Some(iid));
+
+        app.rotate_selected_90(2);
+        let proto = app.job.part(pid).expect("part");
+        let wb = app.job.instances[0].world_bounds(proto.mesh.bounds);
+        let cx = (wb[0][0] + wb[1][0]) * 0.5;
+        let cy = (wb[0][1] + wb[1][1]) * 0.5;
+        let cz = (wb[0][2] + wb[1][2]) * 0.5;
+        assert!((cx - 110.0).abs() < 1e-3, "cx={cx}");
+        assert!((cy - 60.0).abs() < 1e-3, "cy={cy}");
+        assert!((cz - 20.0).abs() < 1e-3, "cz={cz}");
     }
 }

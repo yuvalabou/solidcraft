@@ -261,6 +261,8 @@ pub struct PartInstance {
     pub hidden: bool,
     /// Whether this instance is rendered 50% transparent in the 3D viewport.
     pub transparent: bool,
+    /// Optional custom RGB display color (`None` uses the active theme color).
+    pub color: Option<[u8; 3]>,
     /// Optional project-tree group membership.
     pub group_id: Option<GroupId>,
 }
@@ -523,6 +525,7 @@ impl BuildJob {
             locked: false,
             hidden: false,
             transparent: false,
+            color: None,
             group_id: None,
         });
         Ok(id)
@@ -937,6 +940,138 @@ impl BuildJob {
         true
     }
 
+    /// Set or clear custom RGB display `color` on a single instance.
+    pub fn set_instance_color(&mut self, inst_id: InstanceId, color: Option<[u8; 3]>) -> bool {
+        let Some(inst) = self.instances.iter_mut().find(|i| i.id == inst_id) else {
+            return false;
+        };
+        inst.color = color;
+        true
+    }
+
+    /// Rotate `inst_id` to `euler_deg` while keeping its local bounding-box center fixed in world space.
+    pub fn set_instance_euler_around_center(&mut self, inst_id: InstanceId, euler_deg: [f32; 3]) -> bool {
+        let Some(part_id) = self.instances.iter().find(|i| i.id == inst_id).map(|i| i.part_id) else {
+            return false;
+        };
+        let Some(bounds) = self.part(part_id).map(|p| p.mesh.bounds) else {
+            return false;
+        };
+        let local_center = [
+            (bounds[0][0] + bounds[1][0]) * 0.5,
+            (bounds[0][1] + bounds[1][1]) * 0.5,
+            (bounds[0][2] + bounds[1][2]) * 0.5,
+        ];
+        let Some(inst) = self.instances.iter_mut().find(|i| i.id == inst_id) else {
+            return false;
+        };
+        let center_before = transform_point(&inst.transform, local_center);
+        let pos = inst.translation();
+        inst.transform = transform_from_translation_euler_deg(pos, euler_deg);
+        let center_after = transform_point(&inst.transform, local_center);
+        inst.transform[0][3] += center_before[0] - center_after[0];
+        inst.transform[1][3] += center_before[1] - center_after[1];
+        inst.transform[2][3] += center_before[2] - center_after[2];
+        true
+    }
+
+    /// Split a multi-shell instance into separate parts/instances at the same transform.
+    ///
+    /// Returns the newly created instance IDs, or an empty `Vec` if the mesh has <= 1 shell.
+    pub fn split_instance_shells(&mut self, inst_id: InstanceId) -> Result<Vec<InstanceId>> {
+        let src = self
+            .instances
+            .iter()
+            .find(|i| i.id == inst_id)
+            .cloned()
+            .ok_or_else(|| NestCraftError::InvalidInput(format!("unknown instance id {}", inst_id.0)))?;
+        let proto = self
+            .part(src.part_id)
+            .cloned()
+            .ok_or_else(|| NestCraftError::InvalidInput(format!("unknown part id {}", src.part_id.0)))?;
+        let shells = crate::manifold::split_shells(&proto.mesh)?;
+        if shells.len() <= 1 {
+            return Ok(Vec::new());
+        }
+        self.remove_instance(inst_id);
+        let mut created = Vec::with_capacity(shells.len());
+        for (idx, shell_mesh) in shells.into_iter().enumerate() {
+            let name = format!("{} [Shell {}]", proto.name, idx + 1);
+            let pid = self.add_part(name, Arc::new(shell_mesh));
+            let new_id = self.add_instance(pid, src.transform)?;
+            if let Some(new_inst) = self.instances.iter_mut().find(|i| i.id == new_id) {
+                new_inst.constraint = src.constraint;
+                new_inst.locked = src.locked;
+                new_inst.hidden = src.hidden;
+                new_inst.transparent = src.transparent;
+                new_inst.color = src.color;
+                new_inst.group_id = src.group_id;
+            }
+            created.push(new_id);
+        }
+        Ok(created)
+    }
+
+    /// Merge 2 or more instances into a single combined part/instance in world coordinates.
+    ///
+    /// Removes the source instances and returns the newly created merged instance ID.
+    pub fn merge_instances(&mut self, ids: &[InstanceId]) -> Result<InstanceId> {
+        let id_set: std::collections::HashSet<InstanceId> = ids.iter().copied().collect();
+        let sources: Vec<PartInstance> = self
+            .instances
+            .iter()
+            .filter(|i| id_set.contains(&i.id))
+            .cloned()
+            .collect();
+        if sources.len() < 2 {
+            return Err(NestCraftError::InvalidInput(
+                "Select at least 2 parts to merge".to_owned(),
+            ));
+        }
+
+        let mut positions = Vec::new();
+        let mut indices = Vec::new();
+        let mut first_name = None;
+        for src in &sources {
+            let proto = self
+                .part(src.part_id)
+                .ok_or_else(|| NestCraftError::InvalidInput(format!("unknown part id {}", src.part_id.0)))?;
+            if first_name.is_none() {
+                first_name = Some(proto.name.clone());
+            }
+            let base = u32::try_from(positions.len())
+                .map_err(|_| NestCraftError::InvalidInput("merged mesh vertex count overflow".to_owned()))?;
+            for &p in &proto.mesh.positions {
+                positions.push(transform_point(&src.transform, p));
+            }
+            for &[a, b, c] in &proto.mesh.indices {
+                indices.push([a + base, b + base, c + base]);
+            }
+        }
+
+        let merged_mesh = TriMesh::from_indexed(positions, indices)?;
+        let name = format!("{} (Merged)", first_name.unwrap_or_else(|| "Part".to_owned()));
+        let pid = self.add_part(name, Arc::new(merged_mesh));
+        let new_id = self.add_instance(pid, IDENTITY_TRANSFORM)?;
+
+        let shared_group = sources.first().and_then(|s| s.group_id).filter(|gid| {
+            sources.iter().all(|s| s.group_id == Some(*gid))
+        });
+        let shared_color = sources.first().and_then(|s| s.color).filter(|col| {
+            sources.iter().all(|s| s.color == Some(*col))
+        });
+        let all_transparent = sources.iter().all(|s| s.transparent);
+        if let Some(new_inst) = self.instances.iter_mut().find(|i| i.id == new_id) {
+            new_inst.group_id = shared_group;
+            new_inst.color = shared_color;
+            new_inst.transparent = all_transparent;
+        }
+        for src in &sources {
+            self.remove_instance(src.id);
+        }
+        Ok(new_id)
+    }
+
     /// Return `true` when `inst` is visible (neither itself nor its group is hidden).
     pub fn is_instance_visible(&self, inst: &PartInstance) -> bool {
         if inst.hidden {
@@ -1026,6 +1161,7 @@ mod tests {
             locked: false,
             hidden: false,
             transparent: false,
+            color: None,
             group_id: None,
         };
         let out = inst.euler_deg();

@@ -77,6 +77,35 @@ impl DragExclude {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn instance_palette_color(
+    scene: &mut GpuScene,
+    custom_rgb: Option<[u8; 3]>,
+    valid: bool,
+    is_selected: bool,
+    transparent: bool,
+    part_color: PaletteIndex,
+    part_faded: PaletteIndex,
+    selected_color: PaletteIndex,
+    selected_faded: PaletteIndex,
+    oob_color: PaletteIndex,
+    oob_faded: PaletteIndex,
+) -> PaletteIndex {
+    if !valid {
+        return if transparent { oob_faded } else { oob_color };
+    }
+    if let Some([r, g, b]) = custom_rgb {
+        let alpha = if transparent { 128 } else { 255 };
+        return scene.color([r, g, b, alpha]);
+    }
+    match (is_selected, transparent) {
+        (true, true) => selected_faded,
+        (true, false) => selected_color,
+        (false, true) => part_faded,
+        (false, false) => part_color,
+    }
+}
+
 /// Build the [`GpuScene`] for `job`, including build-chamber wireframe, floor grid, and instanced parts.
 #[cfg(test)]
 pub fn build_gpu_scene(
@@ -150,14 +179,19 @@ pub fn build_gpu_scene_with_exclude(
         let in_nbz = job.world_bounds_in_no_build_zone(wb);
         let valid = above_floor && !in_nbz;
         let is_selected = selected.contains(&inst.id);
-        let color = match (valid, is_selected, inst.transparent) {
-            (false, _, true) => oob_faded,
-            (false, _, false) => oob_color,
-            (true, true, true) => selected_faded,
-            (true, true, false) => selected_color,
-            (true, false, true) => part_faded,
-            (true, false, false) => part_color,
-        };
+        let color = instance_palette_color(
+            &mut scene,
+            inst.color,
+            valid,
+            is_selected,
+            inst.transparent,
+            part_color,
+            part_faded,
+            selected_color,
+            selected_faded,
+            oob_color,
+            oob_faded,
+        );
         entry.place(inst.transform, color);
 
         if is_selected {
@@ -235,14 +269,19 @@ pub fn build_moving_scene(
                 let wb = inst.world_bounds(proto.mesh.bounds);
                 let valid = job.world_bounds_above_floor(wb) && !job.world_bounds_in_no_build_zone(wb);
                 let is_selected = selected.contains(&inst.id);
-                let color = match (valid, is_selected, inst.transparent) {
-                    (false, _, true) => oob_faded,
-                    (false, _, false) => oob_color,
-                    (true, true, true) => selected_faded,
-                    (true, true, false) => selected_color,
-                    (true, false, true) => part_faded,
-                    (true, false, false) => part_color,
-                };
+                let color = instance_palette_color(
+                    &mut scene,
+                    inst.color,
+                    valid,
+                    is_selected,
+                    inst.transparent,
+                    part_color,
+                    part_faded,
+                    selected_color,
+                    selected_faded,
+                    oob_color,
+                    oob_faded,
+                );
                 entry.place(inst.transform, color);
                 if is_selected {
                     draw_box_wireframe(&mut scene, wb[0], wb[1], if valid { selected_color } else { oob_color }, 1.6);

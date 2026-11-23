@@ -75,6 +75,8 @@ struct NestcInstance {
     hidden: bool,
     #[serde(default)]
     transparent: bool,
+    #[serde(default)]
+    color: Option<[u8; 3]>,
     group_id: Option<u32>,
 }
 
@@ -152,6 +154,7 @@ pub fn write_nestc(job: &BuildJob) -> Result<Vec<u8>> {
             locked: i.locked,
             hidden: i.hidden,
             transparent: i.transparent,
+            color: i.color,
             group_id: i.group_id.map(|g| g.0),
         })
         .collect();
@@ -258,6 +261,7 @@ pub fn read_nestc(bytes: &[u8]) -> Result<BuildJob> {
             locked: i.locked,
             hidden: i.hidden,
             transparent: i.transparent,
+            color: i.color,
             group_id: i.group_id.map(GroupId),
         });
     }
