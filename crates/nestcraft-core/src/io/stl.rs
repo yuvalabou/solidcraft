@@ -2,8 +2,61 @@
 
 use std::collections::HashMap;
 
-use crate::model::TriMesh;
+use crate::model::{Transform3x4, TriMesh, transform_point};
 use crate::{NestCraftError, Result};
+
+/// Encode `mesh` (optionally transformed by `transform`) into a binary STL buffer.
+pub fn write_binary_stl(mesh: &TriMesh, transform: Option<&Transform3x4>) -> Result<Vec<u8>> {
+    let tri_count = u32::try_from(mesh.indices.len())
+        .map_err(|_| NestCraftError::InvalidInput("triangle count exceeds binary STL u32 limit".to_owned()))?;
+    let mut buf = Vec::with_capacity(84 + mesh.indices.len() * 50);
+    let mut header = [0_u8; 80];
+    let tag = b"NestCraft binary STL";
+    header[..tag.len()].copy_from_slice(tag);
+    buf.extend_from_slice(&header);
+    buf.extend_from_slice(&tri_count.to_le_bytes());
+
+    for (tri_idx, tri) in mesh.indices.iter().enumerate() {
+        let raw_p = [
+            mesh.positions.get(tri[0] as usize).copied().unwrap_or([0.0; 3]),
+            mesh.positions.get(tri[1] as usize).copied().unwrap_or([0.0; 3]),
+            mesh.positions.get(tri[2] as usize).copied().unwrap_or([0.0; 3]),
+        ];
+        let p = match transform {
+            Some(tf) => [
+                transform_point(tf, raw_p[0]),
+                transform_point(tf, raw_p[1]),
+                transform_point(tf, raw_p[2]),
+            ],
+            None => raw_p,
+        };
+        let n = compute_unit_normal(p[0], p[1], p[2])
+            .unwrap_or_else(|| mesh.tri_normals.get(tri_idx).copied().unwrap_or([0.0, 0.0, 1.0]));
+        for f in n.into_iter().chain(p[0]).chain(p[1]).chain(p[2]) {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+        buf.extend_from_slice(&0_u16.to_le_bytes());
+    }
+    Ok(buf)
+}
+
+fn compute_unit_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> Option<[f32; 3]> {
+    let ux = b[0] - a[0];
+    let uy = b[1] - a[1];
+    let uz = b[2] - a[2];
+    let vx = c[0] - a[0];
+    let vy = c[1] - a[1];
+    let vz = c[2] - a[2];
+    let nx = uy * vz - uz * vy;
+    let ny = uz * vx - ux * vz;
+    let nz = ux * vy - uy * vx;
+    let len = (nx * nx + ny * ny + nz * nz).sqrt();
+    if len > 1e-12 && len.is_finite() {
+        Some([nx / len, ny / len, nz / len])
+    } else {
+        None
+    }
+}
 
 /// Parse a binary or ASCII STL buffer into a [`TriMesh`].
 pub fn parse_stl(bytes: &[u8]) -> Result<TriMesh> {
@@ -176,5 +229,25 @@ mod tests {
     fn rejects_corrupt_stl_without_panicking() {
         assert!(parse_stl(b"").is_err());
         assert!(parse_stl(&[0_u8; 84]).is_err());
+    }
+
+    #[test]
+    fn writes_and_roundtrips_transformed_binary_stl() {
+        let mesh = TriMesh::from_indexed(
+            vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+            vec![[0, 1, 2]],
+        )
+        .expect("valid mesh");
+        let tf = [
+            [1.0, 0.0, 0.0, 25.0],
+            [0.0, 1.0, 0.0, -10.0],
+            [0.0, 0.0, 1.0, 5.0],
+        ];
+        let bytes = write_binary_stl(&mesh, Some(&tf)).expect("written");
+        let parsed = parse_stl(&bytes).expect("re-parsed");
+        assert_eq!(parsed.indices.len(), 1);
+        assert!((parsed.bounds[0][0] - 25.0).abs() < 1e-4);
+        assert!((parsed.bounds[0][1] - (-10.0)).abs() < 1e-4);
+        assert!((parsed.bounds[0][2] - 5.0).abs() < 1e-4);
     }
 }

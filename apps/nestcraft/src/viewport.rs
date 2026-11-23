@@ -1,11 +1,11 @@
 //! 3D viewport scene builder, hardware instancing, camera controls, and ray picking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use nestcraft_core::model::{Aabb, BuildJob, InstanceId, MachineProfile, PartId, Transform3x4, TriMesh};
+use nestcraft_core::model::{Aabb, BedOrigin, BuildJob, InstanceId, MachineProfile, PartId, Transform3x4, TriMesh};
 use solidcraft_theme::Tokens;
-use solidcraft_viewport::{Camera, UpAxis};
+use solidcraft_viewport::{Camera, StandardView, UpAxis};
 use solidcraft_viewport_gpu::view::{GpuScene, InstanceLook, InstancedMesh, Palette, PaletteIndex, SharedTris};
 
 /// Convert a pure-Rust [`TriMesh`] into GPU-ready flat-shaded [`SharedTris`].
@@ -37,7 +37,7 @@ pub fn mesh_to_shared_tris(mesh: &TriMesh) -> Arc<SharedTris> {
 /// Build the [`GpuScene`] for `job`, including build-chamber wireframe, floor grid, and instanced parts.
 pub fn build_gpu_scene(
     job: &BuildJob,
-    selected: Option<InstanceId>,
+    selected: &HashSet<InstanceId>,
     tokens: &Tokens,
     cache: &mut HashMap<PartId, Arc<SharedTris>>,
 ) -> GpuScene {
@@ -54,11 +54,9 @@ pub fn build_gpu_scene(
     let axis_y = scene.color(tokens.axis_y.to_array());
     let axis_z = scene.color(tokens.axis_z.to_array());
 
-    draw_build_chamber(
+    draw_free_floor_and_bed(
         &mut scene,
-        &job.machine,
-        job.wall_margin_mm,
-        job.max_z_mm(),
+        job,
         box_color,
         grid_color,
         margin_color,
@@ -88,9 +86,11 @@ pub fn build_gpu_scene(
             edges: None,
         });
 
-        let in_bounds = job.is_instance_in_bounds(inst.id);
-        let is_selected = Some(inst.id) == selected;
-        let color = if !in_bounds {
+        let above_floor = job.is_instance_above_floor(inst.id);
+        let in_nbz = job.is_instance_in_no_build_zone(inst.id);
+        let valid = above_floor && !in_nbz;
+        let is_selected = selected.contains(&inst.id);
+        let color = if !valid {
             oob_color
         } else if is_selected {
             selected_color
@@ -101,11 +101,32 @@ pub fn build_gpu_scene(
 
         if is_selected {
             let [lo, hi] = inst.world_bounds(proto.mesh.bounds);
-            draw_box_wireframe(&mut scene, lo, hi, if in_bounds { selected_color } else { oob_color }, 1.6);
+            draw_box_wireframe(&mut scene, lo, hi, if valid { selected_color } else { oob_color }, 1.6);
         }
     }
 
     scene.instanced = per_part.into_values().collect();
+
+    if let Some(zone) = &job.no_build_zone
+        && zone.visible
+    {
+        let zone_color = scene.color([tokens.form_error.r(), tokens.form_error.g(), tokens.form_error.b(), 110]);
+        let tris = mesh_to_shared_tris(&zone.mesh);
+        let mut nbz_mesh = InstancedMesh {
+            key: u64::MAX,
+            tris,
+            instances: Vec::new(),
+            look: InstanceLook::Faded,
+            levels: Vec::new(),
+            closed: true,
+            edges: None,
+        };
+        nbz_mesh.place(zone.transform(), zone_color);
+        scene.instanced.push(nbz_mesh);
+        let [lo, hi] = zone.world_bounds();
+        draw_box_wireframe(&mut scene, lo, hi, oob_color, 1.2);
+    }
+
     scene
 }
 
@@ -154,64 +175,116 @@ fn draw_rect_z(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_build_chamber(
+fn draw_free_floor_and_bed(
     scene: &mut GpuScene,
-    machine: &MachineProfile,
-    wall_margin_mm: f32,
-    max_z_mm: f32,
-    box_color: PaletteIndex,
-    grid_color: PaletteIndex,
+    job: &BuildJob,
+    major_grid_color: PaletteIndex,
+    minor_grid_color: PaletteIndex,
     margin_color: PaletteIndex,
-    ceiling_color: PaletteIndex,
+    bed_outline_color: PaletteIndex,
     axes: [PaletteIndex; 3],
 ) {
-    let [w, d, h] = machine.size_mm();
+    let [w, d, h] = job.machine.size_mm();
+    let ([x0, y0], [x1, y1]) = job.bed_xy_bounds();
 
-    draw_box_wireframe(scene, [0.0, 0.0, 0.0], [w, d, h], box_color, 1.4);
-
-    // Wall-margin safe zone on floor
-    let m = wall_margin_mm.max(0.0);
-    if m > 0.0 && w > 2.0 * m && d > 2.0 * m {
-        draw_rect_z(scene, m, m, w - m, d - m, 0.05, margin_color, 1.2);
+    // Compute extended Z = 0 floor grid bounds covering the bed + all placed parts.
+    let mut min_x = x0 - 300.0_f32;
+    let mut min_y = y0 - 300.0_f32;
+    let mut max_x = x1 + 300.0;
+    let mut max_y = y1 + 300.0;
+    for inst in &job.instances {
+        if let Some(proto) = job.part(inst.part_id) {
+            let wb = inst.world_bounds(proto.mesh.bounds);
+            min_x = min_x.min(wb[0][0] - 200.0);
+            min_y = min_y.min(wb[0][1] - 200.0);
+            max_x = max_x.max(wb[1][0] + 200.0);
+            max_y = max_y.max(wb[1][1] + 200.0);
+        }
     }
 
-    // Active build ceiling ring at max_z_mm
-    if max_z_mm > 0.1 && max_z_mm <= h {
-        draw_rect_z(scene, 0.0, 0.0, w, d, max_z_mm, ceiling_color, 1.2);
+    let snap_down = |v: f32| (v / 100.0).floor() * 100.0;
+    let snap_up = |v: f32| (v / 100.0).ceil() * 100.0;
+    let gx0 = snap_down(min_x).max(-5000.0);
+    let gy0 = snap_down(min_y).max(-5000.0);
+    let gx1 = snap_up(max_x).min(5000.0);
+    let gy1 = snap_up(max_y).min(5000.0);
+
+    // 20 mm minor floor grid & 100 mm major floor grid at Z = 0
+    let span = (gx1 - gx0).max(gy1 - gy0);
+    let minor_step = if span > 3000.0 { 100.0_f32 } else { 20.0_f32 };
+    let mut x = gx0;
+    while x <= gx1 + 0.5 {
+        let is_major = (x / 100.0).round() * 100.0 - x;
+        let (col, width) = if is_major.abs() < 0.1 {
+            (major_grid_color, 1.05)
+        } else {
+            (minor_grid_color, 0.75)
+        };
+        scene.line([x, gy0, 0.0], [x, gy1, 0.0], col, width, false);
+        x += minor_step;
+    }
+    let mut y = gy0;
+    while y <= gy1 + 0.5 {
+        let is_major = (y / 100.0).round() * 100.0 - y;
+        let (col, width) = if is_major.abs() < 0.1 {
+            (major_grid_color, 1.05)
+        } else {
+            (minor_grid_color, 0.75)
+        };
+        scene.line([gx0, y, 0.0], [gx1, y, 0.0], col, width, false);
+        y += minor_step;
+    }
+
+    // Subtle reference bed footprint on Z = 0 and platform height envelope at Z = h
+    draw_rect_z(scene, x0, y0, x1, y1, 0.05, bed_outline_color, 1.6);
+    let min_z = job.min_z_mm.max(0.0);
+    if min_z > 0.01 {
+        draw_rect_z(scene, x0, y0, x1, y1, min_z, bed_outline_color, 1.2);
+    }
+    if h > 0.1 {
+        draw_rect_z(scene, x0, y0, x1, y1, h, margin_color, 1.1);
+        scene.line([x0, y0, 0.0], [x0, y0, h], margin_color, 1.0, false);
+        scene.line([x1, y0, 0.0], [x1, y0, h], margin_color, 1.0, false);
+        scene.line([x1, y1, 0.0], [x1, y1, h], margin_color, 1.0, false);
+        scene.line([x0, y1, 0.0], [x0, y1, h], margin_color, 1.0, false);
+    }
+
+    // Wall-margin reference zone inside bed footprint at Z = min_z
+    let m = job.wall_margin_mm.max(0.0);
+    if m > 0.0 && w > 2.0 * m && d > 2.0 * m {
+        draw_rect_z(scene, x0 + m, y0 + m, x1 - m, y1 - m, min_z + 0.05, margin_color, 1.1);
     }
 
     // Origin triad (25 mm)
     scene.line([0.0, 0.0, 0.0], [25.0, 0.0, 0.0], axes[0], 2.2, false);
     scene.line([0.0, 0.0, 0.0], [0.0, 25.0, 0.0], axes[1], 2.2, false);
     scene.line([0.0, 0.0, 0.0], [0.0, 0.0, 25.0], axes[2], 2.2, false);
-
-    // 20 mm floor grid at Z = 0
-    let step = 20.0_f32;
-    let mut x = step;
-    while x < w - 0.5 {
-        scene.line([x, 0.0, 0.0], [x, d, 0.0], grid_color, 1.0, false);
-        x += step;
-    }
-    let mut y = step;
-    while y < d - 0.5 {
-        scene.line([0.0, y, 0.0], [w, y, 0.0], grid_color, 1.0, false);
-        y += step;
-    }
 }
 
-/// Create a default isometric camera framed around `machine`.
-pub fn default_camera(machine: &MachineProfile) -> Camera {
+/// Create a default isometric camera framed around `machine` and `origin`.
+pub fn default_camera_with_origin(machine: &MachineProfile, origin: BedOrigin) -> Camera {
     let [w, d, h] = machine.size_mm();
     let diag = (w * w + d * d + h * h).sqrt();
+    let (yaw, pitch) = StandardView::Iso.angles();
+    let (tx, ty) = match origin {
+        BedOrigin::FrontLeft => (f64::from(w) * 0.5, f64::from(d) * 0.5),
+        BedOrigin::Center => (0.0, 0.0),
+    };
     Camera {
-        target: [f64::from(w) * 0.5, f64::from(d) * 0.5, f64::from(h) * 0.35].into(),
-        yaw: 0.72,
-        pitch: 0.48,
+        target: [tx, ty, f64::from(h) * 0.35].into(),
+        yaw,
+        pitch,
         roll: 0.0,
         distance: f64::from(diag) * 1.15,
         fov: 0.65,
         up: UpAxis::Z,
     }
+}
+
+/// Create a default isometric camera framed around `machine` (front-left origin).
+#[cfg(test)]
+pub fn default_camera(machine: &MachineProfile) -> Camera {
+    default_camera_with_origin(machine, BedOrigin::FrontLeft)
 }
 
 /// Compute world-space `(origin, unit_dir)` ray from `cam` through `pointer` inside `rect`.
@@ -229,22 +302,27 @@ pub fn screen_ray(
     Some((origin.to_f32(), dir.to_f32()))
 }
 
-/// Intersect a screen ray with a horizontal `Z = plane_z` plane (for XY dragging).
-pub fn intersect_horizontal_plane(
+/// Intersect a screen ray with the camera-facing plane passing through `anchor`.
+pub fn intersect_camera_plane(
     cam: &Camera,
     rect: egui::Rect,
     pointer: egui::Pos2,
-    plane_z: f32,
+    anchor: [f32; 3],
 ) -> Option<[f32; 3]> {
     let (origin, dir) = screen_ray(cam, rect, pointer)?;
-    if dir[2].abs() < 1e-6 {
+    let n = cam.back().to_f32();
+    let denom = dir[0] * n[0] + dir[1] * n[1] + dir[2] * n[2];
+    if denom.abs() < 1e-6 {
         return None;
     }
-    let t = (plane_z - origin[2]) / dir[2];
+    let t = ((anchor[0] - origin[0]) * n[0]
+        + (anchor[1] - origin[1]) * n[1]
+        + (anchor[2] - origin[2]) * n[2])
+        / denom;
     if t < 0.0 || !t.is_finite() {
         return None;
     }
-    Some([origin[0] + dir[0] * t, origin[1] + dir[1] * t, plane_z])
+    Some([origin[0] + dir[0] * t, origin[1] + dir[1] * t, origin[2] + dir[2] * t])
 }
 
 /// Intersect a screen ray with a vertical camera-facing plane through `anchor` (for Z dragging).
@@ -307,6 +385,89 @@ pub fn pick_instance(
         }
     }
     best.map(|(_, id)| id)
+}
+
+/// Return `true` when the screen-space pointer ray hits the visible [`NoBuildZone`] mesh.
+pub fn pick_no_build_zone(
+    job: &BuildJob,
+    cam: &Camera,
+    rect: egui::Rect,
+    pointer: egui::Pos2,
+) -> bool {
+    let Some(zone) = &job.no_build_zone else {
+        return false;
+    };
+    if !zone.visible {
+        return false;
+    }
+    let Some((ray_origin, ray_dir)) = screen_ray(cam, rect, pointer) else {
+        return false;
+    };
+    if ray_aabb_intersect(ray_origin, ray_dir, zone.world_bounds()).is_none() {
+        return false;
+    }
+    let (local_origin, local_dir) = inverse_transform_ray(&zone.transform(), ray_origin, ray_dir);
+    for tri in &zone.mesh.indices {
+        let a = zone.mesh.positions[tri[0] as usize];
+        let b = zone.mesh.positions[tri[1] as usize];
+        let c = zone.mesh.positions[tri[2] as usize];
+        if ray_triangle_intersect(local_origin, local_dir, a, b, c).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return all visible instances whose projected world AABB intersects `sel_rect`.
+pub fn instances_in_screen_rect(
+    job: &BuildJob,
+    cam: &Camera,
+    rect: egui::Rect,
+    sel_rect: egui::Rect,
+) -> Vec<InstanceId> {
+    let w = f64::from(rect.width().max(1.0));
+    let h = f64::from(rect.height().max(1.0));
+    let [mw, md, mh] = job.machine.size_mm();
+    let radius = f64::from((mw * mw + md * md + mh * mh).sqrt()) * 2.0;
+
+    let mut hits = Vec::new();
+    for inst in &job.instances {
+        if !job.is_instance_visible(inst) {
+            continue;
+        }
+        let Some(proto) = job.part(inst.part_id) else {
+            continue;
+        };
+        let [lo, hi] = inst.world_bounds(proto.mesh.bounds);
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        let mut any_projected = false;
+        for sx in [lo[0], hi[0]] {
+            for sy in [lo[1], hi[1]] {
+                for sz in [lo[2], hi[2]] {
+                    let p = [f64::from(sx), f64::from(sy), f64::from(sz)].into();
+                    if let Some((px, py, _)) = cam.to_screen(p, w, h, radius) {
+                        let x = rect.left() + px as f32;
+                        let y = rect.top() + py as f32;
+                        min_x = min_x.min(x);
+                        min_y = min_y.min(y);
+                        max_x = max_x.max(x);
+                        max_y = max_y.max(y);
+                        any_projected = true;
+                    }
+                }
+            }
+        }
+        if any_projected {
+            let proj_rect = egui::Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y));
+            if proj_rect.intersects(sel_rect) {
+                hits.push(inst.id);
+            }
+        }
+    }
+    hits
 }
 
 fn inverse_transform_ray(
@@ -408,7 +569,8 @@ mod tests {
         let _ = job.duplicate_instance(i1, 3).expect("duplicated");
 
         let mut cache = HashMap::new();
-        let scene = build_gpu_scene(&job, Some(i1), &Tokens::get(), &mut cache);
+        let selected = HashSet::from([i1]);
+        let scene = build_gpu_scene(&job, &selected, &Tokens::get(), &mut cache);
         assert_eq!(scene.instanced.len(), 1);
         assert_eq!(scene.instanced[0].instances.len(), 4 * INSTANCE_SIZE);
         assert!(!scene.lines.is_empty());
@@ -450,7 +612,7 @@ mod tests {
         let iid = job.add_instance_centered_on_floor(pid).expect("placed");
 
         let mut cam = default_camera(&job.machine);
-        cam.target = [80.0, 105.0, 10.0].into();
+        cam.target = [100.0, 125.0, 10.0].into();
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let picked = pick_instance(&job, &cam, rect, rect.center());
         assert_eq!(picked, Some(iid));
@@ -471,7 +633,7 @@ mod tests {
 
         // Top-down camera looking at the empty (18, 18, 18) corner of the tet's AABB.
         let cam = Camera {
-            target: [88.0, 113.0, 10.0].into(),
+            target: [108.0, 133.0, 10.0].into(),
             yaw: 0.0,
             pitch: 1.54,
             roll: 0.0,
@@ -481,5 +643,47 @@ mod tests {
         };
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         assert_eq!(pick_instance(&job, &cam, rect, rect.center()), None);
+    }
+
+    #[test]
+    fn box_select_finds_visible_instance_in_screen_rect() {
+        let mesh = Arc::new(
+            TriMesh::from_indexed(
+                vec![
+                    [-10.0, -10.0, 0.0],
+                    [10.0, -10.0, 0.0],
+                    [10.0, 10.0, 0.0],
+                    [-10.0, 10.0, 0.0],
+                    [-10.0, -10.0, 20.0],
+                    [10.0, -10.0, 20.0],
+                    [10.0, 10.0, 20.0],
+                    [-10.0, 10.0, 20.0],
+                ],
+                vec![
+                    [0, 2, 1],
+                    [0, 3, 2],
+                    [4, 5, 6],
+                    [4, 6, 7],
+                    [0, 1, 5],
+                    [0, 5, 4],
+                    [1, 2, 6],
+                    [1, 6, 5],
+                    [2, 3, 7],
+                    [2, 7, 6],
+                    [3, 0, 4],
+                    [3, 4, 7],
+                ],
+            )
+            .expect("valid box"),
+        );
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        let pid = job.add_part("box", mesh);
+        let iid = job.add_instance_centered_on_floor(pid).expect("placed");
+
+        let cam = default_camera(&job.machine);
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        assert_eq!(instances_in_screen_rect(&job, &cam, rect, rect), vec![iid]);
+        let empty = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(5.0, 5.0));
+        assert!(instances_in_screen_rect(&job, &cam, rect, empty).is_empty());
     }
 }

@@ -14,6 +14,8 @@ egui = { workspace = true }
 egui-wgpu = { workspace = true }
 nestcraft-core = { path = "../../crates/nestcraft-core" }
 rfd = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 solidcraft-look = { workspace = true }
 solidcraft-theme = { workspace = true }
 solidcraft-ui-kit = { workspace = true }

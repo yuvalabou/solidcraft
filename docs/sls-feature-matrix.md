@@ -36,27 +36,27 @@ Related docs: [`docs/sls-nesting-plan.md`](sls-nesting-plan.md) · [`docs/sls-ne
 | Ref               | NestCraft Feature                                                                                             |       Rank       |   Status   | Implementation Target                                                                |
 | :---------------- | :------------------------------------------------------------------------------------------------------------ | :--------------: | :---------: | :----------------------------------------------------------------------------------- |
 | `2.1, 5.7`      | Hierarchical Project Tree (groups, hide/show, part IDs `#1..#N`, repair/analysis child nodes, context menu) | **`P0`** |  `Done`   | `apps/nestcraft` (groups, visibility, analysis child nodes, split shells, context menu) |
-| `2.2, 4.1–4.3` | 3D Viewport (perspective/ortho, floor grid, origin triad, wall-margin zone, 3D View Compass)                  | **`P0`** |  `Done`  | `apps/nestcraft/src/viewport.rs`                                                   |
-| `2.4, 5.9`      | Machine Platform presets (Formiga P110, Farsoon HT403P) + Custom Platform editor                              | **`P0`** |  `Done`   | `crates/nestcraft-core/src/model.rs` + `apps/nestcraft`                              |
-| `2.5`           | File formats: Binary/ASCII STL & Production 3MF/STL (read/write)                                              | **`P0`** |  `Done`  | `crates/nestcraft-core/src/io/{stl,threemf}.rs`                                    |
-| `2.6`           | Keyboard shortcuts (view presets, transform, duplicate, pack, collision check)                                | **`P1`** | `Partial` | `apps/nestcraft` (view/transform/nudge/dup/del/hide/lock done; pack & collision pending) |
+| `2.2, 4.1–4.3` | 3D Viewport (free-floating `Z=0` extended floor grid, bed footprint & height envelope, 360° orbit, middle-pan, marquee select, model context menu, 3D View Compass) | **`P0`** |  `Done`  | `apps/nestcraft/src/viewport.rs`                                                   |
+| `2.4, 5.9`      | Machine Platform presets (Formiga P110 `200×250×330`, Farsoon HT403P `400×400×450`, Custom) with configurable size, origin, wall distance, Min Z & per-machine No-Build Zone | **`P0`** |  `Done`   | `crates/nestcraft-core/src/model.rs` + `apps/nestcraft`                              |
+| `2.5`           | File formats: Binary/ASCII STL (read/write), Production 3MF (read/write) & `.nestc` project archive | **`P0`** |  `Done`  | `crates/nestcraft-core/src/io/{stl,threemf,nestc}.rs`                              |
+| `2.6`           | Keyboard shortcuts (`Space` view cycle, side-view `Z` arrows, `M` move, `Ctrl+D` duplicate popup, `Ctrl+S` save bed, pack, collision) | **`P1`** | `Partial` | `apps/nestcraft` (view/move/nudge/dup/del/hide/lock/save done; pack & collision pending) |
 
 ### §3. Project Management, Reporting & Export
 
 | Ref              | NestCraft Feature                                                                        |       Rank       |   Status   | Implementation Target                                                                             |
 | :--------------- | :--------------------------------------------------------------------------------------- | :--------------: | :---------: | :------------------------------------------------------------------------------------------------ |
-| `3.1–3.2.2`   | Project lifecycle & multi-part STL/3MF import                                            | **`P0`** | `Partial` | `apps/nestcraft` (single-file picker done; multi-file/folder + project `.nestc` save pending) |
+| `3.1–3.2.2`   | Project lifecycle (`.nestc` save/open) & async multi-part STL/3MF import with progress bar | **`P0`** |  `Done`   | `crates/nestcraft-core/src/io/nestc.rs` + `apps/nestcraft`                                        |
 | `3.2.3`        | File Preview Browser (dimensions, triangle count, thumbnail before import)               | **`P2`** | `Planned` | `apps/nestcraft`                                                                                |
 | `3.2.4, 6.2.4` | Split multi-shell STLs into separate parts                                               | **`P1`** |  `Done`   | `crates/nestcraft-core/src/manifold.rs` + `apps/nestcraft`                                        |
 | `3.2.5`        | Build Report Sheets (`.pdf` / `.csv` / HTML build summary with metrics & thumbnails) | **`P1`** | `Planned` | `crates/nestcraft-core` + `apps/nestcraft`                                                    |
-| `3.3`          | Export build job to 3MF & export individual/merged parts to STL                          | **`P0`** | `Partial` | `crates/nestcraft-core/src/io/` (3MF export done; STL writer pending)                           |
+| `3.3`          | Export build job to 3MF & export individual/transformed parts to STL (ASCII prefix/suffix) | **`P0`** |  `Done`   | `crates/nestcraft-core/src/io/{threemf,stl}.rs` + `apps/nestcraft`                                |
 | `3.4`          | High-resolution viewport screenshot capture                                              | **`P2`** | `Planned` | `apps/nestcraft`                                                                                |
 
 ### §4. Viewing & Visualization Options
 
 | Ref          | NestCraft Feature                                                                              |       Rank       |    Status    | Implementation Target                                                                           |
 | :----------- | :--------------------------------------------------------------------------------------------- | :--------------: | :----------: | :---------------------------------------------------------------------------------------------- |
-| `4.1–4.2` | Standard views (`±X, ±Y, ±Z, Iso`), Zoom to Fit, Zoom to Selected                         | **`P0`** | `Partial` | `apps/nestcraft/src/viewport.rs` (compass snap done; Zoom to Selected + ortho toggle pending) |
+| `4.1–4.2` | Standard views (`Iso, Top, Bottom, Front, Back, Right, Left` + `Space` cycle & View bar), Zoom to Fit, Zoom to Selected | **`P0`** | `Partial` | `apps/nestcraft/src/viewport.rs` (View bar, `Space` cycle & compass snap done; Zoom to Selected + ortho toggle pending) |
 | `4.3`      | Display modes (shaded, triangle edges, outbox brackets, open-edge highlight, Z-clipping plane) | **`P1`** | `Partial` | `apps/nestcraft/src/viewport.rs` (selected outbox done; edges/Z-clip pending)                 |
 | `4.4`      | Mesh vertex color & UV texture viewer                                                          | **`P3`** | `Deferred` | —                                                                                              |
 
@@ -64,10 +64,10 @@ Related docs: [`docs/sls-nesting-plan.md`](sls-nesting-plan.md) · [`docs/sls-ne
 
 | Ref              | NestCraft Feature                                                                                                                               |       Rank       |   Status   | Implementation Target                                                                                       |
 | :--------------- | :---------------------------------------------------------------------------------------------------------------------------------------------- | :--------------: | :---------: | :---------------------------------------------------------------------------------------------------------- |
-| `5.1–5.2`     | Add/Remove parts & Advanced Selection (by volume, height, shell count, OOB, colliding, invert)                                                  | **`P1`** | `Partial` | `apps/nestcraft` (add/remove done; filter selection pending)                                              |
-| `5.3`          | Standard parametric test library (cubes, cylinders, tensile bars, benchmark shapes)                                                             | **`P2`** | `Partial` | `apps/nestcraft` (`Sample Part` bracket done)                                                           |
-| `5.4`          | Duplicate parts (`×N` grid `Nx × Ny × Nz` with configurable X/Y/Z gap)                                                                   | **`P0`** | `Partial` | `crates/nestcraft-core/src/model.rs` (1D X-step done; 3D grid pending)                                    |
-| `5.5.1–5.5.3` | Move, Rotate (`±90°`, Euler, drag-to-translate), Align (to floor `Z=0`, center XY, align faces)                                           | **`P0`** | `Partial` | `crates/nestcraft-core` + `apps/nestcraft` (`Drop Z=0`, `Center XY`, drag done; face-align pending) |
+| `5.1–5.2`     | Add/Remove parts, Multi-select (`Ctrl+Click`, `Shift+Click` tree range, marquee drag) & Metric Filter Selection | **`P1`** | `Partial` | `apps/nestcraft` (add/remove & multi-select done; metric filter selection pending)                          |
+| `5.3`          | Standard parametric test library (cubes, cylinders, tensile bars, benchmark shapes)                                                             | **`P2`** | `Partial` | `crates/nestcraft-core` / `apps/nestcraft` (`Sample Part` bracket done)                                    |
+| `5.4`          | Duplicate parts (`×N` grid `Nx × Ny × Nz` with configurable X/Y/Z gap & compact distribution)                                                 | **`P0`** |  `Done`   | `crates/nestcraft-core/src/model.rs` + `Duplicate Parts` popup in `apps/nestcraft`                          |
+| `5.5.1–5.5.3` | Move (`Relative`/`Absolute` popup, camera-plane drag), Rotate (`±90°`, Euler), Align (`Drop Min Z`, `Center XY`) | **`P0`** | `Partial` | `crates/nestcraft-core` + `apps/nestcraft` (move/rotate/drop/center done; face-align pending)      |
 | `5.5.4`        | **Anisotropic X/Y/Z Scaling** (PA12 shrinkage compensation factors & unit scale)                                                          | **`P0`** | `Planned` | `crates/nestcraft-core/src/model.rs` + Inspector UI                                                       |
 | `5.5.5`        | Outbox 2D/3D Arrange Parts                                                                                                                      | **`P1`** | `Planned` | `crates/nestcraft-core/src/packer.rs`                                                                     |
 | `5.6`          | 2D Planar True-Shape Placement (single-layer Z=0 nesting)                                                                                       | **`P1`** | `Planned` | `crates/nestcraft-core/src/packer.rs`                                                                     |
@@ -147,7 +147,7 @@ flowchart LR
 2. **3D EDT Voxelizer & Packer (`edt.rs`, `voxel.rs`, `packer.rs`):**
    - `u64`-bitpacked `solid_mask` & Felzenszwalb-Huttenlocher 3D EDT `clearance_mask`.
    - Bottom-Left-Back-Fill + multi-start metaheuristic supporting `Fixed`, `ZOnly`, and `Free` (with 3D flip toggle), `max_Z` ceiling limit, selected-only packing, and non-fitting overflow placement outside the chamber.
-   - 2D Planar nesting mode (`§5.6`) & 3D grid duplicate (`Nx × Ny × Nz` with X/Y/Z spacing).
+   - 2D Planar nesting mode (`§5.6`) & 3D grid duplicate (`Nx × Ny × Nz` with X/Y/Z spacing — `Done`).
 3. **Exact Collision & Interlocking Tests (`verify.rs`, `interlock.rs`):**
    - Exact triangle-to-triangle clearance verification (`1.0 mm` / `2.5 mm` configurable) + live collision highlight in the viewport.
    - Topological interlocking detector (ray-escape / translational separability check on cavity-nesting pairs).

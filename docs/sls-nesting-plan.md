@@ -10,10 +10,10 @@ Reference architecture: [`docs/sls-nesting-migration.md`](sls-nesting-migration.
 
 Before starting implementation, three repository/environment details were verified against the current `sls-dev` workspace:
 
-1. **Branch & Workspace:** Currently on `sls-dev`. Root `Cargo.toml` (`v0.43.0`, Rust 2024 edition, MSRV `1.95`) globs `crates/*` and `apps/*` and enforces `unsafe_code = "forbid"`.
+1. **Branch & Workspace:** Currently on `sls-dev`. Root `Cargo.toml` (`v0.46.2`, Rust 2024 edition, MSRV `1.95`) globs `crates/*` and `apps/*` and enforces `unsafe_code = "forbid"`.
 2. **External Dependencies to Vet:** `parry3d` is not currently in `Cargo.lock` or `Cargo.toml`. Adding it (or `nalgebra`) requires passing `cargo xtask licences --check` and wasm compatibility checks.
-3. **`pyroid-core` Source & Toolchain:**
-   - `pyroid-core` lives in your fork at `https://github.com/yuvalabou/pyroid` (the local path `raw/projects/GitHub/pyroid/crates/pyroid-core/src/lib.rs` referenced in `sls-nesting-migration.md` does not exist in this workspace). In Stage 2A, we can either pull `pyroid-core` from that GitHub repo/local clone or vendor/port `bvh.rs`, `edt.rs`, and `manifold.rs` into `crates/nestcraft-core`.
+3. **`ferroform` Source & Toolchain:**
+   - `ferroform` (pure Rust, replacing `pyroid`) lives in the same directory (`raw/projects/GitHub/ferroform` / `https://github.com/yuvalabou/ferroform`). In Stage 2A, we can either pull `ferroform` from that local/GitHub repo or vendor/port its pure-Rust `bvh`, `edt`, and `manifold` modules into `crates/nestcraft-core`.
    - Running `cargo xtask layers` attempted an online rustup sync for `1.99.1-x86_64-pc-windows-msvc`, so local toolchain availability must be confirmed first.
 
 ---
@@ -88,11 +88,11 @@ Before starting implementation, three repository/environment details were verifi
 
 ### Stage 2A — Geometry, Manifold Check & 3D EDT Voxel Masks
 - **Manifold & Winding Gate (`crates/nestcraft-core/src/manifold.rs`):**
-  - Port `pyroid-core::manifold`: check edge incidence (every edge shared by exactly 2 faces), consistent triangle winding, and degenerate/zero-area triangles. Flag or reject non-manifold meshes with structured diagnostics (`ManifoldReport`).
+  - Ported from `ferroform` (pure Rust, `Done`): check edge incidence (every edge shared by exactly 2 faces), consistent triangle winding, and degenerate/zero-area triangles. Flag or reject non-manifold meshes with structured diagnostics (`ManifoldReport`).
 - **BVH & Voxelization (`crates/nestcraft-core/src/voxel.rs`):**
-  - Port `pyroid-core::bvh` (Rayon-parallel BVH ray-cast containment) to voxelize each unique `PartPrototype` (and its quantized orientations, e.g., 90° or 45° steps respecting `RotationConstraint`) at configurable pitch (`1.0 mm` coarse / `0.5 mm` fine).
+  - Port `ferroform` BVH (Rayon-parallel BVH ray-cast containment) to voxelize each unique `PartPrototype` (and its quantized orientations, e.g., 90° or 45° steps respecting `RotationConstraint`) at configurable pitch (`1.0 mm` coarse / `0.5 mm` fine).
 - **3D Euclidean Distance Transform (`crates/nestcraft-core/src/edt.rs`):**
-  - Port Felzenszwalb-Huttenlocher 3D EDT from `pyroid-core::edt`.
+  - Port Felzenszwalb-Huttenlocher 3D EDT from `ferroform` (pure Rust).
   - Produce two `u64`-bitpacked 3D grids per `(PartPrototype, Orientation)`:
     - `solid_mask` (`EDT <= 0.0`): exact part occupancy (used for thermal density & Sinterbox checks).
     - `clearance_mask` (`EDT <= clearance_mm / 2.0`, e.g., `1.25 mm` half-clearance for `2.5 mm` part-to-part gap): dilated shell for `O(1)` bitwise `&` collision detection (`(a_word & b_word) != 0`).
@@ -163,7 +163,7 @@ Before starting implementation, three repository/environment details were verifi
 
 ## Timetable & Gantt Schedule
 
-Estimated **~26 working days (~5.2 weeks)** for Stages 0–3 (assuming offline toolchain and `pyroid-core` access are ready before Stage 2A).
+Estimated **~26 working days (~5.2 weeks)** for Stages 0–3 (assuming offline toolchain and `ferroform` access are ready before Stage 2A).
 
 ### Milestone Timetable
 
@@ -173,7 +173,7 @@ Estimated **~26 working days (~5.2 weeks)** for Stages 0–3 (assuming offline t
 | **Stage 1A** | STL/3MF I/O & Machine Profiles | 3d | Days 2–4 | Stage 0 | Pure-Rust mesh loader & Formiga/HT403P profiles |
 | **Stage 1B** | `ui-kit` Shell & `NESTCRAFT_ICONS` | 4d | Days 3–6 | Stage 0 | `Container`-compliant UI, ribbon, parts tree, inspector |
 | **Stage 1C** | `viewport-gpu` Instancing & Picking | 4d | Days 6–9 | 1A, 1B | Interactive 3D build-volume viewer + manual placement |
-| **Stage 2A** | Manifold, BVH & 3D EDT Masks | 4d | Days 10–13 | 1A, `pyroid-core` | `u64` bitpacked `solid_mask` & `clearance_mask` |
+| **Stage 2A** | Manifold, BVH & 3D EDT Masks | 4d | Days 10–13 | 1A, `ferroform` | `u64` bitpacked `solid_mask` & `clearance_mask` |
 | **Stage 2B** | BLBF + Annealing + `parry3d` Verify | 5d | Days 14–18 | 2A, `parry3d` | Headless 3D packer with exact clearance check |
 | **Stage 2C** | Netfabb Benchmark & UI Wiring | 2d | Days 19–20 | 1C, 2B | 50–150 part benchmark + live Auto-Nest & collision UI |
 | **Stage 3A** | Sinterbox, Thermal Map & Z-Slice | 3d | Days 21–23 | 2A, 2C | Perforated cages, PA12 heat map, Z-slice inspection |
@@ -268,7 +268,7 @@ All SLS development uses `sls-dev` as the protected integration branch, while `m
 ## Open Decisions Before Starting Stage 0
 
 1. **Crate & App naming:** Initially scaffolded as `solidcraft-sls-core` (`crates/sls-core`) and `solidcraft-sls` (`apps/solidcraft-sls`) in Stage 0; renaming to **`nestcraft-core`** (`crates/nestcraft-core`) and **`nestcraft`** (`apps/nestcraft`) with project file format **`.nestc`**.
-2. **`pyroid-core` integration (Stage 2A):** Resolved source: `https://github.com/yuvalabou/pyroid` — prefer adding `pyroid-core` as a git/path dependency or porting `bvh.rs`, `edt.rs`, and `manifold.rs` directly into `crates/nestcraft-core`?
+2. **`ferroform` integration (Stage 2A):** Pure-Rust `ferroform` (replacing `pyroid`, in `raw/projects/GitHub/ferroform`) — prefer adding `ferroform` as a path/git dependency or porting `bvh`, `edt`, and `manifold` directly into `crates/nestcraft-core`?
 3. **`parry3d` addition:** Approve adding `parry3d` (MIT/Apache-2.0) to workspace dependencies for Stage 1C ray-picking / Stage 2B exact verification?
 
 ---
@@ -322,4 +322,17 @@ All SLS development uses `sls-dev` as the protected integration branch, while `m
   - `93593cd10` — `docs(sls): update Stage 1 completion log and test results`
   - `a602d2372` — `fix(solidcraft-sls): fix offscreen scene/window depth target mismatch, apply theme, and hide console window`
 - **Merged to `sls-dev`:** tagged `sls-stage-1`.
+
+### Stage 2A & Workspace UI Refinements (`sls-dev`)
+- **What Was Done:**
+  - Renamed workspace crates to `nestcraft-core` (`crates/nestcraft-core`) and `nestcraft` (`apps/nestcraft`), synced `sls-dev` to `origin/main` (`v0.46.2`, merge commit `c2aa4c2e5`).
+  - Added mesh manifold diagnostics & shell splitting (`crates/nestcraft-core/src/manifold.rs`), hierarchical project tree with groups/visibility/custom platform editor, and multi-file import + window drag-and-drop.
+  - **Free-floating `Z = 0` workspace:** Extended `Z = 0` floor grid with subtle bed footprint & platform height (`Z = h`) wireframe reference, side-by-side non-overlapping import (`add_instance_on_floor_next`), and `Z >= 0` floor clamping/validation (`is_instance_above_floor`, `clamp_instance_above_floor`) without XY bed-size limits.
+  - **Viewport & Navigation:** Right-drag unlimited 360° orbit (`orbit_unlimited_through_roll`), middle-drag pan, `Space` view cycling (`Iso → Top → Bottom → Front → Back → Right → Left`), floating `"View"` hint bar, and side-view arrow-key `±Z` / screen-horizontal nudging.
+  - **Grid Duplication & Multi-Selection:** Moved duplication into a `Duplicate Parts` popup (`duplicate_instance_grid` + `distribute_compact_grid` across selectable X/Y/Z axes) and added Explorer-style multi-selection (`Ctrl+Click`, `Shift+Click` tree range, and left-drag marquee rectangle selection).
+  - **MVP Build-Prep & I/O:** Added configurable pre-built machines (`Formiga P110` `200×250×330` Front-Left origin, `Farsoon HT403P` `400×400×450` Center origin, `Custom`), `Wall Distance` & `Min Z` floor height, per-machine permanent `No-Build Zone` STL (locked by default, unlockable for viewport dragging), `Move Selection` (`Relative`/`Absolute`) popup (`M`), right-click model context menu, camera-plane part dragging, `.nestc` save/open bed (`Ctrl+S`), individual binary STL export with ASCII-only prefix/suffix, and background file loading with progress bar.
+- **Tests Run (`40 passed; 0 failed`):**
+  - `nestcraft-core`: `22 passed; 0 failed`
+  - `nestcraft`: `18 passed; 0 failed`
+  - `cargo clippy -p nestcraft-core -p nestcraft --all-targets -- -D warnings`: passed (0 warnings in `nestcraft-core` / `nestcraft`).
 

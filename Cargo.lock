@@ -3792,6 +3792,8 @@ dependencies = [
  "egui-wgpu",
  "nestcraft-core",
  "rfd",
+ "serde",
+ "serde_json",
  "solidcraft-look",
  "solidcraft-theme",
  "solidcraft-ui-kit",
@@ -3806,6 +3808,8 @@ name = "nestcraft-core"
 version = "0.46.2"
 dependencies = [
  "quick-xml",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "zip",
 ]

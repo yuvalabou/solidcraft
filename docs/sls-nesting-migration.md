@@ -3,7 +3,7 @@
 > **Naming & Project Format:** Renamed to **NestCraft** (formerly *SolidCraft SLS*) to separate it from a slicer and allow a broader nesting & build-preparation scope, with project file extension **`.nestc`** (replacing `.scsls`). Target workspace members: `crates/nestcraft-core` + `apps/nestcraft`.
 
 - **Repository:** `yuvalabou/solidcraft` (tracking upstream `tangency-labs/solidcraft`)
-- **Target Baseline:** SolidCraft `v0.43.0` (Rust 2024 edition, MSRV `1.95`)
+- **Target Baseline:** SolidCraft `v0.46.2` (Rust 2024 edition, MSRV `1.95`)
 - **Licensing Strategy:** **Internal / Upstream-Ready Fork (`LICENSE-BRAND` Clause 2a/2b)** — full `solidcraft-ui-kit`, `solidcraft-look`, and `solidcraft-theme` integration
 - **Workspace Topology:** `crates/nestcraft-core` (`Class::Shared`, pure Rust) + `apps/nestcraft` (`Class::Exempt` binary & MCP host)
 - **Target Machines:** EOS Formiga P110 (`160 × 210 × 330 mm`), Farsoon HT403P (`400 × 400 × 450 mm`), PA12 sintered parts
@@ -108,21 +108,21 @@ static NESTCRAFT_ICONS: IconSet = IconSet::extended(
 | **Asset Provenance Gate** | `xtask/src/assets.rs` | Any committed `.png`, `.svg`, `.ico`, `.ttf`, `.stl`, `.step`, `.obj` outside `solidcore/`/`vendor/` fails `cargo xtask assets` unless listed in `ATTRIBUTION.md` or `attribution/pending/*.md`. Log any new SLS assets in `attribution/pending/nestcraft.md` (prevents merge conflicts on `ATTRIBUTION.md`). |
 | **Strict Lints** | `Cargo.toml`, `crates/viewport/src/lib.rs` | Workspace sets `unsafe_code = "forbid"`, and core crates apply `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]`. Use `thiserror = "2"` + `?` everywhere. |
 | **`crates/io` B-Rep Coupling** | `crates/io/Cargo.toml` | `solidcraft-io` pulls in `solidcraft-kernel`, `solidcraft-doc`, `solidcraft-sketch`, and `solidcore-ops`. Do not import `solidcraft-io` into `nestcraft-core`; write a lean pure-mesh STL/3MF module using workspace `zip = "9"` + `quick-xml = "0.41"` (modeling build-item transforms on `crates/io/src/threemf.rs`). |
-| **`jagua-rs` is 2D Only** | External ecosystem | `jagua-rs` and `sparrow` handle 2D irregular polygons only. Build the 3D clearance/packing kernel over BVH + 3D Euclidean Distance Fields from `pyroid-core`. |
+| **`jagua-rs` is 2D Only** | External ecosystem | `jagua-rs` and `sparrow` handle 2D irregular polygons only. Build the 3D clearance/packing kernel over BVH + 3D Euclidean Distance Fields from `ferroform` (pure Rust). |
 
 ---
 
 ## 4. 3D Nesting Engine Architecture (`nestcraft-core`)
 
-Rather than writing geometry math from scratch or importing `jagua-rs` (2D), reuse proven Rust primitives already validated in our ecosystem (`pyroid-core` + `solidcraft`):
+Rather than writing geometry math from scratch or importing `jagua-rs` (2D), reuse proven pure-Rust primitives already validated in our ecosystem (`ferroform` + `solidcraft`):
 
 1. **Mesh Ingestion & Repair Gate:**
    - **Binary/ASCII STL & 3MF:** Pure-mesh parser in `nestcraft-core` using workspace `zip = "9"` + `quick-xml = "0.41"` (mirroring the Production Extension `p:path` build-item logic in `crates/io/src/threemf.rs` without pulling in `solidcraft-doc`).
-   - **Manifold & Winding Check:** Reuse the Farsoon BuildStar manifold/winding checks from `pyroid-core::manifold` (`raw/projects/GitHub/pyroid/crates/pyroid-core/src/manifold.rs`) to reject/flag non-manifold customer STLs up front (keeping Netfabb as an upstream repair pre-pass for broken meshes during transition).
-2. **Exact 3D Sintering Clearance via 3D EDT (from `pyroid-core`):**
+   - **Manifold & Winding Check:** Reuse the Farsoon BuildStar manifold/winding checks from `ferroform` (`raw/projects/GitHub/ferroform`) to reject/flag non-manifold customer STLs up front (keeping Netfabb as an upstream repair pre-pass for broken meshes during transition).
+2. **Exact 3D Sintering Clearance via 3D EDT (from `ferroform`):**
    - **Voxel + 3D EDT Pipeline:**
-     1. Voxelize each unique part mesh at target pitch (`1.0 mm` / `0.5 mm`) using `pyroid-core::bvh` (Rayon-parallel BVH ray-cast containment).
-     2. Compute the **Felzenszwalb-Huttenlocher 3D Euclidean Distance Transform** (`pyroid-core::edt`) once per unique part / quantized orientation.
+     1. Voxelize each unique part mesh at target pitch (`1.0 mm` / `0.5 mm`) using `ferroform` BVH (Rayon-parallel BVH ray-cast containment).
+     2. Compute the **Felzenszwalb-Huttenlocher 3D Euclidean Distance Transform** (`ferroform` EDT) once per unique part / quantized orientation.
      3. Generate two binary `u64` bitpacked voxel masks per orientation:
         - `solid_mask` (`EDT <= 0`) — actual part occupancy (thermal density & Sinterbox checks)
         - `clearance_mask` (`EDT <= clearance_mm / 2.0`, e.g., `1.25 mm` half-clearance for `2.5 mm` part-to-part gap) — dilated shell for `O(1)` bitwise `&` collision detection (`(a_word & b_word) != 0`).
@@ -141,7 +141,7 @@ Rather than writing geometry math from scratch or importing `jagua-rs` (2D), reu
 
 ### Phase 1: Headless `nestcraft-core` + Packer Benchmark (Zero UI)
 - Scaffold `crates/nestcraft-core`: STL + 3MF Production build-item I/O, Formiga P110 (`160×210×330 mm`) & Farsoon HT403P (`400×400×450 mm`) build volumes.
-- Port/depend on `pyroid-core` (`bvh.rs`, `edt.rs`, `manifold.rs`) for `u64` bitpacked clearance masks.
+- Port/depend on `ferroform` (pure Rust `bvh.rs`, `edt.rs`, `manifold.rs`) for `u64` bitpacked clearance masks.
 - Implement Bottom-Left-Back-Fill + Simulated Annealing packer and benchmark packing density (%), `max_Z` (mm), and runtime (s) on a real 50–150 part job against Netfabb **before** investing in GUI panels.
 
 ### Phase 2: `solidcraft-ui-kit` + `solidcraft-viewport-gpu` App

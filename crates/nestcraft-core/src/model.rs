@@ -52,10 +52,20 @@ pub enum RotationConstraint {
     Fixed,
 }
 
+/// Where world `(0, 0, 0)` sits on the machine bed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BedOrigin {
+    /// `(0, 0, 0)` is at the front-left corner (`X in [0, W]`, `Y in [0, D]`).
+    #[default]
+    FrontLeft,
+    /// `(0, 0, 0)` is at the bed center (`X in [-W/2, W/2]`, `Y in [-D/2, D/2]`).
+    Center,
+}
+
 /// Target machine build-volume profile.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MachineProfile {
-    /// EOS Formiga P110 (`160 x 210 x 330 mm`).
+    /// EOS Formiga P110 (`200 x 250 x 330 mm`).
     FormigaP110,
     /// Farsoon HT403P (`400 x 400 x 450 mm`).
     FarsoonHT403P,
@@ -76,7 +86,7 @@ impl MachineProfile {
     /// Build envelope dimensions `[width_x, depth_y, height_z]` in millimetres.
     pub fn size_mm(&self) -> [f32; 3] {
         match self {
-            Self::FormigaP110 => [160.0, 210.0, 330.0],
+            Self::FormigaP110 => [200.0, 250.0, 330.0],
             Self::FarsoonHT403P => [400.0, 400.0, 450.0],
             Self::Custom { size_mm, .. } => *size_mm,
         }
@@ -327,6 +337,71 @@ pub fn transform_from_translation_euler_deg(translation: [f32; 3], euler_deg: [f
     ]
 }
 
+/// User-configured STL keep-out / no-build zone in build-chamber coordinates.
+#[derive(Debug, Clone)]
+pub struct NoBuildZone {
+    /// Display name (typically derived from the imported STL file name).
+    pub name: String,
+    /// Keep-out volume mesh in local coordinates (millimetres).
+    pub mesh: Arc<TriMesh>,
+    /// Translation `[x, y, z]` in millimetres.
+    pub position: [f32; 3],
+    /// Euler rotation `[rx, ry, rz]` in degrees.
+    pub rotation_deg: [f32; 3],
+    /// Extra safety clearance around the no-build zone in millimetres.
+    pub clearance_mm: f32,
+    /// Whether parts are checked against this zone.
+    pub enabled: bool,
+    /// Whether the zone mesh is rendered in the 3D viewport.
+    pub visible: bool,
+    /// Whether viewport dragging of the no-build zone is locked.
+    pub locked: bool,
+}
+
+impl NoBuildZone {
+    /// Construct a new enabled & visible no-build zone at the origin.
+    pub fn new(name: impl Into<String>, mesh: Arc<TriMesh>) -> Self {
+        Self {
+            name: name.into(),
+            mesh,
+            position: [0.0, 0.0, 0.0],
+            rotation_deg: [0.0, 0.0, 0.0],
+            clearance_mm: 0.0,
+            enabled: true,
+            visible: true,
+            locked: true,
+        }
+    }
+
+    /// Rigid 3x4 world transform for this no-build zone.
+    pub fn transform(&self) -> Transform3x4 {
+        transform_from_translation_euler_deg(self.position, self.rotation_deg)
+    }
+
+    /// World-space axis-aligned bounding box of the transformed no-build zone.
+    pub fn world_bounds(&self) -> Aabb {
+        transform_aabb(self.mesh.bounds, &self.transform())
+    }
+}
+
+fn transform_aabb(bounds: Aabb, m: &Transform3x4) -> Aabb {
+    let [lo, hi] = bounds;
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for sx in [lo[0], hi[0]] {
+        for sy in [lo[1], hi[1]] {
+            for sz in [lo[2], hi[2]] {
+                let p = transform_point(m, [sx, sy, sz]);
+                for k in 0..3 {
+                    min[k] = min[k].min(p[k]);
+                    max[k] = max[k].max(p[k]);
+                }
+            }
+        }
+    }
+    [min, max]
+}
+
 /// Complete NestCraft build job state.
 #[derive(Debug, Clone)]
 pub struct BuildJob {
@@ -336,15 +411,21 @@ pub struct BuildJob {
     pub clearance_mm: f32,
     /// Minimum required margin from X/Y chamber walls and top Z in millimetres.
     pub wall_margin_mm: f32,
+    /// Minimum allowed Z coordinate (floor height) in millimetres (default `0.0`).
+    pub min_z_mm: f32,
+    /// Where world `(0, 0, 0)` sits on the machine bed.
+    pub bed_origin: BedOrigin,
     /// Unique part prototypes.
     pub parts: Vec<PartPrototype>,
     /// Placed part instances.
     pub instances: Vec<PartInstance>,
     /// Project-tree groups.
     pub groups: Vec<PartGroup>,
-    next_part_id: u32,
-    next_instance_id: u32,
-    next_group_id: u32,
+    /// Optional STL keep-out / no-build zone.
+    pub no_build_zone: Option<NoBuildZone>,
+    pub(crate) next_part_id: u32,
+    pub(crate) next_instance_id: u32,
+    pub(crate) next_group_id: u32,
 }
 
 impl Default for BuildJob {
@@ -356,16 +437,41 @@ impl Default for BuildJob {
 impl BuildJob {
     /// Create an empty build job for `machine` with `2.5 mm` clearance and `5.0 mm` wall margin.
     pub fn new(machine: MachineProfile) -> Self {
+        let bed_origin = match machine {
+            MachineProfile::FarsoonHT403P => BedOrigin::Center,
+            _ => BedOrigin::FrontLeft,
+        };
         Self {
             machine,
             clearance_mm: 2.5,
             wall_margin_mm: 5.0,
+            min_z_mm: 0.0,
+            bed_origin,
             parts: Vec::new(),
             instances: Vec::new(),
             groups: Vec::new(),
+            no_build_zone: None,
             next_part_id: 1,
             next_instance_id: 1,
             next_group_id: 1,
+        }
+    }
+
+    /// Reference bed XY bounds `([min_x, min_y], [max_x, max_y])` in world coordinates.
+    pub fn bed_xy_bounds(&self) -> ([f32; 2], [f32; 2]) {
+        let [w, d, _] = self.machine.size_mm();
+        match self.bed_origin {
+            BedOrigin::FrontLeft => ([0.0, 0.0], [w, d]),
+            BedOrigin::Center => ([-w * 0.5, -d * 0.5], [w * 0.5, d * 0.5]),
+        }
+    }
+
+    /// World XY coordinates of the bed center.
+    pub fn bed_center_xy(&self) -> [f32; 2] {
+        let [w, d, _] = self.machine.size_mm();
+        match self.bed_origin {
+            BedOrigin::FrontLeft => [w * 0.5, d * 0.5],
+            BedOrigin::Center => [0.0, 0.0],
         }
     }
 
@@ -427,10 +533,49 @@ impl BuildJob {
             .mesh
             .clone();
         let [lo, hi] = mesh.bounds;
-        let [bx, by, _] = self.machine.size_mm();
-        let tx = bx * 0.5 - (lo[0] + hi[0]) * 0.5;
-        let ty = by * 0.5 - (lo[1] + hi[1]) * 0.5;
-        let tz = -lo[2];
+        let [cx, cy] = self.bed_center_xy();
+        let tx = cx - (lo[0] + hi[0]) * 0.5;
+        let ty = cy - (lo[1] + hi[1]) * 0.5;
+        let tz = self.min_z_mm.max(0.0) - lo[2];
+        let mut transform = IDENTITY_TRANSFORM;
+        transform[0][3] = tx;
+        transform[1][3] = ty;
+        transform[2][3] = tz;
+        self.add_instance(part_id, transform)
+    }
+
+    /// Place a new instance on `Z = 0` side-by-side with existing parts so it does not overlap.
+    ///
+    /// When no instances exist yet, this places the part centered on the reference bed at `Z = 0`.
+    /// Otherwise it places the part to the right (`+X`) of the rightmost existing instance with
+    /// `self.clearance_mm` spacing, without restricting placement to the reference bed size.
+    pub fn add_instance_on_floor_next(&mut self, part_id: PartId) -> Result<InstanceId> {
+        if self.instances.is_empty() {
+            return self.add_instance_centered_on_floor(part_id);
+        }
+        let mesh = self
+            .part(part_id)
+            .ok_or_else(|| NestCraftError::InvalidInput(format!("unknown part id {}", part_id.0)))?
+            .mesh
+            .clone();
+        let [lo, hi] = mesh.bounds;
+        let [cx, cy] = self.bed_center_xy();
+
+        let mut max_x = f32::NEG_INFINITY;
+        for inst in &self.instances {
+            if let Some(proto) = self.part(inst.part_id) {
+                let wb = inst.world_bounds(proto.mesh.bounds);
+                max_x = max_x.max(wb[1][0]);
+            }
+        }
+
+        let tx = if max_x.is_finite() {
+            max_x + self.clearance_mm.max(0.0) - lo[0]
+        } else {
+            cx - (lo[0] + hi[0]) * 0.5
+        };
+        let ty = cy - (lo[1] + hi[1]) * 0.5;
+        let tz = self.min_z_mm.max(0.0) - lo[2];
         let mut transform = IDENTITY_TRANSFORM;
         transform[0][3] = tx;
         transform[1][3] = ty;
@@ -440,23 +585,66 @@ impl BuildJob {
 
     /// Duplicate an existing instance `count` times with a small X-step offset.
     pub fn duplicate_instance(&mut self, source_id: InstanceId, count: usize) -> Result<Vec<InstanceId>> {
+        self.duplicate_instance_grid(source_id, [count + 1, 1, 1], [self.clearance_mm; 3], None)
+    }
+
+    /// Duplicate an existing instance into a compact 3D grid of `counts = [nx, ny, nz]`
+    /// total cells (skipping `(0, 0, 0)` which is the source instance), spaced by
+    /// `world_dims[axis] + gap_mm[axis]`.
+    ///
+    /// When `max_new` is `Some(n)`, stops after creating `n` new instances.
+    pub fn duplicate_instance_grid(
+        &mut self,
+        source_id: InstanceId,
+        counts: [usize; 3],
+        gap_mm: [f32; 3],
+        max_new: Option<usize>,
+    ) -> Result<Vec<InstanceId>> {
         let src = self
             .instances
             .iter()
             .find(|i| i.id == source_id)
             .cloned()
             .ok_or_else(|| NestCraftError::InvalidInput(format!("unknown instance id {}", source_id.0)))?;
-        let dims = self
+        let local_bounds = self
             .part(src.part_id)
-            .map(|p| p.mesh.dimensions())
-            .unwrap_or([10.0, 10.0, 10.0]);
-        let step_x = dims[0] + self.clearance_mm;
-        let mut created = Vec::with_capacity(count);
-        for k in 1..=count {
-            let mut transform = src.transform;
-            transform[0][3] += step_x * k as f32;
-            let id = self.add_instance(src.part_id, transform)?;
-            created.push(id);
+            .map(|p| p.mesh.bounds)
+            .unwrap_or([[0.0; 3], [10.0; 3]]);
+        let wb = src.world_bounds(local_bounds);
+        let dims = [
+            (wb[1][0] - wb[0][0]).max(0.1),
+            (wb[1][1] - wb[0][1]).max(0.1),
+            (wb[1][2] - wb[0][2]).max(0.1),
+        ];
+        let steps = [
+            dims[0] + gap_mm[0].max(0.0),
+            dims[1] + gap_mm[1].max(0.0),
+            dims[2] + gap_mm[2].max(0.0),
+        ];
+        let nx = counts[0].max(1);
+        let ny = counts[1].max(1);
+        let nz = counts[2].max(1);
+        let target_new = max_new.unwrap_or_else(|| nx.saturating_mul(ny).saturating_mul(nz).saturating_sub(1));
+        let mut created = Vec::with_capacity(target_new);
+
+        'outer: for iz in 0..nz {
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    if ix == 0 && iy == 0 && iz == 0 {
+                        continue;
+                    }
+                    if created.len() >= target_new {
+                        break 'outer;
+                    }
+                    let mut transform = src.transform;
+                    transform[0][3] += steps[0] * ix as f32;
+                    transform[1][3] += steps[1] * iy as f32;
+                    transform[2][3] += steps[2] * iz as f32;
+                    let id = self.add_instance(src.part_id, transform)?;
+                    self.clamp_instance_above_floor(id);
+                    created.push(id);
+                }
+            }
         }
         Ok(created)
     }
@@ -501,18 +689,103 @@ impl BuildJob {
             return false;
         };
         let [lo, hi] = inst.world_bounds(proto.mesh.bounds);
-        let [wx, wy, wz] = self.machine.size_mm();
+        let ([x0, y0], [x1, y1]) = self.bed_xy_bounds();
+        let [_, _, wz] = self.machine.size_mm();
         let m = self.wall_margin_mm.max(0.0);
         const EPS: f32 = 1e-3;
-        lo[0] >= m - EPS
-            && lo[1] >= m - EPS
-            && lo[2] >= -EPS
-            && hi[0] <= wx - m + EPS
-            && hi[1] <= wy - m + EPS
+        lo[0] >= x0 + m - EPS
+            && lo[1] >= y0 + m - EPS
+            && lo[2] >= self.min_z_mm.max(0.0) - EPS
+            && hi[0] <= x1 - m + EPS
+            && hi[1] <= y1 - m + EPS
             && hi[2] <= wz - m + EPS
     }
 
-    /// Drop an instance vertically so its lowest world Z rests at `Z = 0.0`.
+    /// Check whether an instance's lowest world Z is on or above `self.min_z_mm` (default `0.0`).
+    pub fn is_instance_above_floor(&self, id: InstanceId) -> bool {
+        let Some(inst) = self.instances.iter().find(|i| i.id == id) else {
+            return false;
+        };
+        let Some(proto) = self.part(inst.part_id) else {
+            return false;
+        };
+        let wb = inst.world_bounds(proto.mesh.bounds);
+        const EPS: f32 = 1e-3;
+        wb[0][2] >= self.min_z_mm.max(0.0) - EPS
+    }
+
+    /// Lift an instance vertically if its lowest world Z is below `self.min_z_mm`.
+    ///
+    /// Returns `true` when the instance was adjusted.
+    pub fn clamp_instance_above_floor(&mut self, id: InstanceId) -> bool {
+        let Some(part_id) = self.instances.iter().find(|i| i.id == id).map(|i| i.part_id) else {
+            return false;
+        };
+        let Some(local_bounds) = self.part(part_id).map(|p| p.mesh.bounds) else {
+            return false;
+        };
+        let floor_z = self.min_z_mm.max(0.0);
+        let Some(inst) = self.instances.iter_mut().find(|i| i.id == id) else {
+            return false;
+        };
+        let wb = inst.world_bounds(local_bounds);
+        if wb[0][2] < floor_z {
+            inst.transform[2][3] += floor_z - wb[0][2];
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return `true` when `id` intersects the active [`NoBuildZone`] (including its `clearance_mm`).
+    pub fn is_instance_in_no_build_zone(&self, id: InstanceId) -> bool {
+        let Some(zone) = &self.no_build_zone else {
+            return false;
+        };
+        if !zone.enabled {
+            return false;
+        }
+        let Some(inst) = self.instances.iter().find(|i| i.id == id) else {
+            return false;
+        };
+        let Some(proto) = self.part(inst.part_id) else {
+            return false;
+        };
+        let pad = zone.clearance_mm.max(0.0);
+        let wb = inst.world_bounds(proto.mesh.bounds);
+        let zb = zone.world_bounds();
+        let wb_pad = [
+            [wb[0][0] - pad, wb[0][1] - pad, wb[0][2] - pad],
+            [wb[1][0] + pad, wb[1][1] + pad, wb[1][2] + pad],
+        ];
+        let aabbs_overlap = |a: Aabb, b: Aabb| -> bool {
+            a[0][0] <= b[1][0]
+                && a[1][0] >= b[0][0]
+                && a[0][1] <= b[1][1]
+                && a[1][1] >= b[0][1]
+                && a[0][2] <= b[1][2]
+                && a[1][2] >= b[0][2]
+        };
+        if !aabbs_overlap(wb_pad, zb) {
+            return false;
+        }
+        let z_tf = zone.transform();
+        for tri in &zone.mesh.indices {
+            let p0 = transform_point(&z_tf, zone.mesh.positions[tri[0] as usize]);
+            let p1 = transform_point(&z_tf, zone.mesh.positions[tri[1] as usize]);
+            let p2 = transform_point(&z_tf, zone.mesh.positions[tri[2] as usize]);
+            let tri_box = [
+                [p0[0].min(p1[0]).min(p2[0]), p0[1].min(p1[1]).min(p2[1]), p0[2].min(p1[2]).min(p2[2])],
+                [p0[0].max(p1[0]).max(p2[0]), p0[1].max(p1[1]).max(p2[1]), p0[2].max(p1[2]).max(p2[2])],
+            ];
+            if aabbs_overlap(wb_pad, tri_box) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Drop an instance vertically so its lowest world Z rests at `self.min_z_mm`.
     pub fn drop_instance_to_floor(&mut self, id: InstanceId) -> bool {
         let Some(part_id) = self.instances.iter().find(|i| i.id == id).map(|i| i.part_id) else {
             return false;
@@ -520,15 +793,16 @@ impl BuildJob {
         let Some(local_bounds) = self.part(part_id).map(|p| p.mesh.bounds) else {
             return false;
         };
+        let floor_z = self.min_z_mm.max(0.0);
         let Some(inst) = self.instances.iter_mut().find(|i| i.id == id) else {
             return false;
         };
         let wb = inst.world_bounds(local_bounds);
-        inst.transform[2][3] -= wb[0][2];
+        inst.transform[2][3] += floor_z - wb[0][2];
         true
     }
 
-    /// Center an instance horizontally at `(W / 2, D / 2)` without changing Z or rotation.
+    /// Center an instance horizontally at the bed center without changing Z or rotation.
     pub fn center_instance_xy(&mut self, id: InstanceId) -> bool {
         let Some(part_id) = self.instances.iter().find(|i| i.id == id).map(|i| i.part_id) else {
             return false;
@@ -536,15 +810,15 @@ impl BuildJob {
         let Some(local_bounds) = self.part(part_id).map(|p| p.mesh.bounds) else {
             return false;
         };
-        let [wx, wy, _] = self.machine.size_mm();
+        let [tx_center, ty_center] = self.bed_center_xy();
         let Some(inst) = self.instances.iter_mut().find(|i| i.id == id) else {
             return false;
         };
         let wb = inst.world_bounds(local_bounds);
         let cx = (wb[0][0] + wb[1][0]) * 0.5;
         let cy = (wb[0][1] + wb[1][1]) * 0.5;
-        inst.transform[0][3] += wx * 0.5 - cx;
-        inst.transform[1][3] += wy * 0.5 - cy;
+        inst.transform[0][3] += tx_center - cx;
+        inst.transform[1][3] += ty_center - cy;
         true
     }
 
@@ -753,5 +1027,95 @@ mod tests {
         assert!(job.remove_group(gid));
         assert_eq!(job.instances[0].group_id, None);
         assert!(job.is_instance_visible(&job.instances[0]));
+    }
+
+    #[test]
+    fn free_floor_placement_and_z_zero_clamp_work() {
+        let cube = unit_cube();
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        let p1 = job.add_part("c1", cube.clone());
+        let p2 = job.add_part("c2", cube);
+
+        let i1 = job.add_instance_on_floor_next(p1).expect("i1");
+        let i2 = job.add_instance_on_floor_next(p2).expect("i2");
+        let wb1 = job.instances[0].world_bounds(job.part(p1).expect("p1").mesh.bounds);
+        let wb2 = job.instances[1].world_bounds(job.part(p2).expect("p2").mesh.bounds);
+        assert!(wb1[0][2].abs() < 1e-4);
+        assert!(wb2[0][2].abs() < 1e-4);
+        assert!(wb2[0][0] >= wb1[1][0] + job.clearance_mm - 1e-3);
+
+        // Moving far outside XY bed is still valid above Z = 0.
+        if let Some(inst) = job.instances.iter_mut().find(|i| i.id == i1) {
+            inst.set_translation([-500.0, 900.0, 5.0]);
+        }
+        assert!(job.is_instance_above_floor(i1));
+
+        // Moving below Z = 0 fails floor check and is lifted back by clamp.
+        if let Some(inst) = job.instances.iter_mut().find(|i| i.id == i2) {
+            inst.set_translation([0.0, 0.0, -4.0]);
+        }
+        assert!(!job.is_instance_above_floor(i2));
+        assert!(job.clamp_instance_above_floor(i2));
+        assert!(job.is_instance_above_floor(i2));
+    }
+
+    #[test]
+    fn duplicate_instance_grid_places_3d_array_without_overlap() {
+        let cube = unit_cube();
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        let pid = job.add_part("cube", cube);
+        let iid = job.add_instance_centered_on_floor(pid).expect("placed");
+
+        let created = job
+            .duplicate_instance_grid(iid, [3, 2, 2], [2.0, 3.0, 4.0], None)
+            .expect("grid");
+        assert_eq!(created.len(), 11);
+        assert_eq!(job.instances.len(), 12);
+        for inst in &job.instances {
+            assert!(job.is_instance_above_floor(inst.id));
+        }
+
+        // Respects max_new cap for non-rectangular total counts.
+        let capped = job
+            .duplicate_instance_grid(iid, [3, 3, 1], [2.0, 2.0, 2.0], Some(6))
+            .expect("capped");
+        assert_eq!(capped.len(), 6);
+    }
+
+    #[test]
+    fn no_build_zone_detects_overlap_with_clearance() {
+        let cube = unit_cube();
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        let pid = job.add_part("cube", cube.clone());
+        let iid = job.add_instance(pid, IDENTITY_TRANSFORM).expect("placed");
+
+        let mut zone = NoBuildZone::new("Keep-Out", cube);
+        zone.position = [12.0, 0.0, 0.0];
+        zone.clearance_mm = 1.0;
+        job.no_build_zone = Some(zone);
+        assert!(!job.is_instance_in_no_build_zone(iid));
+
+        if let Some(z) = &mut job.no_build_zone {
+            z.clearance_mm = 3.0;
+        }
+        assert!(job.is_instance_in_no_build_zone(iid));
+
+        if let Some(z) = &mut job.no_build_zone {
+            z.enabled = false;
+        }
+        assert!(!job.is_instance_in_no_build_zone(iid));
+    }
+
+    #[test]
+    fn bed_origin_sets_bounds_and_center_per_machine() {
+        let p110 = BuildJob::new(MachineProfile::FormigaP110);
+        assert_eq!(p110.bed_origin, BedOrigin::FrontLeft);
+        assert_eq!(p110.bed_xy_bounds(), ([0.0, 0.0], [200.0, 250.0]));
+        assert_eq!(p110.bed_center_xy(), [100.0, 125.0]);
+
+        let farsoon = BuildJob::new(MachineProfile::FarsoonHT403P);
+        assert_eq!(farsoon.bed_origin, BedOrigin::Center);
+        assert_eq!(farsoon.bed_xy_bounds(), ([-200.0, -200.0], [200.0, 200.0]));
+        assert_eq!(farsoon.bed_center_xy(), [0.0, 0.0]);
     }
 }
