@@ -26,6 +26,7 @@ use nestcraft_core::model::{
     BedOrigin, BuildJob, GroupId, IDENTITY_TRANSFORM, InstanceId, MachineProfile, NoBuildZone, PartId,
     RotationConstraint, TriMesh,
 };
+use nestcraft_core::sinterbox::{self, CageShape, LabelPanel, SinterboxConfig};
 use serde::{Deserialize, Serialize};
 use solidcraft_theme::Tokens;
 use solidcraft_ui_kit::container::{BackingTooltipExt as _, Container, Edge, Surface};
@@ -251,6 +252,22 @@ struct NestCraftApp {
     scale_initial_dims: [f32; 3],
     scale_initial_snapshot: Option<UndoSnapshot>,
     scale_applied_in_session: usize,
+    sinterbox_dialog_open: bool,
+    sinterbox_shape_idx: usize,
+    sinterbox_inner_clearance: f32,
+    sinterbox_window_mm: f32,
+    sinterbox_window_auto: bool,
+    sinterbox_bar_mm: f32,
+    sinterbox_bar_auto: bool,
+    sinterbox_label_enabled: bool,
+    sinterbox_label_text: String,
+    sinterbox_label_panel_idx: usize,
+    sinterbox_label_depth: f32,
+    sinterbox_group_name: String,
+    sinterbox_group_name_edited: bool,
+    sinterbox_transparent: bool,
+    sinterbox_single_copies: usize,
+    sinterbox_single_gap: f32,
     color_picker_open: bool,
     color_picker_rgb: [u8; 3],
     color_picker_undo_pushed: bool,
@@ -733,6 +750,22 @@ impl NestCraftApp {
             scale_initial_dims: [10.0, 10.0, 10.0],
             scale_initial_snapshot: None,
             scale_applied_in_session: 0,
+            sinterbox_dialog_open: false,
+            sinterbox_shape_idx: 0,
+            sinterbox_inner_clearance: custom_clearance,
+            sinterbox_window_mm: 4.0,
+            sinterbox_window_auto: true,
+            sinterbox_bar_mm: 0.80,
+            sinterbox_bar_auto: true,
+            sinterbox_label_enabled: true,
+            sinterbox_label_text: String::new(),
+            sinterbox_label_panel_idx: 0,
+            sinterbox_label_depth: 0.8,
+            sinterbox_group_name: String::new(),
+            sinterbox_group_name_edited: false,
+            sinterbox_transparent: true,
+            sinterbox_single_copies: 1,
+            sinterbox_single_gap: custom_clearance,
             color_picker_open: false,
             color_picker_rgb: [220, 220, 220],
             color_picker_undo_pushed: false,
@@ -1164,6 +1197,152 @@ impl NestCraftApp {
         self.dup_dialog_open = true;
     }
 
+    fn select_group_instances(&mut self, gid: GroupId) {
+        let members: Vec<InstanceId> = self
+            .job
+            .instances
+            .iter()
+            .filter(|i| i.group_id == Some(gid))
+            .map(|i| i.id)
+            .collect();
+        self.selected_set.clear();
+        for &id in &members {
+            self.selected_set.insert(id);
+            if let Some(inst) = self.job.instances.iter().find(|i| i.id == id) {
+                self.euler_edit.insert(id, inst.euler_deg());
+            }
+        }
+        self.selected = members.first().copied();
+        self.selection_anchor = self.selected;
+        self.mark_dirty();
+        self.status = format!("Selected {} part(s) in group", members.len());
+    }
+
+    fn open_sinterbox_dialog(&mut self) {
+        if self.selected_set.is_empty() {
+            self.status = "Select part(s) to create a Sinterbox".to_owned();
+            return;
+        }
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        match sinterbox::analyze_sinterbox_inputs(&self.job, &ids) {
+            Ok((_bounds, min_dim, default_name)) => {
+                let rec_win = sinterbox::recommended_window_size_mm(min_dim);
+                let rec_bar = sinterbox::recommended_bar_thickness_mm(rec_win);
+                self.sinterbox_inner_clearance = self.job.clearance_mm.max(0.5);
+                self.sinterbox_window_mm = rec_win;
+                self.sinterbox_window_auto = true;
+                self.sinterbox_bar_mm = rec_bar;
+                self.sinterbox_bar_auto = true;
+                self.sinterbox_label_enabled = true;
+                self.sinterbox_label_text = default_name.clone();
+                self.sinterbox_label_panel_idx = 0;
+                self.sinterbox_label_depth = 0.8;
+                self.sinterbox_group_name = format!("Sinterbox: {default_name}");
+                self.sinterbox_group_name_edited = false;
+                self.sinterbox_transparent = true;
+                self.sinterbox_single_copies = 1;
+                self.sinterbox_single_gap = self.job.clearance_mm.max(0.0);
+                self.sinterbox_dialog_open = true;
+            }
+            Err(e) => {
+                self.status = format!("Sinterbox unavailable: {e}");
+            }
+        }
+    }
+
+    fn current_sinterbox_config(&self) -> SinterboxConfig {
+        let shape = if self.sinterbox_shape_idx == 1 {
+            CageShape::TightFit
+        } else {
+            CageShape::Box
+        };
+        let label_panel = match self.sinterbox_label_panel_idx {
+            1 => LabelPanel::TopPosZ,
+            2 => LabelPanel::FrontNegY,
+            3 => LabelPanel::RightPosX,
+            4 => LabelPanel::BackPosY,
+            5 => LabelPanel::LeftNegX,
+            6 => LabelPanel::BottomNegZ,
+            _ => LabelPanel::AutoLargest,
+        };
+        SinterboxConfig {
+            shape,
+            inner_clearance_mm: self.sinterbox_inner_clearance,
+            window_size_mm: self.sinterbox_window_mm,
+            bar_thickness_mm: self.sinterbox_bar_mm,
+            label_enabled: self.sinterbox_label_enabled,
+            label_text: self.sinterbox_label_text.clone(),
+            label_panel,
+            label_depth_mm: self.sinterbox_label_depth,
+            group_name: self.sinterbox_group_name.clone(),
+            cage_transparent: self.sinterbox_transparent,
+        }
+    }
+
+    fn apply_create_sinterbox(&mut self) {
+        let mut target_ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        if target_ids.is_empty() {
+            return;
+        }
+        self.push_undo();
+
+        if target_ids.len() == 1 && self.sinterbox_single_copies > 1 {
+            let primary = target_ids[0];
+            let grid_counts = distribute_compact_grid(self.sinterbox_single_copies, [true, true, false]);
+            let gap = [self.sinterbox_single_gap.max(0.0); 3];
+            match self.job.duplicate_instance_grid(
+                primary,
+                grid_counts,
+                gap,
+                Some(self.sinterbox_single_copies.saturating_sub(1)),
+            ) {
+                Ok(extra) => target_ids.extend(extra),
+                Err(e) => {
+                    self.undo_stack.pop();
+                    self.status = format!("Sinterbox multiply failed: {e}");
+                    return;
+                }
+            }
+        }
+
+        let cfg = self.current_sinterbox_config();
+        match sinterbox::create_sinterbox(
+            &mut self.job,
+            &target_ids,
+            &cfg,
+            Some(solidcraft_look::fonts::PLEX_SANS),
+        ) {
+            Ok(res) => {
+                self.selected_set.clear();
+                for &id in &target_ids {
+                    self.selected_set.insert(id);
+                }
+                self.selected_set.insert(res.cage_instance_id);
+                self.selected = Some(res.cage_instance_id);
+                self.selection_anchor = Some(res.cage_instance_id);
+                self.mark_dirty();
+                let shape_str = match cfg.shape {
+                    CageShape::Box => "Box",
+                    CageShape::TightFit => "Tight Fit",
+                };
+                self.status = format!(
+                    "Created {shape_str} Sinterbox ({:.1}×{:.1}×{:.1} mm, window {:.1} mm, bar {:.2} mm)",
+                    res.metrics.outer_size_mm[0],
+                    res.metrics.outer_size_mm[1],
+                    res.metrics.outer_size_mm[2],
+                    cfg.window_size_mm,
+                    cfg.bar_thickness_mm,
+                );
+            }
+            Err(e) => {
+                if let Some(snap) = self.undo_stack.pop() {
+                    self.restore_snapshot(snap);
+                }
+                self.status = format!("Sinterbox failed: {e}");
+            }
+        }
+    }
+
     fn snapshot(&self) -> UndoSnapshot {
         UndoSnapshot {
             job: self.job.clone(),
@@ -1533,6 +1712,7 @@ impl NestCraftApp {
             || self.dup_dialog_open
             || self.move_dialog_open
             || self.scale_dialog_open
+            || self.sinterbox_dialog_open
             || self.color_picker_open
             || self.export_stl_dialog_open
             || !self.below_zero_import_dialog.is_empty()
@@ -2701,6 +2881,9 @@ impl NestCraftApp {
             ShellsToParts(InstanceId),
             AlignFace(InstanceId),
             OpenScale(InstanceId),
+            OpenSinterbox(InstanceId),
+            OpenSinterboxGroup(GroupId),
+            SelectGroup(GroupId),
             MergeSelected,
         }
 
@@ -2788,6 +2971,15 @@ impl NestCraftApp {
                                     );
                                 });
                                 header_resp.response.context_menu(|ui| {
+                                    if ui.button("Select Group").clicked() {
+                                        actions.push(TreeAction::SelectGroup(group.id));
+                                        ui.close();
+                                    }
+                                    if icon_label_button(ui, "Create Sinterbox for Group...", "sls_sinterbox", !members.is_empty(), false).clicked() {
+                                        actions.push(TreeAction::OpenSinterboxGroup(group.id));
+                                        ui.close();
+                                    }
+                                    ui.separator();
                                     if ui.button(if group.hidden { "Show Group" } else { "Hide Group" }).clicked() {
                                         actions.push(TreeAction::ToggleGroupHidden(group.id, !group.hidden));
                                         ui.close();
@@ -2925,6 +3117,10 @@ impl NestCraftApp {
                                                 .clicked()
                                             {
                                                 actions.push(TreeAction::MergeSelected);
+                                                ui.close();
+                                            }
+                                            if icon_label_button(ui, "Create Sinterbox...", "sls_sinterbox", true, false).clicked() {
+                                                actions.push(TreeAction::OpenSinterbox(inst.id));
                                                 ui.close();
                                             }
                                             let export_count = if is_sel { self.selected_set.len() } else { 1 };
@@ -3143,6 +3339,10 @@ impl NestCraftApp {
                                         actions.push(TreeAction::MergeSelected);
                                         ui.close();
                                     }
+                                    if icon_label_button(ui, "Create Sinterbox...", "sls_sinterbox", true, false).clicked() {
+                                        actions.push(TreeAction::OpenSinterbox(inst.id));
+                                        ui.close();
+                                    }
                                     let export_count = if is_sel { self.selected_set.len() } else { 1 };
                                     if ui.button(export_part_menu_label(export_count)).clicked() {
                                         actions.push(TreeAction::ExportParts(inst.id));
@@ -3324,6 +3524,10 @@ impl NestCraftApp {
                                                 actions.push(TreeAction::MergeSelected);
                                                 ui.close();
                                             }
+                                            if icon_label_button(ui, "Create Sinterbox...", "sls_sinterbox", true, false).clicked() {
+                                                actions.push(TreeAction::OpenSinterbox(inst.id));
+                                                ui.close();
+                                            }
                                             let export_count = if is_sel { self.selected_set.len() } else { 1 };
                                             if ui.button(export_part_menu_label(export_count)).clicked() {
                                                 actions.push(TreeAction::ExportParts(inst.id));
@@ -3357,6 +3561,9 @@ impl NestCraftApp {
                             | TreeAction::ShellsToParts(_)
                             | TreeAction::AlignFace(_)
                             | TreeAction::OpenScale(_)
+                            | TreeAction::OpenSinterbox(_)
+                            | TreeAction::OpenSinterboxGroup(_)
+                            | TreeAction::SelectGroup(_)
                             | TreeAction::MergeSelected
                             | TreeAction::GroupSelected(_)
                             | TreeAction::UngroupSelected(_)
@@ -3496,6 +3703,19 @@ impl NestCraftApp {
                                 self.select_instance(Some(id));
                             }
                             self.open_scale_dialog();
+                        }
+                        TreeAction::OpenSinterbox(id) => {
+                            if !self.selected_set.contains(&id) {
+                                self.select_instance(Some(id));
+                            }
+                            self.open_sinterbox_dialog();
+                        }
+                        TreeAction::OpenSinterboxGroup(gid) => {
+                            self.select_group_instances(gid);
+                            self.open_sinterbox_dialog();
+                        }
+                        TreeAction::SelectGroup(gid) => {
+                            self.select_group_instances(gid);
                         }
                         TreeAction::MergeSelected => {
                             self.merge_selected_parts();
@@ -4074,6 +4294,310 @@ impl NestCraftApp {
             self.scale_dialog_open = false;
             self.scale_initial_snapshot = None;
             self.scale_applied_in_session = 0;
+        }
+    }
+
+    fn draw_sinterbox_modal(&mut self, ctx: &egui::Context) {
+        if !self.sinterbox_dialog_open {
+            return;
+        }
+        if self.selected_set.is_empty() {
+            self.sinterbox_dialog_open = false;
+            return;
+        }
+
+        let mut open = self.sinterbox_dialog_open;
+        let mut apply = false;
+        let mut cancel = false;
+        let mut switch_to_dup = false;
+        let selected_ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        let single_selected = selected_ids.len() == 1;
+
+        egui::Window::new("Create Sinterbox")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if single_selected {
+                    status_line(
+                        ui,
+                        "Only 1 part is selected. Multiply into a batch before boxing?",
+                        StatusTone::Warning,
+                    );
+                    row(ui, "Copies", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.sinterbox_single_copies)
+                                    .range(1..=200)
+                                    .speed(0.2)
+                                    .prefix("×"),
+                            );
+                            for preset in [1usize, 4, 6, 9, 12] {
+                                let lbl = if preset == 1 {
+                                    "1".to_owned()
+                                } else {
+                                    format!("×{preset}")
+                                };
+                                let tone = if self.sinterbox_single_copies == preset {
+                                    Button::Primary
+                                } else {
+                                    Button::Small
+                                };
+                                if button(ui, &lbl, tone).clicked() {
+                                    self.sinterbox_single_copies = preset;
+                                }
+                            }
+                        });
+                    });
+                    if self.sinterbox_single_copies > 1 {
+                        let grid = distribute_compact_grid(self.sinterbox_single_copies, [true, true, false]);
+                        row(ui, "Part Gap", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.sinterbox_single_gap)
+                                        .range(0.0..=50.0)
+                                        .speed(0.25)
+                                        .suffix(" mm"),
+                                );
+                                status_line(
+                                    ui,
+                                    &format!("Grid: {} × {} × {}", grid[0], grid[1], grid[2]),
+                                    StatusTone::Dim,
+                                );
+                            });
+                        });
+                    }
+                    row(ui, "Custom Grid", |ui| {
+                        if button(ui, "Open Duplicate Dialog...", Button::Small).clicked() {
+                            switch_to_dup = true;
+                        }
+                    });
+                    ui.separator();
+                }
+
+                row(ui, "Cage Shape", |ui| {
+                    ui.push_id("sinterbox_shape_seg", |ui| {
+                        segmented(
+                            ui,
+                            &mut self.sinterbox_shape_idx,
+                            &["Box", "Tight Fit"],
+                            Segments {
+                                dense: true,
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .inner
+                });
+
+                row(ui, "Inner Distance", |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.sinterbox_inner_clearance)
+                            .range(0.2..=50.0)
+                            .speed(0.25)
+                            .suffix(" mm"),
+                    )
+                    .backing_on_hover_text("Clearance between enclosed parts and inner cage walls");
+                });
+
+                let sim_grid = (single_selected && self.sinterbox_single_copies > 1).then(|| {
+                    (
+                        distribute_compact_grid(self.sinterbox_single_copies, [true, true, false]),
+                        self.sinterbox_single_gap,
+                    )
+                });
+                let cfg_preview = self.current_sinterbox_config();
+                let metrics = sinterbox::preview_sinterbox_metrics(
+                    &self.job,
+                    &selected_ids,
+                    &cfg_preview,
+                    sim_grid,
+                )
+                .ok();
+
+                row(ui, "Window Size", |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.sinterbox_window_mm)
+                                    .range(1.0..=100.0)
+                                    .speed(0.25)
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            self.sinterbox_window_auto = false;
+                            if self.sinterbox_bar_auto {
+                                self.sinterbox_bar_mm =
+                                    sinterbox::recommended_bar_thickness_mm(self.sinterbox_window_mm);
+                            }
+                        }
+                        if let Some(ref m) = metrics
+                            && button(ui, "Auto", Button::Small)
+                                .backing_on_hover_text("Set diagonal-safe window size from smallest part XYZ")
+                                .clicked()
+                        {
+                            self.sinterbox_window_mm = m.recommended_window_mm;
+                            self.sinterbox_window_auto = true;
+                            if self.sinterbox_bar_auto {
+                                self.sinterbox_bar_mm =
+                                    sinterbox::recommended_bar_thickness_mm(self.sinterbox_window_mm);
+                            }
+                        }
+                    });
+                });
+
+                if let Some(ref m) = metrics {
+                    if m.window_exceeds_safe_limit {
+                        status_line(
+                            ui,
+                            &format!(
+                                "Warning: {:.1} mm window diagonal ({:.1} mm) >= smallest part dim ({:.1} mm); part may slip out!",
+                                self.sinterbox_window_mm,
+                                self.sinterbox_window_mm * std::f32::consts::SQRT_2,
+                                m.min_part_dim_mm
+                            ),
+                            StatusTone::Warning,
+                        );
+                    } else {
+                        status_line(
+                            ui,
+                            &format!(
+                                "Smallest part XYZ: {:.1} mm → Safe window: {:.1} mm",
+                                m.min_part_dim_mm, m.recommended_window_mm
+                            ),
+                            StatusTone::Dim,
+                        );
+                    }
+                }
+
+                row(ui, "Bar Thickness", |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.sinterbox_bar_mm)
+                                    .range(0.5..=5.0)
+                                    .speed(0.05)
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            self.sinterbox_bar_auto = false;
+                        }
+                        if button(ui, "Auto (0.8–1.0)", Button::Small)
+                            .backing_on_hover_text("0.80 mm for small windows (prevents sintering shut) up to 1.00 mm")
+                            .clicked()
+                        {
+                            self.sinterbox_bar_mm =
+                                sinterbox::recommended_bar_thickness_mm(self.sinterbox_window_mm);
+                            self.sinterbox_bar_auto = true;
+                        }
+                    });
+                });
+
+                ui.separator();
+                if checkbox_row(ui, "sinterbox_label_en", "Add 3D Label", self.sinterbox_label_enabled) {
+                    self.sinterbox_label_enabled = !self.sinterbox_label_enabled;
+                }
+                if self.sinterbox_label_enabled {
+                    row(ui, "Label Text", |ui| {
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut self.sinterbox_label_text).desired_width(180.0))
+                            .changed()
+                            && !self.sinterbox_group_name_edited
+                        {
+                            let trimmed = self.sinterbox_label_text.trim();
+                            self.sinterbox_group_name = if trimmed.is_empty() {
+                                format!("Sinterbox #{}", self.job.groups.len() + 1)
+                            } else {
+                                format!("Sinterbox: {trimmed}")
+                            };
+                        }
+                    });
+                    row(ui, "Label Panel", |ui| {
+                        let options = [
+                            "Auto (Largest)",
+                            "Top (+Z)",
+                            "Front (-Y)",
+                            "Right (+X)",
+                            "Back (+Y)",
+                            "Left (-X)",
+                            "Bottom (-Z)",
+                        ];
+                        let selected_lbl = options[self.sinterbox_label_panel_idx.min(options.len() - 1)];
+                        egui::ComboBox::from_id_salt("sinterbox_panel_combo")
+                            .selected_text(selected_lbl)
+                            .show_ui(ui, |ui| {
+                                for (idx, opt) in options.iter().enumerate() {
+                                    ui.selectable_value(&mut self.sinterbox_label_panel_idx, idx, *opt);
+                                }
+                            });
+                    });
+                    row(ui, "Emboss Depth", |ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.sinterbox_label_depth)
+                                .range(0.2..=3.0)
+                                .speed(0.05)
+                                .suffix(" mm"),
+                        );
+                    });
+                }
+
+                ui.separator();
+                row(ui, "Group Name", |ui| {
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut self.sinterbox_group_name).desired_width(180.0))
+                        .changed()
+                    {
+                        self.sinterbox_group_name_edited = true;
+                    }
+                });
+                if checkbox_row(ui, "sinterbox_transp", "50% Transparent Cage", self.sinterbox_transparent) {
+                    self.sinterbox_transparent = !self.sinterbox_transparent;
+                }
+
+                if let Some(ref m) = metrics {
+                    status_line(
+                        ui,
+                        &format!(
+                            "Cage: {:.1}×{:.1}×{:.1} mm · Panel: {} ({:.1}×{:.1} mm)",
+                            m.outer_size_mm[0],
+                            m.outer_size_mm[1],
+                            m.outer_size_mm[2],
+                            m.chosen_panel.display_name(),
+                            m.chosen_panel_size_mm[0],
+                            m.chosen_panel_size_mm[1],
+                        ),
+                        StatusTone::Dim,
+                    );
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if button(ui, "Create Sinterbox", Button::Primary).clicked() {
+                        apply = true;
+                    }
+                    if button(ui, "Cancel", Button::Small).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        } else if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            apply = true;
+        }
+
+        if switch_to_dup {
+            self.sinterbox_dialog_open = false;
+            self.open_duplicate_dialog();
+        } else if apply {
+            self.apply_create_sinterbox();
+            self.sinterbox_dialog_open = false;
+        } else if cancel || !open {
+            self.sinterbox_dialog_open = false;
         }
     }
 
@@ -5048,6 +5572,7 @@ impl NestCraftApp {
             if self.viewport_ctx_menu.is_some() {
                 let mut open_move = false;
                 let mut open_scale = false;
+                let mut open_sinterbox = false;
                 let mut open_dup = false;
                 let mut drop_floor = false;
                 let mut center_xy = false;
@@ -5169,6 +5694,10 @@ impl NestCraftApp {
                         merge_parts = true;
                         ui.close();
                     }
+                    if icon_label_button(ui, "Create Sinterbox...", "sls_sinterbox", true, false).clicked() {
+                        open_sinterbox = true;
+                        ui.close();
+                    }
                     if ui.button(export_part_menu_label(self.selected_set.len())).clicked() {
                         export_sel = true;
                         ui.close();
@@ -5185,6 +5714,9 @@ impl NestCraftApp {
                 } else if open_scale {
                     self.viewport_ctx_menu = None;
                     self.open_scale_dialog();
+                } else if open_sinterbox {
+                    self.viewport_ctx_menu = None;
+                    self.open_sinterbox_dialog();
                 } else if open_dup {
                     self.viewport_ctx_menu = None;
                     self.open_duplicate_dialog();
@@ -5441,6 +5973,7 @@ impl eframe::App for NestCraftApp {
         self.draw_duplicate_modal(&ctx);
         self.draw_move_modal(&ctx);
         self.draw_scale_modal(&ctx);
+        self.draw_sinterbox_modal(&ctx);
         self.draw_color_picker_modal(&ctx);
         self.draw_export_stl_modal(&ctx);
         self.draw_below_zero_import_modal(&ctx);
@@ -6118,5 +6651,60 @@ mod tests {
         let wb_undo = app.job.instances[0].world_bounds(b_undo);
         assert!(((wb_undo[1][0] - wb_undo[0][0]) - dx0).abs() < 1e-3);
         let _ = iid;
+    }
+
+    #[test]
+    fn create_sinterbox_groups_multi_selection_and_undoes_cleanly() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        let i1 = app.selected.expect("i1");
+        app.add_sample_part();
+        let i2 = app.selected.expect("i2");
+        app.select_instance(Some(i1));
+        app.toggle_select_instance(i2);
+
+        app.open_sinterbox_dialog();
+        assert!(app.sinterbox_dialog_open);
+        assert_eq!(app.sinterbox_label_text, "Sample Bracket #1");
+
+        app.apply_create_sinterbox();
+        assert_eq!(app.job.groups.len(), 1);
+        assert_eq!(app.job.instances.len(), 3);
+        let gid = app.job.groups[0].id;
+        assert!(app.job.instances.iter().all(|i| i.group_id == Some(gid)));
+
+        let cage_inst = app.job.instances.last().expect("cage");
+        assert!(cage_inst.transparent);
+        let cage_mesh = &app.job.part(cage_inst.part_id).expect("cage part").mesh;
+        assert!(manifold::analyze_mesh(cage_mesh).is_watertight_manifold());
+
+        assert!(app.undo());
+        assert!(app.job.groups.is_empty());
+        assert_eq!(app.job.instances.len(), 2);
+    }
+
+    #[test]
+    fn create_sinterbox_single_part_with_multiplication_creates_batch_and_group() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        assert_eq!(app.selected_set.len(), 1);
+
+        app.open_sinterbox_dialog();
+        app.sinterbox_single_copies = 4;
+        app.sinterbox_shape_idx = 1; // Tight Fit
+        app.apply_create_sinterbox();
+
+        assert_eq!(app.job.groups.len(), 1);
+        assert_eq!(app.job.instances.len(), 5); // 4 parts + 1 cage
+        let gid = app.job.groups[0].id;
+        assert!(app.job.instances.iter().all(|i| i.group_id == Some(gid)));
+
+        let cage_inst = app.job.instances.last().expect("cage");
+        let cage_mesh = &app.job.part(cage_inst.part_id).expect("cage part").mesh;
+        assert!(manifold::analyze_mesh(cage_mesh).is_watertight_manifold());
+
+        assert!(app.undo());
+        assert!(app.job.groups.is_empty());
+        assert_eq!(app.job.instances.len(), 1);
     }
 }
