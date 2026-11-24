@@ -79,6 +79,7 @@ impl eframe::App for NestCraftApp {
         self.handle_dropped_files(&ctx);
         self.draw_top_bar(ui, &ctx, &t);
         self.draw_edit_bar(ui, &ctx, &t);
+        self.draw_nest_bar(ui, &ctx, &t);
         self.draw_analyze_bar(ui, &ctx, &t);
         self.draw_view_bar(ui, &ctx, &t);
         self.draw_bottom_bar(ui, &ctx, &t);

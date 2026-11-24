@@ -548,6 +548,33 @@ impl NestCraftApp {
         });
     }
 
+    pub(crate) fn draw_nest_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
+        let chrome = Container::new(ctx, Surface::Chrome);
+        let nest_panel = chrome.edge("sls_nest_bar", Edge::Top).exact_size(36.0).resizable(false);
+        chrome.show_edge(ui, nest_panel, chrome.edge_frame(t.toolbar), |ui| {
+            scope(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("sls_nest_scroll")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                    .show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.label(egui::RichText::new("Nest").strong().color(t.text));
+                            StageBar::separator(ui);
+
+                            icon_label_button(ui, "2D Nesting", "sls_auto_nest", false, false)
+                                .backing_on_hover_text(
+                                    "Planar 2D nesting on the build floor (coming in Stage 2)",
+                                );
+                            icon_label_button(ui, "3D Nesting", "sls_auto_nest", false, false)
+                                .backing_on_hover_text(
+                                    "3D EDT volumetric packing across the build chamber (coming in Stage 2)",
+                                );
+                        });
+                    });
+            });
+        });
+    }
+
     pub(crate) fn draw_bottom_bar(&self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
         let chrome = Container::new(ctx, Surface::Chrome);
         let bottom_panel = chrome.edge("sls_status_bar", Edge::Bottom).exact_size(30.0).resizable(false);
