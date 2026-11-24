@@ -164,6 +164,10 @@ flowchart LR
    - **CSV List Labeling** & text embossing/debossing for serialized production parts.
 4. **Thermal Density Heatmap & Interactive Z-Slice (`thermal.rs`, `slice.rs`):** 3D sliding-box sintered density map (`20×20×20 mm`) + real-time Z-plane cross-section viewer.
 5. **Report Sheets & Headless `--mcp` (`apps/nestcraft`):** Exportable build report sheets (`.html` / `.pdf` / `.csv`) + `--mcp` JSON-RPC automation (`load_job`, `nest_job`, `split_builds`, `export_3mf`).
+   - *Build Report Plan Note (pricing & material specs in `C:\Users\Degamim-I9\Desktop\SLS_wiki\raw\tools\quoting_editor`):*
+     1. Only account for placed parts that are **inside the machine** build volume.
+     2. Generate report metrics, pricing, and powder/build calculations based on the **selected machine** (`data/machines.js`: `bedX`, `bedY`, `pillowZ`, `machineCost`, `defaultBuildRate`).
+     3. Add **"Select Material"** to the **Build Chamber** configuration (`data/materials.js`: `PA 2200`, `FS3300PA`, `PA2210FR`, `FS3401GB`, `PBT-01`, `PA3200GB` + `MATERIAL_PROFILES` with `bulkDensity`, `sinteredDensity`, `powderPrice`, `recovery`, `setupHrs`, `margin`, `layerThickness`, `recoatTime`, `laserSpeed`, `hatchDistance`) and support Netfabb-style XML metrics (`netfabb618891.xml`).
 
 ### Stage 4 (`P2`) — Mesh Editing, Measurement & Direct Slicing
 

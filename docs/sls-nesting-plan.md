@@ -143,6 +143,10 @@ Before starting implementation, three repository/environment details were verifi
 3. **Additional Production Utilities:**
    - `sls_slice_z`: Z-plane clipping / cross-section slider in the viewport to inspect internal packing & clearances at any layer height.
    - `sls_hollow` / `sls_emboss_id` (if scoped in v1) or job-splitting (`split_builds`) when a BOM exceeds one machine build height.
+   - **Build Report (`Generate Report` placeholder in Top Banner; pricing reference: `C:\Users\Degamim-I9\Desktop\SLS_wiki\raw\tools\quoting_editor`):**
+     1. Only account for placed parts that are **inside the machine** build volume (exclude overflow/out-of-bounds parts).
+     2. Generate report metrics and pricing based on the **selected machine** (`data/machines.js`: `bedX`, `bedY`, `pillowZ`, `machineCost`, `defaultBuildRate`).
+     3. Add **"Select Material"** to the **Build Chamber** configuration (`ui_build_panel.rs` / `BuildJob`) using `data/materials.js` (`PA 2200`, `FS3300PA`, `PA2210FR`, `FS3401GB`, `PBT-01`, `PA3200GB` and `MATERIAL_PROFILES` parameters) + `netfabb618891.xml` platform/part metrics.
 4. **Headless MCP Server (`apps/nestcraft` `--mcp` mode):**
    - Integrate `solidcraft-mcp-server` with zero-dialog execution (strictly respecting `skills/solidcraft-commands/SKILL.md`).
    - Expose tools:
