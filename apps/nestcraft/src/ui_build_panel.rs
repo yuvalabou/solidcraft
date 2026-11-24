@@ -313,4 +313,168 @@ impl NestCraftApp {
         });
     }
 
+    pub(crate) fn draw_slice_distribution_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
+        if !self.slice_dist_open {
+            return;
+        }
+        if self.slice_dist_cache.is_none() {
+            self.slice_dist_cache = Some(nestcraft_core::slice::SliceDistribution::compute(
+                &self.job,
+                self.slice_dist_step_mm,
+            ));
+        }
+
+        let side_c = Container::new(ctx, Surface::Panel);
+        let panel = side_c
+            .edge("sls_slice_dist_panel", Edge::Right)
+            .default_size(220.0)
+            .min_size(180.0)
+            .max_size(560.0)
+            .resizable(true);
+        let frame = side_c
+            .edge_frame(t.panel)
+            .inner_margin(egui::Margin::symmetric(t.space_10 as i8, t.space_10 as i8));
+
+        let mut close_now = false;
+        let mut recompute = false;
+        side_c.show_edge(ui, panel, frame, |ui| {
+            scope(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(t.space_6, t.space_6);
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Slice Distribution").strong().color(t.text));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if button(ui, "×", Button::Small)
+                            .backing_on_hover_text("Collapse Slice Distribution sidebar")
+                            .clicked()
+                        {
+                            close_now = true;
+                        }
+                    });
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Step").small().color(t.text_dim));
+                    egui::ComboBox::from_id_salt("sls_slice_step_combo")
+                        .selected_text(format!("{:.1} mm", self.slice_dist_step_mm))
+                        .width(72.0)
+                        .show_ui(ui, |ui| {
+                            for step in [0.1_f32, 0.5, 1.0, 2.0, 5.0] {
+                                if ui
+                                    .selectable_label(
+                                        (self.slice_dist_step_mm - step).abs() < 0.01,
+                                        format!("{step:.1} mm"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.slice_dist_step_mm = step;
+                                    recompute = true;
+                                }
+                            }
+                        });
+                    if button(ui, "Refresh", Button::Small).clicked() {
+                        recompute = true;
+                    }
+                });
+
+                if let Some(dist) = &self.slice_dist_cache {
+                    if dist.excluded_oob_count > 0 {
+                        status_line(
+                            ui,
+                            &format!("{} out-of-bounds part(s) excluded", dist.excluded_oob_count),
+                            StatusTone::Warning,
+                        );
+                    }
+                    value_row(
+                        ui,
+                        "Peak Area",
+                        &format!("{:.1} mm² @ Z={:.1}", dist.peak_area_mm2, dist.peak_z_mm),
+                    );
+                    value_row(ui, "Mean Area", &format!("{:.1} mm²", dist.mean_area_mm2));
+                    value_row(
+                        ui,
+                        "Z Span",
+                        &format!("{:.1}..{:.1} mm ({} slices)", dist.z_min_mm, dist.z_max_mm, dist.layers.len()),
+                    );
+
+                    ui.separator();
+                    if dist.layers.is_empty() {
+                        status_line(ui, "No parts inside machine to slice.", StatusTone::Dim);
+                    } else {
+                        let avail = ui.available_size();
+                        let chart_h = (avail.y - 36.0).max(160.0);
+                        let chart_w = avail.x.max(120.0);
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(chart_w, chart_h),
+                            egui::Sense::hover(),
+                        );
+                        let p = ui.painter_at(rect);
+                        p.rect_filled(rect, 4.0, t.panel.gamma_multiply(0.6));
+                        p.rect_stroke(
+                            rect,
+                            4.0,
+                            egui::Stroke::new(1.0, t.border),
+                            egui::StrokeKind::Inside,
+                        );
+
+                        let pad = 6.0_f32;
+                        let inner = rect.shrink(pad);
+                        let n = dist.layers.len().max(1);
+                        let row_h = (inner.height() / n as f32).max(1.0);
+                        let peak = dist.peak_area_mm2.max(1e-6);
+
+                        let hovered_idx = resp.hover_pos().and_then(|hp| {
+                            if !inner.contains(hp) {
+                                return None;
+                            }
+                            let frac_from_top = ((hp.y - inner.top()) / inner.height()).clamp(0.0, 0.9999);
+                            let rev = (frac_from_top * n as f32).floor() as usize;
+                            Some(n.saturating_sub(1).saturating_sub(rev))
+                        });
+
+                        for (idx, layer) in dist.layers.iter().enumerate() {
+                            // Draw bottom (z_min) at bottom of chart, top (z_max) at top.
+                            let rev = n - 1 - idx;
+                            let y0 = inner.top() + rev as f32 * row_h;
+                            let y1 = (y0 + row_h - 0.5).max(y0 + 1.0);
+                            let frac = (layer.area_mm2 / peak).clamp(0.0, 1.0) as f32;
+                            let bar_w = (inner.width() * frac).max(if layer.area_mm2 > 0.0 { 2.0 } else { 0.0 });
+                            let bar_rect = egui::Rect::from_min_max(
+                                egui::pos2(inner.left(), y0),
+                                egui::pos2(inner.left() + bar_w, y1),
+                            );
+                            let is_hov = hovered_idx == Some(idx);
+                            let col = if is_hov { t.accent } else { t.accent.gamma_multiply(0.75) };
+                            p.rect_filled(bar_rect, 1.0, col);
+                        }
+
+                        if let Some(idx) = hovered_idx
+                            && let Some(l) = dist.layers.get(idx)
+                        {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Z={:.1} mm | {:.1} mm² ({:.1}%) | {} part(s)",
+                                    l.z_mm, l.area_mm2, l.fill_pct, l.part_count
+                                ))
+                                .small()
+                                .strong()
+                                .color(t.accent),
+                            );
+                        } else {
+                            status_line(ui, "Hover chart to inspect Z layer; drag left edge to widen.", StatusTone::Dim);
+                        }
+                    }
+                }
+            });
+        });
+
+        if close_now {
+            self.slice_dist_open = false;
+        } else if recompute {
+            self.slice_dist_cache = Some(nestcraft_core::slice::SliceDistribution::compute(
+                &self.job,
+                self.slice_dist_step_mm,
+            ));
+        }
+    }
 }

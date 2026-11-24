@@ -230,6 +230,9 @@ pub(crate) struct NestCraftApp {
     pub(crate) export_stl_dialog_open: bool,
     pub(crate) report_dialog_open: bool,
     pub(crate) report_preview: Option<nestcraft_core::report::BuildReport>,
+    pub(crate) slice_dist_open: bool,
+    pub(crate) slice_dist_step_mm: f32,
+    pub(crate) slice_dist_cache: Option<nestcraft_core::slice::SliceDistribution>,
     pub(crate) export_stl_selected_only: bool,
     pub(crate) export_stl_prefix: String,
     pub(crate) export_stl_suffix: String,
@@ -736,6 +739,9 @@ impl NestCraftApp {
             export_stl_dialog_open: false,
             report_dialog_open: false,
             report_preview: None,
+            slice_dist_open: false,
+            slice_dist_step_mm: 1.0,
+            slice_dist_cache: None,
             export_stl_selected_only: false,
             export_stl_prefix: String::new(),
             export_stl_suffix: String::new(),
@@ -1885,6 +1891,9 @@ impl NestCraftApp {
 
     pub(crate) fn mark_dirty(&mut self) {
         self.scene_dirty = true;
+        if self.slice_dist_open {
+            self.slice_dist_cache = None;
+        }
     }
 
     pub(crate) fn import_no_build_zone_stl(&mut self, path: &Path) {

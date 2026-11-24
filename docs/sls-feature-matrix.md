@@ -48,7 +48,7 @@ Related docs: [`docs/sls-nesting-plan.md`](sls-nesting-plan.md) · [`docs/sls-ne
 | `3.1–3.2.2`   | Project lifecycle (`.nestc` save/open), parallel multi-threaded STL/3MF import, model-location import with below-`Z=0` prompt | **`P0`** |  `Done`   | `crates/nestcraft-core/src/io/nestc.rs` + `apps/nestcraft`                                        |
 | `3.2.3`        | File Preview Browser (dimensions, triangle count, thumbnail before import)               | **`P2`** | `Planned` | `apps/nestcraft`                                                                                |
 | `3.2.4, 6.2.4` | Split multi-shell STLs into separate parts (`Shells to Parts` with Keep/Delete Original prompt) | **`P1`** |  `Done`   | `crates/nestcraft-core/src/manifold.rs` + `apps/nestcraft` |
-| `3.2.5`        | Build Report Sheets (`.pdf` / `.csv` / HTML build summary with metrics & thumbnails; `Generate Report` placeholder in top bar) | **`P1`** | `Planned` | `crates/nestcraft-core` + `apps/nestcraft`                                                    |
+| `3.2.5`        | Build Report Sheets (`.html` / `.csv` mockup with immediate open, inside-machine filter, selected machine & Build Chamber material selector; `.pdf` pending) | **`P1`** | `Partial` | `crates/nestcraft-core/src/report.rs` + `apps/nestcraft`                                                    |
 | `3.3`          | Export build job to 3MF & export individual/selected parts to STL (with context menu)    | **`P0`** |  `Done`   | `crates/nestcraft-core/src/io/{threemf,stl}.rs` + `apps/nestcraft`                                |
 | `3.4`          | High-resolution viewport screenshot capture                                              | **`P2`** | `Planned` | `apps/nestcraft`                                                                                |
 
@@ -120,7 +120,7 @@ Related docs: [`docs/sls-nesting-plan.md`](sls-nesting-plan.md) · [`docs/sls-ne
 
 | Ref            | NestCraft Feature                                                                           |       Rank       |    Status    | Implementation Target                                        |
 | :------------- | :------------------------------------------------------------------------------------------ | :--------------: | :----------: | :----------------------------------------------------------- |
-| `10.1–10.4` | Interactive Z-Slice Inspector (cross-section preview at layer height `Z`, slice playback) | **`P1`** | `Planned` | `crates/nestcraft-core/src/slice.rs` + viewport clip plane |
+| `10.1–10.4` | Interactive Z-Slice Inspector (`Slice Distribution` collapsible/widenable sidebar with exact XY sintered area at `0.1–5.0 mm` step done; viewport clip plane & playback pending) | **`P1`** | `Partial` | `crates/nestcraft-core/src/slice.rs` + `apps/nestcraft/src/ui_build_panel.rs` |
 | `10.5–10.7` | 2D slice boolean/offset/hatch filling & **EOS `.sli` / CLI slice export**           | **`P3`** | `Deffered` | `crates/nestcraft-core/src/slice.rs`                       |
 
 ### §11–§12. Settings & Report Templates

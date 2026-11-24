@@ -84,6 +84,7 @@ impl eframe::App for NestCraftApp {
         self.draw_bottom_bar(ui, &ctx, &t);
         self.draw_parts_browser(ui, &ctx, &t);
         self.draw_inspector(ui, &ctx, &t);
+        self.draw_slice_distribution_panel(ui, &ctx, &t);
         self.draw_viewport(ui, &ctx, &t);
         self.draw_custom_platform_modal(&ctx);
         self.draw_duplicate_modal(&ctx);

@@ -470,6 +470,27 @@ impl NestCraftApp {
                             ui.label(egui::RichText::new("Analyze").strong().color(t.text));
                             StageBar::separator(ui);
 
+                            if icon_label_button(
+                                ui,
+                                "Slice Distribution",
+                                "sls_slice_z",
+                                true,
+                                self.slice_dist_open,
+                            )
+                            .backing_on_hover_text(
+                                "Toggle collapsible Slice Layer Distribution sidebar (sintered XY area vs Z height)",
+                            )
+                            .clicked()
+                            {
+                                self.slice_dist_open = !self.slice_dist_open;
+                                if self.slice_dist_open {
+                                    self.slice_dist_cache = Some(nestcraft_core::slice::SliceDistribution::compute(
+                                        &self.job,
+                                        self.slice_dist_step_mm,
+                                    ));
+                                }
+                            }
+
                             const PLACEHOLDERS: [(&str, &str, &str); 7] = [
                                 (
                                     "Stair Highlight",
