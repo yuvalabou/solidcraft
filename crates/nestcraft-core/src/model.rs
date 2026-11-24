@@ -419,6 +419,8 @@ pub struct BuildJob {
     pub min_z_mm: f32,
     /// Where world `(0, 0, 0)` sits on the machine bed.
     pub bed_origin: BedOrigin,
+    /// Selected SLS material identifier (see `report::SLS_MATERIALS`).
+    pub material_id: String,
     /// Unique part prototypes.
     pub parts: Vec<PartPrototype>,
     /// Placed part instances.
@@ -451,6 +453,7 @@ impl BuildJob {
             wall_margin_mm: 5.0,
             min_z_mm: 0.0,
             bed_origin,
+            material_id: "pa2200".to_owned(),
             parts: Vec::new(),
             instances: Vec::new(),
             groups: Vec::new(),

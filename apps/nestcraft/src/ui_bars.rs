@@ -77,8 +77,14 @@ impl NestCraftApp {
                             {
                                 self.save_bed_file(&path);
                             }
-                            icon_label_button(ui, "Generate Report", "export", false, false)
-                                .backing_on_hover_text("Generate build report (coming soon)");
+                            if icon_label_button(ui, "Generate Report", "export", true, self.report_dialog_open)
+                                .backing_on_hover_text(
+                                    "Generate build report mockup for parts inside the selected machine & material",
+                                )
+                                .clicked()
+                            {
+                                self.open_report_dialog();
+                            }
                             if icon_label_button(ui, "Import", "sls_import_mesh", self.load_task.is_none(), false)
                                 .backing_on_hover_text("Import STL or 3MF meshes into the build chamber")
                                 .clicked()

@@ -12,6 +12,7 @@
 pub mod io;
 pub mod manifold;
 pub mod model;
+pub mod report;
 pub mod sinterbox;
 
 use thiserror::Error;

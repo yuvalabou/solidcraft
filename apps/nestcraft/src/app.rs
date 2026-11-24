@@ -69,7 +69,7 @@ pub(crate) enum BackgroundLoadOutcome {
         kind: ImportedKind,
     },
     OpenedBed {
-        job: BuildJob,
+        job: Box<BuildJob>,
         path_display: String,
     },
     Failed(String),
@@ -115,7 +115,7 @@ pub(crate) fn load_single_file_outcome(path: &Path) -> BackgroundLoadOutcome {
     if ext == "nestc" {
         match nestc::read_nestc(&bytes) {
             Ok(job) => BackgroundLoadOutcome::OpenedBed {
-                job,
+                job: Box::new(job),
                 path_display: path.display().to_string(),
             },
             Err(e) => BackgroundLoadOutcome::Failed(format!("Open bed error: {e}")),
@@ -228,6 +228,8 @@ pub(crate) struct NestCraftApp {
     pub(crate) color_picker_undo_pushed: bool,
     pub(crate) pending_keep_delete: Option<KeepOrDeleteAction>,
     pub(crate) export_stl_dialog_open: bool,
+    pub(crate) report_dialog_open: bool,
+    pub(crate) report_preview: Option<nestcraft_core::report::BuildReport>,
     pub(crate) export_stl_selected_only: bool,
     pub(crate) export_stl_prefix: String,
     pub(crate) export_stl_suffix: String,
@@ -732,6 +734,8 @@ impl NestCraftApp {
             color_picker_undo_pushed: false,
             pending_keep_delete: None,
             export_stl_dialog_open: false,
+            report_dialog_open: false,
+            report_preview: None,
             export_stl_selected_only: false,
             export_stl_prefix: String::new(),
             export_stl_suffix: String::new(),
@@ -806,6 +810,11 @@ impl NestCraftApp {
         self.camera = self.default_camera_for_job();
         self.mark_dirty();
         self.status = format!("Active machine: {}", self.job.machine.name());
+    }
+
+    pub(crate) fn open_report_dialog(&mut self) {
+        self.report_preview = Some(nestcraft_core::report::BuildReport::generate(&self.job));
+        self.report_dialog_open = true;
     }
 
     pub(crate) fn open_custom_platform_dialog(&mut self) {
@@ -1716,6 +1725,7 @@ impl NestCraftApp {
             || self.sinterbox_dialog_open
             || self.color_picker_open
             || self.export_stl_dialog_open
+            || self.report_dialog_open
             || !self.below_zero_import_dialog.is_empty()
         {
             return;
@@ -2097,7 +2107,7 @@ impl NestCraftApp {
                                 }
                             }
                             BackgroundLoadOutcome::OpenedBed { job, path_display } => {
-                                self.apply_loaded_bed(job, &path_display);
+                                self.apply_loaded_bed(*job, &path_display);
                                 opened_bed = true;
                             }
                             BackgroundLoadOutcome::Failed(err) => {

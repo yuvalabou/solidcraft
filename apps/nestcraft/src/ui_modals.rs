@@ -1246,4 +1246,216 @@ impl NestCraftApp {
         }
     }
 
+    pub(crate) fn draw_report_modal(&mut self, ctx: &egui::Context) {
+        if !self.report_dialog_open {
+            return;
+        }
+        if self.report_preview.is_none() {
+            self.report_preview = Some(nestcraft_core::report::BuildReport::generate(&self.job));
+        }
+        let mut open = self.report_dialog_open;
+        let mut refresh = false;
+        let mut open_html_now = false;
+        let mut export_html = false;
+        let mut export_csv = false;
+        let mut close_now = false;
+        let t = Tokens::get();
+
+        if let Some(rep) = &self.report_preview {
+            egui::Window::new("Build Report Generator (Mockup)")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .movable(true)
+                .default_width(640.0)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
+                .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Machine:").strong());
+                        ui.label(format!(
+                            "{} ({:.0}×{:.0}×{:.0} mm)",
+                            rep.machine_name,
+                            rep.machine_size_mm[0],
+                            rep.machine_size_mm[1],
+                            rep.machine_size_mm[2],
+                        ));
+                        ui.separator();
+                        ui.label(egui::RichText::new("Material:").strong());
+                        ui.label(rep.material.name);
+                    });
+
+                    if rep.excluded_oob_count > 0 || rep.hidden_excluded_count > 0 {
+                        status_line(
+                            ui,
+                            &format!(
+                                "Excluded {} out-of-bounds part(s) outside machine & {} hidden part(s).",
+                                rep.excluded_oob_count, rep.hidden_excluded_count
+                            ),
+                            StatusTone::Warning,
+                        );
+                    }
+
+                    ui.add_space(6.0);
+                    egui::Grid::new("report_kpi_grid")
+                        .num_columns(4)
+                        .spacing([14.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("Parts Inside Machine").small().color(t.text_dim));
+                            ui.label(egui::RichText::new("Total Part Volume").small().color(t.text_dim));
+                            ui.label(egui::RichText::new("Build Height (+Pillow)").small().color(t.text_dim));
+                            ui.label(egui::RichText::new("Packing Density").small().color(t.text_dim));
+                            ui.end_row();
+
+                            ui.label(egui::RichText::new(format!("{}", rep.included_parts.len())).strong());
+                            ui.label(egui::RichText::new(format!("{:.2} cm³", rep.total_part_volume_cm3)).strong());
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{:.1} mm (+{:.0} mm)",
+                                    rep.total_build_height_mm, rep.spec.pillow_z_mm
+                                ))
+                                .strong(),
+                            );
+                            ui.label(egui::RichText::new(format!("{:.2}%", rep.packing_density_pct)).strong());
+                            ui.end_row();
+
+                            ui.label(egui::RichText::new("Fresh Powder").small().color(t.text_dim));
+                            ui.label(egui::RichText::new("Est. Build Time").small().color(t.text_dim));
+                            ui.label(egui::RichText::new("Material + Machine").small().color(t.text_dim));
+                            ui.label(egui::RichText::new(format!("Quoted ({:.2}×)", rep.spec.margin)).small().color(t.text_dim));
+                            ui.end_row();
+
+                            ui.label(egui::RichText::new(format!("{:.2} kg", rep.fresh_powder_kg)).strong());
+                            ui.label(egui::RichText::new(format!("{:.1} h", rep.est_build_hours)).strong());
+                            ui.label(
+                                egui::RichText::new(format!("${:.2} + ${:.2}", rep.material_cost, rep.machine_cost))
+                                    .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("${:.2}", rep.quoted_price))
+                                    .strong()
+                                    .color(t.accent),
+                            );
+                            ui.end_row();
+                        });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("report_parts_table_scroll")
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("report_parts_table")
+                                .striped(true)
+                                .num_columns(6)
+                                .spacing([12.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("ID").strong());
+                                    ui.label(egui::RichText::new("Part").strong());
+                                    ui.label(egui::RichText::new("Size (mm)").strong());
+                                    ui.label(egui::RichText::new("Vol (cm³)").strong());
+                                    ui.label(egui::RichText::new("Area (cm²)").strong());
+                                    ui.label(egui::RichText::new("Mesh").strong());
+                                    ui.end_row();
+
+                                    for p in &rep.included_parts {
+                                        ui.label(format!("#{}", p.instance_id));
+                                        ui.label(&p.name);
+                                        ui.label(format!("{:.1}×{:.1}×{:.1}", p.size_mm[0], p.size_mm[1], p.size_mm[2]));
+                                        ui.label(format!("{:.2}", p.volume_cm3));
+                                        ui.label(format!("{:.2}", p.area_cm2));
+                                        if p.is_manifold {
+                                            ui.label("OK");
+                                        } else {
+                                            ui.label(egui::RichText::new("Error").color(t.error));
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if button(ui, "Open HTML Report", Button::Primary).clicked() {
+                            open_html_now = true;
+                        }
+                        if button(ui, "Export HTML...", Button::Small).clicked() {
+                            export_html = true;
+                        }
+                        if button(ui, "Export CSV...", Button::Small).clicked() {
+                            export_csv = true;
+                        }
+                        if button(ui, "Refresh", Button::Small).clicked() {
+                            refresh = true;
+                        }
+                        if button(ui, "Close", Button::Small).clicked() {
+                            close_now = true;
+                        }
+                    });
+                });
+        }
+
+        if refresh {
+            self.report_preview = Some(nestcraft_core::report::BuildReport::generate(&self.job));
+        } else if open_html_now
+            && let Some(rep) = &self.report_preview
+        {
+            let path = std::env::temp_dir().join("nestcraft_build_report.html");
+            match std::fs::write(&path, rep.to_html()).and_then(|()| open_file_in_default_app(&path)) {
+                Ok(()) => self.status = format!("Opened HTML report {}", path.display()),
+                Err(e) => self.status = format!("Failed to open HTML report: {e}"),
+            }
+        } else if export_html
+            && let Some(rep) = &self.report_preview
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("HTML Report", &["html"])
+                .set_file_name("build_report.html")
+                .save_file()
+        {
+            match std::fs::write(&path, rep.to_html()).and_then(|()| open_file_in_default_app(&path)) {
+                Ok(()) => self.status = format!("Exported and opened HTML report {}", path.display()),
+                Err(e) => self.status = format!("HTML report export failed: {e}"),
+            }
+        } else if export_csv
+            && let Some(rep) = &self.report_preview
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("CSV Report", &["csv"])
+                .set_file_name("build_report.csv")
+                .save_file()
+        {
+            match std::fs::write(&path, rep.to_csv()).and_then(|()| open_file_in_default_app(&path)) {
+                Ok(()) => self.status = format!("Exported and opened CSV report {}", path.display()),
+                Err(e) => self.status = format!("CSV report export failed: {e}"),
+            }
+        }
+        if close_now || !open {
+            self.report_dialog_open = false;
+        }
+    }
+}
+
+fn open_file_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(path).spawn()?;
+        return Ok(());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(path).spawn()?;
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }

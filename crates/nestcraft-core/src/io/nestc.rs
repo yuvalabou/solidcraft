@@ -23,10 +23,16 @@ struct NestcProject {
     wall_margin_mm: f32,
     min_z_mm: f32,
     bed_origin: NestcBedOrigin,
+    #[serde(default = "default_material_id")]
+    material_id: String,
     parts: Vec<NestcPart>,
     groups: Vec<NestcGroup>,
     instances: Vec<NestcInstance>,
     no_build_zone: Option<NestcNoBuildZone>,
+}
+
+fn default_material_id() -> String {
+    "pa2200".to_owned()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -177,6 +183,7 @@ pub fn write_nestc(job: &BuildJob) -> Result<Vec<u8>> {
         wall_margin_mm: job.wall_margin_mm,
         min_z_mm: job.min_z_mm,
         bed_origin,
+        material_id: job.material_id.clone(),
         parts,
         groups,
         instances,
@@ -227,6 +234,7 @@ pub fn read_nestc(bytes: &[u8]) -> Result<BuildJob> {
         NestcBedOrigin::FrontLeft => BedOrigin::FrontLeft,
         NestcBedOrigin::Center => BedOrigin::Center,
     };
+    job.material_id = project.material_id;
 
     let mut max_part_id = 0_u32;
     for p in project.parts {

@@ -92,6 +92,7 @@ impl eframe::App for NestCraftApp {
         self.draw_sinterbox_modal(&ctx);
         self.draw_color_picker_modal(&ctx);
         self.draw_export_stl_modal(&ctx);
+        self.draw_report_modal(&ctx);
         self.draw_below_zero_import_modal(&ctx);
         self.draw_keep_delete_modal(&ctx);
         self.draw_load_progress_modal(&ctx);

@@ -160,6 +160,27 @@ impl NestCraftApp {
                             )
                             .backing_on_hover_text("Default part-to-part gap for placement & grid duplication");
                         });
+                        row(ui, "Material", |ui| {
+                            let cur = nestcraft_core::report::material_by_id(&self.job.material_id);
+                            egui::ComboBox::from_id_salt("sls_material_combo")
+                                .selected_text(cur.name)
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for mat in nestcraft_core::report::SLS_MATERIALS {
+                                        if ui
+                                            .selectable_label(self.job.material_id == mat.id, mat.name)
+                                            .clicked()
+                                        {
+                                            self.job.material_id = mat.id.to_owned();
+                                            if self.report_dialog_open {
+                                                self.report_preview =
+                                                    Some(nestcraft_core::report::BuildReport::generate(&self.job));
+                                            }
+                                            self.status = format!("Material: {}", mat.name);
+                                        }
+                                    }
+                                });
+                        });
                     });
 
                     ui.add_space(t.space_12);
