@@ -2895,10 +2895,14 @@ impl NestCraftApp {
         self.ensure_part_thumbnails(ctx);
 
         let side_c = Container::new(ctx, Surface::Panel);
-        let left_panel = side_c.edge("sls_parts_tree", Edge::Left).default_size(275.0);
-        side_c.show_edge(ui, left_panel, side_c.edge_frame(t.panel), |ui| {
+        let left_panel = side_c.edge("sls_parts_tree", Edge::Left).default_size(300.0);
+        let left_frame = side_c
+            .edge_frame(t.panel)
+            .inner_margin(egui::Margin::symmetric(t.space_10 as i8, t.space_10 as i8));
+        side_c.show_edge(ui, left_panel, left_frame, |ui| {
             scope(ui, |ui| {
                 ui.label(egui::RichText::new("Build Parts Browser").strong().size(t.font_heading).color(t.form_ink));
+                ui.add_space(t.space_4);
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.new_group_name)
@@ -2933,14 +2937,23 @@ impl NestCraftApp {
                         self.status = format!("Removed {removed} empty group(s)");
                     }
                 });
+                ui.add_space(t.space_4);
                 ui.separator();
+                ui.add_space(t.space_4);
 
                 let mut actions: Vec<TreeAction> = Vec::new();
                 let mut tree_order: Vec<InstanceId> = Vec::new();
-                let footer_h = solidcraft_ui_kit::catalog_footer_height(ui) + t.space_8;
-                let scroll_h = (ui.available_height() - footer_h).max(60.0);
-                ui.spacing_mut().item_spacing.y = 2.0;
+                let footer_h = solidcraft_ui_kit::catalog_footer_height(ui) + t.space_12;
+                let avail_h = (ui.available_height() - footer_h).max(120.0);
+                let details_h = if self.selected.is_some() {
+                    (avail_h * 0.54).clamp(180.0, 420.0)
+                } else {
+                    76.0
+                };
+                let scroll_h = (avail_h - details_h - t.space_12).max(60.0);
+                ui.spacing_mut().item_spacing.y = t.space_4;
                 egui::ScrollArea::vertical()
+                    .id_salt("sls_parts_tree_scroll")
                     .max_height(scroll_h)
                     .show(ui, |ui| {
                         if self.job.parts.is_empty() && self.job.groups.is_empty() {
@@ -3722,6 +3735,17 @@ impl NestCraftApp {
                         }
                     }
                 }
+
+                ui.add_space(t.space_6);
+                ui.separator();
+                ui.add_space(t.space_6);
+                egui::ScrollArea::vertical()
+                    .id_salt("sls_part_details_scroll")
+                    .max_height(details_h)
+                    .show(ui, |ui| {
+                        self.draw_selected_part_section(ui, t);
+                    });
+                ui.add_space(t.space_4);
 
                 catalog_footer_with_tip(
                     ui,
@@ -4813,11 +4837,262 @@ impl NestCraftApp {
             });
     }
 
+    fn draw_selected_part_section(&mut self, ui: &mut egui::Ui, t: &Tokens) {
+        ui.spacing_mut().item_spacing = egui::vec2(t.space_6, t.space_6);
+        section(ui, "inst_sec", "Selected Part", true, |ui| {
+            let Some(sel_id) = self.selected else {
+                status_line(ui, "Select a part in the 3D view or Parts Browser.", StatusTone::Dim);
+                return;
+            };
+
+            if self.selected_set.len() > 1 {
+                let sel_vol_cm3: f64 = self
+                    .job
+                    .instances
+                    .iter()
+                    .filter(|i| self.selected_set.contains(&i.id))
+                    .filter_map(|i| self.job.part(i.part_id).map(|p| p.mesh.volume_mm3))
+                    .sum::<f64>()
+                    / 1000.0;
+                status_line(
+                    ui,
+                    &format!("{} selected ({sel_vol_cm3:.2} cm³ total)", self.selected_set.len()),
+                    StatusTone::Dim,
+                );
+            }
+
+            let above_floor = self.job.is_instance_above_floor(sel_id);
+            let in_nbz = self.job.is_instance_in_no_build_zone(sel_id);
+            let current_euler = self
+                .job
+                .instances
+                .iter()
+                .find(|i| i.id == sel_id)
+                .map(|i| i.euler_deg());
+            let part_metrics = self
+                .job
+                .instances
+                .iter()
+                .find(|i| i.id == sel_id)
+                .and_then(|inst| {
+                    self.job.part(inst.part_id).map(|p| {
+                        let wb = inst.world_bounds(p.mesh.bounds);
+                        (
+                            [
+                                wb[1][0] - wb[0][0],
+                                wb[1][1] - wb[0][1],
+                                wb[1][2] - wb[0][2],
+                            ],
+                            wb[0][2],
+                            wb[1][2],
+                            p.mesh.volume_mm3 / 1000.0,
+                            p.mesh.surface_area_mm2 / 100.0,
+                        )
+                    })
+                });
+
+            if let Some((dims, min_z, inst_max_z, vol_cm3, area_cm2)) = part_metrics {
+                value_row(
+                    ui,
+                    "Dimensions",
+                    &format!("{:.1} × {:.1} × {:.1} mm", dims[0], dims[1], dims[2]),
+                )
+                .backing_on_hover_text("World-space bounding box size (X × Y × Z)");
+                value_row(ui, "Volume", &format!("{vol_cm3:.2} cm³"))
+                    .backing_on_hover_text("Part mesh volume in cubic centimetres");
+                value_row(ui, "Surface Area", &format!("{area_cm2:.2} cm²"))
+                    .backing_on_hover_text("Part mesh surface area in square centimetres");
+                value_row(ui, "Z Span", &format!("{min_z:.2} .. {inst_max_z:.2} mm"))
+                    .backing_on_hover_text("Lowest to highest Z coordinate (Z = 0 is the floor)");
+                ui.add_space(t.space_4);
+            }
+
+            let mut drop_floor = false;
+            let mut clamp_floor = false;
+            let mut center_xy = false;
+            let mut rot_step: Option<usize> = None;
+
+            let part_color_opt = self
+                .job
+                .instances
+                .iter()
+                .find(|i| i.id == sel_id)
+                .and_then(|i| i.color);
+            let mut color_action: Option<Option<[u8; 3]>> = None;
+            row(ui, "Color", |ui| {
+                ui.horizontal(|ui| {
+                    let mut rgb = part_color_opt.unwrap_or([t.text.r(), t.text.g(), t.text.b()]);
+                    if ui.color_edit_button_srgb(&mut rgb).changed() {
+                        color_action = Some(Some(rgb));
+                    }
+                    if part_color_opt.is_some()
+                        && button(ui, "Reset", Button::Small)
+                            .backing_on_hover_text("Reset part color to theme default")
+                            .clicked()
+                    {
+                        color_action = Some(None);
+                    }
+                });
+            });
+            if let Some(new_color) = color_action {
+                self.set_selected_color(new_color);
+            }
+
+            let mut applied_euler = None;
+            if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == sel_id) {
+                let mut pos = inst.translation();
+                let mut changed = false;
+                row(ui, "Position", |ui| {
+                    ui.horizontal(|ui| {
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut pos[0]).speed(0.5).prefix("X "))
+                            .changed();
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut pos[1]).speed(0.5).prefix("Y "))
+                            .changed();
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut pos[2]).speed(0.5).prefix("Z "))
+                            .changed();
+                    });
+                });
+
+                row(ui, "Quick Place", |ui| {
+                    ui.horizontal(|ui| {
+                        if button(ui, "Drop Z=0", Button::Small)
+                            .backing_on_hover_text("Align lowest vertex to build floor (Z = 0)")
+                            .clicked()
+                        {
+                            drop_floor = true;
+                        }
+                        if button(ui, "Center XY", Button::Small)
+                            .backing_on_hover_text("Center instance horizontally in chamber")
+                            .clicked()
+                        {
+                            center_xy = true;
+                        }
+                    });
+                });
+
+                let euler = self
+                    .euler_edit
+                    .entry(sel_id)
+                    .or_insert_with(|| current_euler.unwrap_or([0.0, 0.0, 0.0]));
+                let mut rot_changed = false;
+                row(ui, "Rotation", |ui| {
+                    ui.horizontal(|ui| {
+                        rot_changed |= ui
+                            .add(egui::DragValue::new(&mut euler[0]).speed(1.0).suffix("°"))
+                            .changed();
+                        rot_changed |= ui
+                            .add(egui::DragValue::new(&mut euler[1]).speed(1.0).suffix("°"))
+                            .changed();
+                        rot_changed |= ui
+                            .add(egui::DragValue::new(&mut euler[2]).speed(1.0).suffix("°"))
+                            .changed();
+                    });
+                });
+
+                row(ui, "Step +90°", |ui| {
+                    ui.horizontal(|ui| {
+                        if button(ui, "+90° X", Button::Small).clicked() {
+                            rot_step = Some(0);
+                        }
+                        if button(ui, "+90° Y", Button::Small).clicked() {
+                            rot_step = Some(1);
+                        }
+                        if button(ui, "+90° Z", Button::Small).clicked() {
+                            rot_step = Some(2);
+                        }
+                    });
+                });
+
+                if rot_changed {
+                    applied_euler = Some(*euler);
+                    clamp_floor = true;
+                    changed = true;
+                } else if changed {
+                    inst.set_translation(pos);
+                }
+
+                let mut orient_idx = match inst.constraint {
+                    RotationConstraint::Free => 0,
+                    RotationConstraint::ZOnly => 1,
+                    RotationConstraint::Fixed => 2,
+                };
+                let orient_changed = row(ui, "Orientation", |ui| {
+                    ui.push_id("orient_seg", |ui| {
+                        segmented(
+                            ui,
+                            &mut orient_idx,
+                            &["Free", "Z-Only", "Fixed"],
+                            Segments {
+                                dense: true,
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .inner
+                });
+                if orient_changed {
+                    inst.constraint = match orient_idx {
+                        1 => RotationConstraint::ZOnly,
+                        2 => RotationConstraint::Fixed,
+                        _ => RotationConstraint::Free,
+                    };
+                }
+
+                if checkbox_row(ui, "lock_inst", "Lock Placement", inst.locked) {
+                    inst.locked = !inst.locked;
+                }
+
+                status_line(
+                    ui,
+                    if !above_floor {
+                        "Below Z = 0 floor!"
+                    } else if in_nbz {
+                        "Intersects No-Build Zone!"
+                    } else {
+                        "On or above Z = 0 floor"
+                    },
+                    if above_floor && !in_nbz {
+                        StatusTone::Dim
+                    } else {
+                        StatusTone::Error
+                    },
+                );
+
+                if changed {
+                    self.mark_dirty();
+                }
+            }
+
+            if let Some(new_euler) = applied_euler {
+                self.job.set_instance_euler_around_center(sel_id, new_euler);
+            }
+            if drop_floor && self.job.drop_instance_to_floor(sel_id) {
+                self.mark_dirty();
+            }
+            if clamp_floor && self.job.clamp_instance_above_floor(sel_id) {
+                self.mark_dirty();
+            }
+            if center_xy && self.job.center_instance_xy(sel_id) {
+                self.mark_dirty();
+            }
+            if let Some(axis) = rot_step {
+                self.rotate_selected_90(axis);
+            }
+        });
+    }
+
     fn draw_inspector(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
         let side_c = Container::new(ctx, Surface::Panel);
-        let right_panel = side_c.edge("sls_inspector", Edge::Right).default_size(295.0);
-        side_c.show_edge(ui, right_panel, side_c.edge_frame(t.panel), |ui| {
+        let right_panel = side_c.edge("sls_inspector", Edge::Right).default_size(310.0);
+        let right_frame = side_c
+            .edge_frame(t.panel)
+            .inner_margin(egui::Margin::symmetric(t.space_10 as i8, t.space_10 as i8));
+        side_c.show_edge(ui, right_panel, right_frame, |ui| {
             scope(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(t.space_6, t.space_6);
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let [wx, wy, wz] = self.job.machine.size_mm();
                     let max_z = self.job.max_z_mm();
@@ -4837,7 +5112,55 @@ impl NestCraftApp {
                     } else {
                         0.0
                     };
+                    let below_floor_count = self
+                        .job
+                        .instances
+                        .iter()
+                        .filter(|inst| !self.job.is_instance_above_floor(inst.id))
+                        .count();
+                    let in_nbz_count = self
+                        .job
+                        .instances
+                        .iter()
+                        .filter(|inst| self.job.is_instance_in_no_build_zone(inst.id))
+                        .count();
 
+                    section(ui, "build_summary_sec", "Build Summary", true, |ui| {
+                        value_row(
+                            ui,
+                            "Instances",
+                            &format!("{} ({} unique)", self.job.instances.len(), self.job.parts.len()),
+                        )
+                        .backing_on_hover_text("Placed part instances and unique part geometries");
+                        value_row(ui, "Part Volume", &format!("{total_vol_cm3:.2} cm³"))
+                            .backing_on_hover_text("Total sintered volume across all placed instances");
+                        value_row(ui, "Surface Area", &format!("{total_area_cm2:.2} cm²"))
+                            .backing_on_hover_text("Total triangle surface area across all placed instances");
+                        value_row(ui, "Z Height", &format!("{max_z:.2} / {wz:.0} mm ({layers} layers)"))
+                            .backing_on_hover_text(
+                                "Highest Z across all parts vs platform height (layer count at 0.10 mm recoater step)",
+                            );
+                        value_row(ui, "Density", &format!("{occupied_density:.2}%"))
+                            .backing_on_hover_text(format!(
+                                "Occupied cake density = total volume / (W × D × max Z).\nFull-chamber density (at H = {wz:.0} mm): {full_chamber_density:.2}%.\nTypical PA12 SLS target: 8–15%."
+                            ));
+                        if below_floor_count > 0 {
+                            status_line(
+                                ui,
+                                &format!("{below_floor_count} instance(s) below Z = 0 floor!"),
+                                StatusTone::Error,
+                            );
+                        }
+                        if in_nbz_count > 0 {
+                            status_line(
+                                ui,
+                                &format!("{in_nbz_count} instance(s) in No-Build Zone!"),
+                                StatusTone::Error,
+                            );
+                        }
+                    });
+
+                    ui.add_space(t.space_12);
                     section(ui, "chamber_sec", "Build Chamber", true, |ui| {
                         value_row(ui, "Machine", self.job.machine.name())
                             .backing_on_hover_text("Reference SLS machine profile");
@@ -4911,21 +5234,9 @@ impl NestCraftApp {
                             )
                             .backing_on_hover_text("Default part-to-part gap for placement & grid duplication");
                         });
-                        value_row(ui, "Part Volume", &format!("{total_vol_cm3:.2} cm³"))
-                            .backing_on_hover_text("Total sintered volume across all placed instances");
-                        value_row(ui, "Surface Area", &format!("{total_area_cm2:.2} cm²"))
-                            .backing_on_hover_text("Total triangle surface area across all placed instances");
-                        value_row(ui, "Z Height", &format!("{max_z:.2} / {wz:.0} mm ({layers} layers)"))
-                            .backing_on_hover_text(
-                                "Highest Z across all parts vs platform height (layer count at 0.10 mm recoater step)",
-                            );
-                        value_row(ui, "Density", &format!("{occupied_density:.2}%"))
-                            .backing_on_hover_text(format!(
-                                "Occupied cake density = total volume / (W × D × max Z).\nFull-chamber density (at H = {wz:.0} mm): {full_chamber_density:.2}%.\nTypical PA12 SLS target: 8–15%."
-                            ));
                     });
 
-                    ui.add_space(t.space_6);
+                    ui.add_space(t.space_12);
                     section(ui, "nbz_sec", "No-Build Zone", false, |ui| {
                         let mut pick_stl = false;
                         let mut clear_zone = false;
@@ -5048,234 +5359,6 @@ impl NestCraftApp {
                         } else if zone_changed {
                             self.mark_dirty();
                             self.persist_no_build_zone();
-                        }
-                    });
-
-                    ui.add_space(t.space_6);
-                    section(ui, "inst_sec", "Selected Instance", true, |ui| {
-                        let Some(sel_id) = self.selected else {
-                            status_line(ui, "Select a part in the 3D view or Parts Browser.", StatusTone::Dim);
-                            return;
-                        };
-
-                        let above_floor = self.job.is_instance_above_floor(sel_id);
-                        let in_nbz = self.job.is_instance_in_no_build_zone(sel_id);
-                        let current_euler = self
-                            .job
-                            .instances
-                            .iter()
-                            .find(|i| i.id == sel_id)
-                            .map(|i| i.euler_deg());
-                        let part_metrics = self
-                            .job
-                            .instances
-                            .iter()
-                            .find(|i| i.id == sel_id)
-                            .and_then(|inst| {
-                                self.job.part(inst.part_id).map(|p| {
-                                    let wb = inst.world_bounds(p.mesh.bounds);
-                                    (
-                                        [
-                                            wb[1][0] - wb[0][0],
-                                            wb[1][1] - wb[0][1],
-                                            wb[1][2] - wb[0][2],
-                                        ],
-                                        wb[0][2],
-                                        wb[1][2],
-                                        p.mesh.volume_mm3 / 1000.0,
-                                        p.mesh.surface_area_mm2 / 100.0,
-                                    )
-                                })
-                            });
-
-                        if let Some((dims, min_z, inst_max_z, vol_cm3, area_cm2)) = part_metrics {
-                            value_row(
-                                ui,
-                                "Dimensions",
-                                &format!("{:.1} × {:.1} × {:.1} mm", dims[0], dims[1], dims[2]),
-                            )
-                            .backing_on_hover_text("World-space bounding box size (X × Y × Z)");
-                            value_row(ui, "Volume", &format!("{vol_cm3:.2} cm³"))
-                                .backing_on_hover_text("Part mesh volume in cubic centimetres");
-                            value_row(ui, "Surface Area", &format!("{area_cm2:.2} cm²"))
-                                .backing_on_hover_text("Part mesh surface area in square centimetres");
-                            value_row(ui, "Z Span", &format!("{min_z:.2} .. {inst_max_z:.2} mm"))
-                                .backing_on_hover_text("Lowest to highest Z coordinate (Z = 0 is the floor)");
-                        }
-
-                        let mut drop_floor = false;
-                        let mut clamp_floor = false;
-                        let mut center_xy = false;
-                        let mut rot_step: Option<usize> = None;
-
-                        let part_color_opt = self
-                            .job
-                            .instances
-                            .iter()
-                            .find(|i| i.id == sel_id)
-                            .and_then(|i| i.color);
-                        let mut color_action: Option<Option<[u8; 3]>> = None;
-                        row(ui, "Color", |ui| {
-                            ui.horizontal(|ui| {
-                                let mut rgb = part_color_opt.unwrap_or([t.text.r(), t.text.g(), t.text.b()]);
-                                if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                    color_action = Some(Some(rgb));
-                                }
-                                if part_color_opt.is_some()
-                                    && button(ui, "Reset", Button::Small)
-                                        .backing_on_hover_text("Reset part color to theme default")
-                                        .clicked()
-                                {
-                                    color_action = Some(None);
-                                }
-                            });
-                        });
-                        if let Some(new_color) = color_action {
-                            self.set_selected_color(new_color);
-                        }
-
-                        let mut applied_euler = None;
-                        if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == sel_id) {
-                            let mut pos = inst.translation();
-                            let mut changed = false;
-                            row(ui, "Position", |ui| {
-                                ui.horizontal(|ui| {
-                                    changed |= ui
-                                        .add(egui::DragValue::new(&mut pos[0]).speed(0.5).prefix("X "))
-                                        .changed();
-                                    changed |= ui
-                                        .add(egui::DragValue::new(&mut pos[1]).speed(0.5).prefix("Y "))
-                                        .changed();
-                                    changed |= ui
-                                        .add(egui::DragValue::new(&mut pos[2]).speed(0.5).prefix("Z "))
-                                        .changed();
-                                });
-                            });
-
-                            row(ui, "Quick Place", |ui| {
-                                ui.horizontal(|ui| {
-                                    if button(ui, "Drop Z=0", Button::Small)
-                                        .backing_on_hover_text("Align lowest vertex to build floor (Z = 0)")
-                                        .clicked()
-                                    {
-                                        drop_floor = true;
-                                    }
-                                    if button(ui, "Center XY", Button::Small)
-                                        .backing_on_hover_text("Center instance horizontally in chamber")
-                                        .clicked()
-                                    {
-                                        center_xy = true;
-                                    }
-                                });
-                            });
-
-                            let euler = self
-                                .euler_edit
-                                .entry(sel_id)
-                                .or_insert_with(|| current_euler.unwrap_or([0.0, 0.0, 0.0]));
-                            let mut rot_changed = false;
-                            row(ui, "Rotation", |ui| {
-                                ui.horizontal(|ui| {
-                                    rot_changed |= ui
-                                        .add(egui::DragValue::new(&mut euler[0]).speed(1.0).suffix("°"))
-                                        .changed();
-                                    rot_changed |= ui
-                                        .add(egui::DragValue::new(&mut euler[1]).speed(1.0).suffix("°"))
-                                        .changed();
-                                    rot_changed |= ui
-                                        .add(egui::DragValue::new(&mut euler[2]).speed(1.0).suffix("°"))
-                                        .changed();
-                                });
-                            });
-
-                            row(ui, "Step +90°", |ui| {
-                                ui.horizontal(|ui| {
-                                    if button(ui, "+90° X", Button::Small).clicked() {
-                                        rot_step = Some(0);
-                                    }
-                                    if button(ui, "+90° Y", Button::Small).clicked() {
-                                        rot_step = Some(1);
-                                    }
-                                    if button(ui, "+90° Z", Button::Small).clicked() {
-                                        rot_step = Some(2);
-                                    }
-                                });
-                            });
-
-                            if rot_changed {
-                                applied_euler = Some(*euler);
-                                clamp_floor = true;
-                                changed = true;
-                            } else if changed {
-                                inst.set_translation(pos);
-                            }
-
-                            let mut orient_idx = match inst.constraint {
-                                RotationConstraint::Free => 0,
-                                RotationConstraint::ZOnly => 1,
-                                RotationConstraint::Fixed => 2,
-                            };
-                            let orient_changed = row(ui, "Orientation", |ui| {
-                                ui.push_id("orient_seg", |ui| {
-                                    segmented(
-                                        ui,
-                                        &mut orient_idx,
-                                        &["Free", "Z-Only", "Fixed"],
-                                        Segments {
-                                            dense: true,
-                                            ..Default::default()
-                                        },
-                                    )
-                                })
-                                .inner
-                            });
-                            if orient_changed {
-                                inst.constraint = match orient_idx {
-                                    1 => RotationConstraint::ZOnly,
-                                    2 => RotationConstraint::Fixed,
-                                    _ => RotationConstraint::Free,
-                                };
-                            }
-
-                            if checkbox_row(ui, "lock_inst", "Lock Placement", inst.locked) {
-                                inst.locked = !inst.locked;
-                            }
-
-                            status_line(
-                                ui,
-                                if !above_floor {
-                                    "Below Z = 0 floor!"
-                                } else if in_nbz {
-                                    "Intersects No-Build Zone!"
-                                } else {
-                                    "On or above Z = 0 floor"
-                                },
-                                if above_floor && !in_nbz {
-                                    StatusTone::Dim
-                                } else {
-                                    StatusTone::Error
-                                },
-                            );
-
-                            if changed {
-                                self.mark_dirty();
-                            }
-                        }
-
-                        if let Some(new_euler) = applied_euler {
-                            self.job.set_instance_euler_around_center(sel_id, new_euler);
-                        }
-                        if drop_floor && self.job.drop_instance_to_floor(sel_id) {
-                            self.mark_dirty();
-                        }
-                        if clamp_floor && self.job.clamp_instance_above_floor(sel_id) {
-                            self.mark_dirty();
-                        }
-                        if center_xy && self.job.center_instance_xy(sel_id) {
-                            self.mark_dirty();
-                        }
-                        if let Some(axis) = rot_step {
-                            self.rotate_selected_90(axis);
                         }
                     });
                 });
