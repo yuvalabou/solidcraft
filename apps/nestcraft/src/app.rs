@@ -235,6 +235,9 @@ pub(crate) struct NestCraftApp {
     pub(crate) failed_print_filter: usize,
     pub(crate) failed_print_source_label: String,
     pub(crate) failed_print_external_job: Option<BuildJob>,
+    pub(crate) nest2d_dialog_open: bool,
+    pub(crate) nest2d_config: nestcraft_core::nest2d::Nest2dConfig,
+    pub(crate) nest2d_last_result: Option<nestcraft_core::nest2d::Nest2dResult>,
     pub(crate) slice_dist_open: bool,
     pub(crate) slice_dist_step_mm: f32,
     pub(crate) slice_dist_bed_scale: bool,
@@ -752,6 +755,9 @@ impl NestCraftApp {
             failed_print_filter: 0,
             failed_print_source_label: "Current Bed".to_owned(),
             failed_print_external_job: None,
+            nest2d_dialog_open: false,
+            nest2d_config: nestcraft_core::nest2d::Nest2dConfig::default(),
+            nest2d_last_result: None,
             slice_dist_open: false,
             slice_dist_step_mm: 1.0,
             slice_dist_bed_scale: false,
@@ -846,6 +852,12 @@ impl NestCraftApp {
             self.failed_print_z_mm = (self.job.max_z_mm() * 0.5).max(0.0);
         }
         self.failed_print_dialog_open = true;
+    }
+
+    pub(crate) fn open_nest2d_dialog(&mut self) {
+        self.nest2d_config.min_distance_mm = self.job.clearance_mm;
+        self.nest2d_config.wall_margin_mm = self.job.wall_margin_mm;
+        self.nest2d_dialog_open = true;
     }
 
     pub(crate) fn open_custom_platform_dialog(&mut self) {
@@ -1758,6 +1770,7 @@ impl NestCraftApp {
             || self.export_stl_dialog_open
             || self.report_dialog_open
             || self.failed_print_dialog_open
+            || self.nest2d_dialog_open
             || !self.below_zero_import_dialog.is_empty()
         {
             return;

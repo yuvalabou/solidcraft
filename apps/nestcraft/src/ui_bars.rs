@@ -575,10 +575,20 @@ impl NestCraftApp {
                             ui.label(egui::RichText::new("Nest").strong().color(t.text));
                             StageBar::separator(ui);
 
-                            icon_label_button(ui, "2D Nesting", "sls_auto_nest", false, false)
-                                .backing_on_hover_text(
-                                    "Planar 2D nesting on the build floor (coming in Stage 2)",
-                                );
+                            if icon_label_button(
+                                ui,
+                                "2D Nesting",
+                                "sls_auto_nest",
+                                !self.job.instances.is_empty(),
+                                self.nest2d_dialog_open,
+                            )
+                            .backing_on_hover_text(
+                                "Configure and run 2D auto-nesting (To Platform or In Place outside platform)",
+                            )
+                            .clicked()
+                            {
+                                self.open_nest2d_dialog();
+                            }
                             icon_label_button(ui, "3D Nesting", "sls_auto_nest", false, false)
                                 .backing_on_hover_text(
                                     "3D EDT volumetric packing across the build chamber (coming in Stage 2)",

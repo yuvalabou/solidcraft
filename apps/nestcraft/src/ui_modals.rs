@@ -1678,6 +1678,214 @@ impl NestCraftApp {
             self.failed_print_dialog_open = false;
         }
     }
+
+    pub(crate) fn draw_nest2d_modal(&mut self, ctx: &egui::Context) {
+        if !self.nest2d_dialog_open {
+            return;
+        }
+        let mut open = self.nest2d_dialog_open;
+        let mut run_now = false;
+        let mut close_now = false;
+        let t = Tokens::get();
+
+        egui::Window::new("2D Auto-Nest Configuration")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                row(ui, "Target", |ui| {
+                    let mut tgt_idx = match self.nest2d_config.target {
+                        nestcraft_core::nest2d::Nest2dTarget::ToPlatform => 0,
+                        nestcraft_core::nest2d::Nest2dTarget::InPlaceOutsidePlatform => 1,
+                    };
+                    if ui
+                        .push_id("nest2d_target_seg", |ui| {
+                            segmented(
+                                ui,
+                                &mut tgt_idx,
+                                &["To Platform", "In Place (Outside)"],
+                                Segments {
+                                    dense: true,
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .inner
+                    {
+                        self.nest2d_config.target = if tgt_idx == 1 {
+                            nestcraft_core::nest2d::Nest2dTarget::InPlaceOutsidePlatform
+                        } else {
+                            nestcraft_core::nest2d::Nest2dTarget::ToPlatform
+                        };
+                    }
+                });
+
+                row(ui, "Scope", |ui| {
+                    let mut scope_idx = usize::from(self.nest2d_config.selected_only && !self.selected_set.is_empty());
+                    let labels = if self.selected_set.is_empty() {
+                        ["All Visible", "Selected (None)"]
+                    } else {
+                        ["All Visible", "Selected Only"]
+                    };
+                    if ui
+                        .push_id("nest2d_scope_seg", |ui| {
+                            segmented(
+                                ui,
+                                &mut scope_idx,
+                                &labels,
+                                Segments {
+                                    dense: true,
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .inner
+                    {
+                        self.nest2d_config.selected_only = scope_idx == 1 && !self.selected_set.is_empty();
+                    }
+                });
+
+                row(ui, "Min Distance", |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.nest2d_config.min_distance_mm)
+                            .range(0.0..=50.0)
+                            .speed(0.25)
+                            .suffix(" mm"),
+                    )
+                    .backing_on_hover_text("Minimum XY clearance between nested parts");
+                });
+
+                row(ui, "Resolution", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Accurate").small().color(t.text_dim));
+                        ui.add(
+                            egui::Slider::new(&mut self.nest2d_config.resolution_mm, 0.5..=3.0)
+                                .step_by(0.25)
+                                .show_value(false),
+                        )
+                        .backing_on_hover_text("Drag left for higher accuracy, right for faster nesting");
+                        ui.label(egui::RichText::new("Fast").small().color(t.text_dim));
+                    });
+                });
+
+                if self.nest2d_config.target == nestcraft_core::nest2d::Nest2dTarget::ToPlatform {
+                    row(ui, "Wall Margin", |ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.nest2d_config.wall_margin_mm)
+                                .range(0.0..=50.0)
+                                .speed(0.5)
+                                .suffix(" mm"),
+                        )
+                        .backing_on_hover_text("Keep-in margin from platform X/Y edges");
+                    });
+                }
+
+                row(ui, "Z Rotation", |ui| {
+                    let mut rot_idx = match self.nest2d_config.rotation_step_deg {
+                        0 => 0,
+                        90 => 1,
+                        45 => 2,
+                        _ => 3,
+                    };
+                    if ui
+                        .push_id("nest2d_rot_seg", |ui| {
+                            segmented(
+                                ui,
+                                &mut rot_idx,
+                                &["0°", "90°", "45°", "15°"],
+                                Segments {
+                                    dense: true,
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .inner
+                    {
+                        self.nest2d_config.rotation_step_deg = match rot_idx {
+                            0 => 0,
+                            1 => 90,
+                            2 => 45,
+                            _ => 15,
+                        };
+                    }
+                });
+
+                if checkbox_row(
+                    ui,
+                    "nest2d_use_min_bbox",
+                    "Use Minimum X/Y Bounding Box (no interlocking)",
+                    self.nest2d_config.use_min_bbox,
+                ) {
+                    self.nest2d_config.use_min_bbox = !self.nest2d_config.use_min_bbox;
+                }
+                if checkbox_row(
+                    ui,
+                    "nest2d_drop_min_z",
+                    "Drop nested parts to Min Z floor",
+                    self.nest2d_config.drop_to_min_z,
+                ) {
+                    self.nest2d_config.drop_to_min_z = !self.nest2d_config.drop_to_min_z;
+                }
+                if self.nest2d_config.target == nestcraft_core::nest2d::Nest2dTarget::ToPlatform
+                    && checkbox_row(
+                        ui,
+                        "nest2d_avoid_nbz",
+                        "Avoid enabled No-Build Zone",
+                        self.nest2d_config.avoid_no_build_zone,
+                    )
+                {
+                    self.nest2d_config.avoid_no_build_zone = !self.nest2d_config.avoid_no_build_zone;
+                }
+
+                if let Some(res) = &self.nest2d_last_result {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Last run: {} placed, {} overflow, {:.1}% bed fill ({} ms)",
+                            res.placed_count, res.overflow_count, res.used_area_pct, res.elapsed_ms
+                        ))
+                        .small()
+                        .color(if res.overflow_count > 0 { t.error } else { t.accent }),
+                    );
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if button(ui, "Run 2D Nest", Button::Primary).clicked() {
+                        run_now = true;
+                    }
+                    if button(ui, "Close", Button::Small).clicked() {
+                        close_now = true;
+                    }
+                });
+            });
+
+        if run_now {
+            self.push_undo();
+            let sel = self.selected_set.clone();
+            match nestcraft_core::nest2d::nest_2d(&mut self.job, &self.nest2d_config, Some(&sel)) {
+                Ok(res) => {
+                    self.euler_edit.clear();
+                    self.mark_dirty();
+                    self.status = format!(
+                        "2D Nest: {} placed, {} overflow ({:.1}% fill, {} ms)",
+                        res.placed_count, res.overflow_count, res.used_area_pct, res.elapsed_ms
+                    );
+                    self.nest2d_last_result = Some(res);
+                }
+                Err(e) => {
+                    self.undo_stack.pop();
+                    self.status = format!("2D Nest error: {e}");
+                }
+            }
+        }
+        if close_now || !open {
+            self.nest2d_dialog_open = false;
+        }
+    }
 }
 
 fn open_file_in_default_app(path: &std::path::Path) -> std::io::Result<()> {

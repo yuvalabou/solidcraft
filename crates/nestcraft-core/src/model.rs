@@ -784,10 +784,84 @@ impl BuildJob {
         let Some(inst) = self.instances.iter().find(|i| i.id == id) else {
             return false;
         };
+        self.instance_in_no_build_zone(inst)
+    }
+
+    /// Return `true` when `inst`'s exact triangle mesh intersects or comes within `clearance_mm`
+    /// of the active [`NoBuildZone`] mesh (never using the part's AABB alone as a false positive).
+    pub fn instance_in_no_build_zone(&self, inst: &PartInstance) -> bool {
+        let Some(zone) = &self.no_build_zone else {
+            return false;
+        };
+        if !zone.enabled {
+            return false;
+        }
         let Some(proto) = self.part(inst.part_id) else {
             return false;
         };
-        self.world_bounds_in_no_build_zone(inst.world_bounds(proto.mesh.bounds))
+        let pad = zone.clearance_mm.max(0.0);
+        let pad_sq = pad * pad;
+        let wb = inst.world_bounds(proto.mesh.bounds);
+        let zb = zone.world_bounds();
+        let wb_pad = [
+            [wb[0][0] - pad, wb[0][1] - pad, wb[0][2] - pad],
+            [wb[1][0] + pad, wb[1][1] + pad, wb[1][2] + pad],
+        ];
+        if !aabbs_overlap(wb_pad, zb) {
+            return false;
+        }
+
+        let zb_pad = [
+            [zb[0][0] - pad, zb[0][1] - pad, zb[0][2] - pad],
+            [zb[1][0] + pad, zb[1][1] + pad, zb[1][2] + pad],
+        ];
+        let p_tf = inst.transform;
+        let mut p_tris: Vec<([[f32; 3]; 3], Aabb)> = Vec::new();
+        for tri in &proto.mesh.indices {
+            let a = transform_point(&p_tf, proto.mesh.positions[tri[0] as usize]);
+            let b = transform_point(&p_tf, proto.mesh.positions[tri[1] as usize]);
+            let c = transform_point(&p_tf, proto.mesh.positions[tri[2] as usize]);
+            let tb = tri_aabb(a, b, c);
+            if aabbs_overlap(tb, zb_pad) {
+                p_tris.push(([a, b, c], tb));
+            }
+        }
+
+        let z_tf = zone.transform();
+        let mut z_tris: Vec<([[f32; 3]; 3], Aabb)> = Vec::new();
+        for tri in &zone.mesh.indices {
+            let a = transform_point(&z_tf, zone.mesh.positions[tri[0] as usize]);
+            let b = transform_point(&z_tf, zone.mesh.positions[tri[1] as usize]);
+            let c = transform_point(&z_tf, zone.mesh.positions[tri[2] as usize]);
+            let tb = tri_aabb(a, b, c);
+            if aabbs_overlap(wb_pad, tb) {
+                z_tris.push(([a, b, c], tb));
+            }
+        }
+
+        for &(pt, pb) in &p_tris {
+            let pb_pad = [
+                [pb[0][0] - pad, pb[0][1] - pad, pb[0][2] - pad],
+                [pb[1][0] + pad, pb[1][1] + pad, pb[1][2] + pad],
+            ];
+            for &(zt, zb_tri) in &z_tris {
+                if !aabbs_overlap(pb_pad, zb_tri) {
+                    continue;
+                }
+                if tri_tri_dist_sq(pt, zt) <= pad_sq + 1e-6 {
+                    return true;
+                }
+            }
+        }
+
+        // Handle a part wholly contained inside a closed No-Build Zone.
+        if let Some(first_local) = proto.mesh.positions.first() {
+            let probe = transform_point(&p_tf, *first_local);
+            if aabbs_overlap([probe, probe], zb) && point_inside_mesh_x_ray(probe, &zone.mesh, &z_tf) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Return `true` when `wb` intersects the active [`NoBuildZone`] (including its `clearance_mm`).
@@ -804,14 +878,6 @@ impl BuildJob {
             [wb[0][0] - pad, wb[0][1] - pad, wb[0][2] - pad],
             [wb[1][0] + pad, wb[1][1] + pad, wb[1][2] + pad],
         ];
-        let aabbs_overlap = |a: Aabb, b: Aabb| -> bool {
-            a[0][0] <= b[1][0]
-                && a[1][0] >= b[0][0]
-                && a[0][1] <= b[1][1]
-                && a[1][1] >= b[0][1]
-                && a[0][2] <= b[1][2]
-                && a[1][2] >= b[0][2]
-        };
         if !aabbs_overlap(wb_pad, zb) {
             return false;
         }
@@ -820,10 +886,7 @@ impl BuildJob {
             let p0 = transform_point(&z_tf, zone.mesh.positions[tri[0] as usize]);
             let p1 = transform_point(&z_tf, zone.mesh.positions[tri[1] as usize]);
             let p2 = transform_point(&z_tf, zone.mesh.positions[tri[2] as usize]);
-            let tri_box = [
-                [p0[0].min(p1[0]).min(p2[0]), p0[1].min(p1[1]).min(p2[1]), p0[2].min(p1[2]).min(p2[2])],
-                [p0[0].max(p1[0]).max(p2[0]), p0[1].max(p1[1]).max(p2[1]), p0[2].max(p1[2]).max(p2[2])],
-            ];
+            let tri_box = tri_aabb(p0, p1, p2);
             if aabbs_overlap(wb_pad, tri_box) {
                 return true;
             }
@@ -1232,6 +1295,214 @@ impl BuildJob {
     }
 }
 
+fn aabbs_overlap(a: Aabb, b: Aabb) -> bool {
+    a[0][0] <= b[1][0]
+        && a[1][0] >= b[0][0]
+        && a[0][1] <= b[1][1]
+        && a[1][1] >= b[0][1]
+        && a[0][2] <= b[1][2]
+        && a[1][2] >= b[0][2]
+}
+
+fn tri_aabb(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> Aabb {
+    [
+        [a[0].min(b[0]).min(c[0]), a[1].min(b[1]).min(c[1]), a[2].min(b[2]).min(c[2])],
+        [a[0].max(b[0]).max(c[0]), a[1].max(b[1]).max(c[1]), a[2].max(b[2]).max(c[2])],
+    ]
+}
+
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn point_tri_dist_sq(p: [f32; 3], tri: [[f32; 3]; 3]) -> f32 {
+    let [a, b, c] = tri;
+    let ab = sub3(b, a);
+    let ac = sub3(c, a);
+    let ap = sub3(p, a);
+    let d1 = dot3(ab, ap);
+    let d2 = dot3(ac, ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return dot3(ap, ap);
+    }
+    let bp = sub3(p, b);
+    let d3 = dot3(ab, bp);
+    let d4 = dot3(ac, bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return dot3(bp, bp);
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        let proj = [a[0] + v * ab[0], a[1] + v * ab[1], a[2] + v * ab[2]];
+        let d = sub3(p, proj);
+        return dot3(d, d);
+    }
+    let cp = sub3(p, c);
+    let d5 = dot3(ab, cp);
+    let d6 = dot3(ac, cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return dot3(cp, cp);
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        let proj = [a[0] + w * ac[0], a[1] + w * ac[1], a[2] + w * ac[2]];
+        let d = sub3(p, proj);
+        return dot3(d, d);
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        let bc = sub3(c, b);
+        let proj = [b[0] + w * bc[0], b[1] + w * bc[1], b[2] + w * bc[2]];
+        let d = sub3(p, proj);
+        return dot3(d, d);
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    let proj = [
+        a[0] + ab[0] * v + ac[0] * w,
+        a[1] + ab[1] * v + ac[1] * w,
+        a[2] + ab[2] * v + ac[2] * w,
+    ];
+    let d = sub3(p, proj);
+    dot3(d, d)
+}
+
+fn seg_seg_dist_sq(p1: [f32; 3], q1: [f32; 3], p2: [f32; 3], q2: [f32; 3]) -> f32 {
+    let d1 = sub3(q1, p1);
+    let d2 = sub3(q2, p2);
+    let r = sub3(p1, p2);
+    let a = dot3(d1, d1);
+    let e = dot3(d2, d2);
+    let f = dot3(d2, r);
+    let (s, t) = if a <= 1e-12 && e <= 1e-12 {
+        (0.0, 0.0)
+    } else if a <= 1e-12 {
+        (0.0, (f / e).clamp(0.0, 1.0))
+    } else {
+        let c = dot3(d1, r);
+        if e <= 1e-12 {
+            ((-c / a).clamp(0.0, 1.0), 0.0)
+        } else {
+            let b = dot3(d1, d2);
+            let denom = a * e - b * b;
+            let mut s = if denom != 0.0 {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let tnom = b * s + f;
+            let mut t = tnom / e;
+            if t < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            }
+            (s, t)
+        }
+    };
+    let c1 = [p1[0] + d1[0] * s, p1[1] + d1[1] * s, p1[2] + d1[2] * s];
+    let c2 = [p2[0] + d2[0] * t, p2[1] + d2[1] * t, p2[2] + d2[2] * t];
+    let diff = sub3(c1, c2);
+    dot3(diff, diff)
+}
+
+fn seg_intersects_tri(p0: [f32; 3], p1: [f32; 3], tri: [[f32; 3]; 3]) -> bool {
+    let dir = sub3(p1, p0);
+    let e1 = sub3(tri[1], tri[0]);
+    let e2 = sub3(tri[2], tri[0]);
+    let h = cross3(dir, e2);
+    let a = dot3(e1, h);
+    if a.abs() < 1e-8 {
+        return false;
+    }
+    let f = 1.0 / a;
+    let s = sub3(p0, tri[0]);
+    let u = f * dot3(s, h);
+    if !(0.0..=1.0).contains(&u) {
+        return false;
+    }
+    let q = cross3(s, e1);
+    let v = f * dot3(dir, q);
+    if v < 0.0 || u + v > 1.0 {
+        return false;
+    }
+    let t = f * dot3(e2, q);
+    (0.0..=1.0).contains(&t)
+}
+
+fn tri_tri_dist_sq(t1: [[f32; 3]; 3], t2: [[f32; 3]; 3]) -> f32 {
+    for i in 0..3 {
+        if seg_intersects_tri(t1[i], t1[(i + 1) % 3], t2)
+            || seg_intersects_tri(t2[i], t2[(i + 1) % 3], t1)
+        {
+            return 0.0;
+        }
+    }
+    let mut best = f32::INFINITY;
+    for &p in &t1 {
+        best = best.min(point_tri_dist_sq(p, t2));
+    }
+    for &p in &t2 {
+        best = best.min(point_tri_dist_sq(p, t1));
+    }
+    for i in 0..3 {
+        for j in 0..3 {
+            best = best.min(seg_seg_dist_sq(t1[i], t1[(i + 1) % 3], t2[j], t2[(j + 1) % 3]));
+        }
+    }
+    best
+}
+
+fn point_inside_mesh_x_ray(p: [f32; 3], mesh: &TriMesh, tf: &Transform3x4) -> bool {
+    let mut hits = 0usize;
+    for tri in &mesh.indices {
+        let a = transform_point(tf, mesh.positions[tri[0] as usize]);
+        let b = transform_point(tf, mesh.positions[tri[1] as usize]);
+        let c = transform_point(tf, mesh.positions[tri[2] as usize]);
+        let e1 = sub3(b, a);
+        let e2 = sub3(c, a);
+        let h = [0.0, e2[2], -e2[1]]; // cross([1,0,0], e2)
+        let det = dot3(e1, h);
+        if det.abs() < 1e-8 {
+            continue;
+        }
+        let inv = 1.0 / det;
+        let s = sub3(p, a);
+        let u = inv * dot3(s, h);
+        if !(0.0..=1.0).contains(&u) {
+            continue;
+        }
+        let q = cross3(s, e1);
+        let v = inv * q[0];
+        if v < 0.0 || u + v > 1.0 {
+            continue;
+        }
+        let t = inv * dot3(e2, q);
+        if t > 1e-6 {
+            hits += 1;
+        }
+    }
+    hits % 2 == 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1449,5 +1720,34 @@ mod tests {
         assert_eq!(farsoon.bed_origin, BedOrigin::Center);
         assert_eq!(farsoon.bed_xy_bounds(), ([-200.0, -200.0], [200.0, 200.0]));
         assert_eq!(farsoon.bed_center_xy(), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn no_build_zone_uses_exact_mesh_not_part_bbox() {
+        // L-shaped part: occupies [0..30, 0..10] and [0..10, 0..30], so [15..30, 15..30] is empty!
+        let l_positions = vec![
+            [0.0, 0.0, 0.0], [30.0, 0.0, 0.0], [30.0, 10.0, 0.0], [10.0, 10.0, 0.0], [10.0, 30.0, 0.0], [0.0, 30.0, 0.0],
+            [0.0, 0.0, 5.0], [30.0, 0.0, 5.0], [30.0, 10.0, 5.0], [10.0, 10.0, 5.0], [10.0, 30.0, 5.0], [0.0, 30.0, 5.0],
+        ];
+        let l_indices = vec![
+            [0, 2, 1], [0, 3, 2], [0, 4, 3], [0, 5, 4],
+            [6, 7, 8], [6, 8, 9], [6, 9, 10], [6, 10, 11],
+            [0, 1, 7], [0, 7, 6], [1, 2, 8], [1, 8, 7],
+            [2, 3, 9], [2, 9, 8], [3, 4, 10], [3, 10, 9],
+            [4, 5, 11], [4, 11, 10], [5, 0, 6], [5, 6, 11],
+        ];
+        let l_mesh = Arc::new(TriMesh::from_indexed(l_positions, l_indices).expect("L mesh"));
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        let pid = job.add_part("LPart", l_mesh);
+        let iid = job.add_instance(pid, IDENTITY_TRANSFORM).expect("placed");
+
+        // Place a 10x10x5 No-Build Zone inside the empty L pocket at [15..25, 15..25, 0..5]
+        let mut zone = NoBuildZone::new("PocketZone", unit_cube());
+        zone.position = [15.0, 15.0, 0.0];
+        zone.clearance_mm = 1.0;
+        job.no_build_zone = Some(zone);
+
+        // Part AABB [0..30, 0..30] overlaps the zone, but actual L triangles are >= 5 mm away!
+        assert!(!job.is_instance_in_no_build_zone(iid));
     }
 }

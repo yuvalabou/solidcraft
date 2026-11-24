@@ -179,7 +179,7 @@ pub fn build_gpu_scene_with_exclude(
 
         let wb = inst.world_bounds(proto.mesh.bounds);
         let above_floor = job.world_bounds_above_floor(wb);
-        let in_nbz = job.world_bounds_in_no_build_zone(wb);
+        let in_nbz = job.instance_in_no_build_zone(inst);
         let valid = above_floor && !in_nbz;
         let is_selected = selected.contains(&inst.id);
         let color = if let Some(t_rgba) = cache.thermal_colors.as_ref().and_then(|m| m.get(&inst.id)) {
@@ -278,7 +278,7 @@ pub fn build_moving_scene(
                     edges: None,
                 });
                 let wb = inst.world_bounds(proto.mesh.bounds);
-                let valid = job.world_bounds_above_floor(wb) && !job.world_bounds_in_no_build_zone(wb);
+                let valid = job.world_bounds_above_floor(wb) && !job.instance_in_no_build_zone(inst);
                 let is_selected = selected.contains(&inst.id);
                 let color = instance_palette_color(
                     &mut scene,
@@ -819,7 +819,7 @@ pub fn selected_centerpoints(
         ) {
             let screen_pos = egui::pos2(rect.left() + px as f32, rect.top() + py as f32);
             if rect.contains(screen_pos) {
-                let valid = job.world_bounds_above_floor(wb) && !job.world_bounds_in_no_build_zone(wb);
+                let valid = job.world_bounds_above_floor(wb) && !job.instance_in_no_build_zone(inst);
                 centers.push(CenterpointHandle {
                     id: inst.id,
                     screen_pos,
