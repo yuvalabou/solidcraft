@@ -1432,6 +1432,252 @@ impl NestCraftApp {
             self.report_dialog_open = false;
         }
     }
+
+    pub(crate) fn draw_failed_print_modal(&mut self, ctx: &egui::Context) {
+        if !self.failed_print_dialog_open {
+            return;
+        }
+        let mut open = self.failed_print_dialog_open;
+        let mut use_current = false;
+        let mut browse_job = false;
+        let mut select_reprint = false;
+        let mut load_reprint_job = false;
+        let mut export_csv = false;
+        let mut close_now = false;
+        let t = Tokens::get();
+
+        let inspecting_current = self.failed_print_external_job.is_none();
+        let report = {
+            let target_job = self.failed_print_external_job.as_ref().unwrap_or(&self.job);
+            nestcraft_core::recovery::FailedPrintReport::classify(target_job, self.failed_print_z_mm)
+        };
+        let max_slider_z = report.job_max_z_mm.max(1.0);
+        let reprint_total = report.partial_count + report.not_started_count;
+
+        egui::Window::new("Failed Print Recovery")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .movable(true)
+            .default_width(660.0)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                row(ui, "Select Job", |ui| {
+                    ui.horizontal(|ui| {
+                        if button(ui, "Use Current Bed", Button::Small).clicked() {
+                            use_current = true;
+                        }
+                        if button(ui, "Browse .nestc...", Button::Small).clicked() {
+                            browse_job = true;
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} ({} parts inside machine)",
+                                self.failed_print_source_label,
+                                report.rows.len()
+                            ))
+                            .small()
+                            .color(t.text_dim),
+                        );
+                    });
+                });
+
+                row(ui, "Aborted Z (mm)", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.failed_print_z_mm)
+                                .range(0.0..=max_slider_z)
+                                .speed(0.5)
+                                .suffix(" mm"),
+                        );
+                        ui.add(egui::Slider::new(&mut self.failed_print_z_mm, 0.0..=max_slider_z).show_value(false));
+                        let layer_num = (self.failed_print_z_mm / 0.1).round() as u32;
+                        ui.label(egui::RichText::new(format!("Layer ~{layer_num}")).small().color(t.text_dim));
+                    });
+                });
+
+                ui.add_space(4.0);
+                egui::Grid::new("failed_print_kpi_grid")
+                    .num_columns(4)
+                    .spacing([14.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Completed (OK)").small().color(t.text_dim));
+                        ui.label(egui::RichText::new("Partial / Ruined").small().color(t.text_dim));
+                        ui.label(egui::RichText::new("Not Started").small().color(t.text_dim));
+                        ui.label(egui::RichText::new("Needs Reprint").small().color(t.text_dim));
+                        ui.end_row();
+
+                        ui.label(
+                            egui::RichText::new(format!("{}", report.completed_count))
+                                .strong()
+                                .color(egui::Color32::from_rgb(0x22, 0xC5, 0x5E)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{}", report.partial_count))
+                                .strong()
+                                .color(t.error),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{}", report.not_started_count))
+                                .strong()
+                                .color(egui::Color32::from_rgb(0xF5, 0x9E, 0x0B)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{reprint_total} ({:.2} cm³)", report.reprint_volume_cm3))
+                                .strong()
+                                .color(t.accent),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(6.0);
+                ui.push_id("failed_print_filter_seg", |ui| {
+                    segmented(
+                        ui,
+                        &mut self.failed_print_filter,
+                        &["All", "Needs Reprint", "Completed"],
+                        Segments {
+                            dense: true,
+                            ..Default::default()
+                        },
+                    );
+                });
+
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("failed_print_table_scroll")
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("failed_print_table")
+                            .striped(true)
+                            .num_columns(5)
+                            .spacing([14.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("ID").strong());
+                                ui.label(egui::RichText::new("Part").strong());
+                                ui.label(egui::RichText::new("Z Range (mm)").strong());
+                                ui.label(egui::RichText::new("Printed").strong());
+                                ui.label(egui::RichText::new("Status").strong());
+                                ui.end_row();
+
+                                for r in &report.rows {
+                                    let show = match self.failed_print_filter {
+                                        1 => r.needs_reprint(),
+                                        2 => !r.needs_reprint(),
+                                        _ => true,
+                                    };
+                                    if !show {
+                                        continue;
+                                    }
+                                    ui.label(format!("#{}", r.instance_id.0));
+                                    ui.label(&r.name);
+                                    ui.label(format!("{:.1} .. {:.1}", r.min_z_mm, r.max_z_mm));
+                                    match r.status {
+                                        nestcraft_core::recovery::FailedPrintStatus::Completed => {
+                                            ui.label("100.0%");
+                                            ui.label(
+                                                egui::RichText::new("Completed")
+                                                    .color(egui::Color32::from_rgb(0x22, 0xC5, 0x5E)),
+                                            );
+                                        }
+                                        nestcraft_core::recovery::FailedPrintStatus::Partial { pct_printed } => {
+                                            ui.label(format!("{pct_printed:.1}%"));
+                                            ui.label(egui::RichText::new("Partial (Reprint)").color(t.error));
+                                        }
+                                        nestcraft_core::recovery::FailedPrintStatus::NotStarted => {
+                                            ui.label("0.0%");
+                                            ui.label(
+                                                egui::RichText::new("Not Started (Reprint)")
+                                                    .color(egui::Color32::from_rgb(0xF5, 0x9E, 0x0B)),
+                                            );
+                                        }
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if inspecting_current
+                        && reprint_total > 0
+                        && button(ui, "Select Reprint in Viewport", Button::Small).clicked()
+                    {
+                        select_reprint = true;
+                    }
+                    if reprint_total > 0 && button(ui, "Load Reprint Job on Bed", Button::Primary).clicked() {
+                        load_reprint_job = true;
+                    }
+                    if reprint_total > 0 && button(ui, "Export Reprint CSV...", Button::Small).clicked() {
+                        export_csv = true;
+                    }
+                    if button(ui, "Close", Button::Small).clicked() {
+                        close_now = true;
+                    }
+                });
+            });
+
+        if use_current {
+            self.failed_print_external_job = None;
+            self.failed_print_source_label = "Current Bed".to_owned();
+            self.failed_print_z_mm = (self.job.max_z_mm() * 0.5).max(0.0);
+        } else if browse_job
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("NestCraft Bed", &["nestc"])
+                .pick_file()
+        {
+            match std::fs::read(&path).and_then(|b| {
+                nestcraft_core::io::nestc::read_nestc(&b).map_err(std::io::Error::other)
+            }) {
+                Ok(loaded) => {
+                    self.failed_print_z_mm = (loaded.max_z_mm() * 0.5).max(0.0);
+                    self.failed_print_source_label = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    self.failed_print_external_job = Some(loaded);
+                }
+                Err(e) => {
+                    self.status = format!("Failed to load job: {e}");
+                }
+            }
+        } else if select_reprint {
+            let ids = report.reprint_instance_ids();
+            self.selected_set.clear();
+            for &id in &ids {
+                self.selected_set.insert(id);
+            }
+            self.selected = ids.last().copied();
+            self.selection_anchor = self.selected;
+            self.mark_dirty();
+            self.status = format!("Selected {} part(s) needing reprint", ids.len());
+        } else if load_reprint_job {
+            let reprint_job = {
+                let target_job = self.failed_print_external_job.as_ref().unwrap_or(&self.job);
+                nestcraft_core::recovery::build_reprint_job(target_job, self.failed_print_z_mm)
+            };
+            let count = reprint_job.instances.len();
+            self.apply_loaded_bed(reprint_job, "Reprint Job");
+            self.failed_print_dialog_open = false;
+            self.status = format!("Loaded reprint job with {count} part(s)");
+            return;
+        } else if export_csv
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("CSV Reprint List", &["csv"])
+                .set_file_name("reprint_parts.csv")
+                .save_file()
+        {
+            match std::fs::write(&path, report.to_reprint_csv()).and_then(|()| open_file_in_default_app(&path)) {
+                Ok(()) => self.status = format!("Exported and opened reprint CSV {}", path.display()),
+                Err(e) => self.status = format!("Reprint CSV export failed: {e}"),
+            }
+        }
+
+        if close_now || !open {
+            self.failed_print_dialog_open = false;
+        }
+    }
 }
 
 fn open_file_in_default_app(path: &std::path::Path) -> std::io::Result<()> {

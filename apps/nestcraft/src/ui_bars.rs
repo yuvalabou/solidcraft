@@ -94,6 +94,20 @@ impl NestCraftApp {
                             {
                                 self.start_import_files(paths, ctx);
                             }
+                            if icon_label_button(
+                                ui,
+                                "Failed Print?",
+                                "sls_slice_z",
+                                true,
+                                self.failed_print_dialog_open,
+                            )
+                            .backing_on_hover_text(
+                                "Inspect a failed/aborted build by Z height to see completed vs reprint parts",
+                            )
+                            .clicked()
+                            {
+                                self.open_failed_print_dialog();
+                            }
                             if icon_label_button(ui, "Sample Part", "mesh_body", true, false)
                                 .backing_on_hover_text("Insert a sample 30x20x25 mm bracket into the chamber")
                                 .clicked()

@@ -230,6 +230,11 @@ pub(crate) struct NestCraftApp {
     pub(crate) export_stl_dialog_open: bool,
     pub(crate) report_dialog_open: bool,
     pub(crate) report_preview: Option<nestcraft_core::report::BuildReport>,
+    pub(crate) failed_print_dialog_open: bool,
+    pub(crate) failed_print_z_mm: f32,
+    pub(crate) failed_print_filter: usize,
+    pub(crate) failed_print_source_label: String,
+    pub(crate) failed_print_external_job: Option<BuildJob>,
     pub(crate) slice_dist_open: bool,
     pub(crate) slice_dist_step_mm: f32,
     pub(crate) slice_dist_bed_scale: bool,
@@ -742,6 +747,11 @@ impl NestCraftApp {
             export_stl_dialog_open: false,
             report_dialog_open: false,
             report_preview: None,
+            failed_print_dialog_open: false,
+            failed_print_z_mm: 0.0,
+            failed_print_filter: 0,
+            failed_print_source_label: "Current Bed".to_owned(),
+            failed_print_external_job: None,
             slice_dist_open: false,
             slice_dist_step_mm: 1.0,
             slice_dist_bed_scale: false,
@@ -827,6 +837,15 @@ impl NestCraftApp {
     pub(crate) fn open_report_dialog(&mut self) {
         self.report_preview = Some(nestcraft_core::report::BuildReport::generate(&self.job));
         self.report_dialog_open = true;
+    }
+
+    pub(crate) fn open_failed_print_dialog(&mut self) {
+        self.failed_print_external_job = None;
+        self.failed_print_source_label = "Current Bed".to_owned();
+        if self.failed_print_z_mm <= 0.0 {
+            self.failed_print_z_mm = (self.job.max_z_mm() * 0.5).max(0.0);
+        }
+        self.failed_print_dialog_open = true;
     }
 
     pub(crate) fn open_custom_platform_dialog(&mut self) {
@@ -1738,6 +1757,7 @@ impl NestCraftApp {
             || self.color_picker_open
             || self.export_stl_dialog_open
             || self.report_dialog_open
+            || self.failed_print_dialog_open
             || !self.below_zero_import_dialog.is_empty()
         {
             return;
