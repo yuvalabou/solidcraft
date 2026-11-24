@@ -1,7 +1,6 @@
 //! Top, Edit, Analyze, View, and Status bars.
 
 use crate::app::*;
-use crate::viewport;
 
 use nestcraft_core::model::InstanceId;
 use solidcraft_theme::Tokens;
@@ -78,6 +77,8 @@ impl NestCraftApp {
                             {
                                 self.save_bed_file(&path);
                             }
+                            icon_label_button(ui, "Generate Report", "export", false, false)
+                                .backing_on_hover_text("Generate build report (coming soon)");
                             if icon_label_button(ui, "Import", "sls_import_mesh", self.load_task.is_none(), false)
                                 .backing_on_hover_text("Import STL or 3MF meshes into the build chamber")
                                 .clicked()
@@ -119,8 +120,7 @@ impl NestCraftApp {
                                 .backing_on_hover_text("Reset camera to default isometric build view")
                                 .clicked()
                             {
-                                self.camera =
-                                    viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
+                                self.camera = self.default_camera_for_job();
                             }
                             let dark = solidcraft_theme::is_dark();
                             if icon_label_button(
@@ -307,6 +307,22 @@ impl NestCraftApp {
                                 } else {
                                     "Cancelled zoom to selection".to_owned()
                                 };
+                            }
+                            StageBar::separator(ui);
+                            let is_ortho = self.is_orthographic();
+                            if icon_label_button(
+                                ui,
+                                if is_ortho { "Isometric" } else { "Perspective" },
+                                "sls_view_ortho",
+                                true,
+                                is_ortho,
+                            )
+                            .backing_on_hover_text(
+                                "Toggle camera projection between Perspective and Isometric (Orthographic)",
+                            )
+                            .clicked()
+                            {
+                                self.toggle_projection();
                             }
                         });
                     });

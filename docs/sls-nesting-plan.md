@@ -58,13 +58,16 @@ Before starting implementation, three repository/environment details were verifi
 - **Startup Initialization (`apps/nestcraft/src/main.rs`):**
   - Define `static NESTCRAFT_ICONS: IconSet = IconSet::extended(solidcraft_look::icons::DATA, IconExtension { masters: &[], aliases: &[...], icon_accents: &[] })` mapping the 10 semantic actions (`sls_import_mesh`, `sls_auto_nest`, `sls_sinterbox`, `sls_orient_lock`, `sls_duplicate`, `sls_emboss_id`, `sls_hollow`, `sls_slice_z`, `sls_collision`, `sls_thermal_map`) to existing `crates/look/icons/design/svg/model/` masters.
   - Call `solidcraft_look::glyphs::install()`, `solidcraft_look::themes::install()`, `solidcraft_ui_kit::icons::install(&NESTCRAFT_ICONS)`, and `solidcraft_look::fonts::install(&ctx)` — **never** calling `solidcraft_look::install(&ctx)` so `OnceLock` does not lock out `&NESTCRAFT_ICONS`.
-- **UI Layout (`apps/nestcraft/src/main.rs`):**
+- **UI Layout & Module Split (`apps/nestcraft/src/`):**
+  - Modularized across `main.rs`, `app.rs`, `ui_bars.rs`, `ui_parts_panel.rs`, `ui_build_panel.rs`, `ui_modals.rs`, `ui_viewport.rs`, `viewport.rs`, `icons.rs`, and `tests.rs`.
   - Route every window, panel, ribbon, menu, and tooltip through `solidcraft_ui_kit::Container` and `BackingTooltipExt` (`cargo xtask ui-containers` compliant), with draggable pop-up modals (`movable(true)`).
-  - **Top Banner:** Machine selector (Formiga P110 / HT403P / Custom + Configure), Open/Save `.nestc`, Import STL/3MF, Sample Part, Export 3MF / STLs, Auto-Nest (stubbed), Fit View, Theme toggle.
+  - **Top Banner:** Machine selector (Formiga P110 / HT403P / Custom + Configure), Open/Save `.nestc`, Generate Report (stubbed), Import STL/3MF, Sample Part, Export 3MF / STLs, Auto-Nest (stubbed), Fit View, Theme toggle.
   - **Edit Banner:** Part-editing actions (`Move`, `Scale`, `Duplicate`, `Drop Z=0`, `Delete`, `Align`, `Shells to Parts`, `Merge Parts` with Keep/Delete Original prompt) plus placeholder mesh tools (`Shell`, `Labels`, `Repair Mesh`, `Boolean`, `Cut / Split`, `Offset`).
-  - **View Banner:** `Zoom to All Parts`, `Zoom to Selected`, `Zoom to Platform`, `Zoom to All`, `Zoom to Selection` (right-drag rect).
+  - **Analyze Banner:** Placeholder analysis tools (`Stair Highlight`, `Measure`, `Wall Thickness`, `Up / Downskin`, `Shadow Area`, `Collision Check`, `Thermal Map`).
+  - **View Banner:** `Zoom to All Parts`, `Zoom to Selected`, `Zoom to Platform`, `Zoom to All`, `Zoom to Selection` (right-drag rect), and `Perspective / Isometric` projection toggle (with Front-Left default view: `+X` right, `+Y` far).
   - **Left Sidebar (Part Scope):** Aerated `Build Parts Browser` (groups, 20×20 thumbnails, visibility/transparency/lock/color, context menu) + `Selected Part` configuration and metrics.
   - **Right Sidebar (Build Scope):** Aerated `Build Summary` (counts, volume, surface area, Z height/layers, density, floor/NBZ warnings), `Build Chamber` (machine, origin, margins, clearance), and `No-Build Zone`.
+  - **3D Viewport Overlays & Handles:** Selected part centerpoint drag handle (`Grab` cursor), left-front bounding-box toggleable world-axis (`X`/`Y`/`Z`) ring rotation gizmo (`MovingLayer` live update, continuous rotation without floor clamping or snapping), and bottom-right Mesh Repair Gate badge (clickable to select faulty parts).
 
 ### Stage 1C — Instanced 3D Viewport & Basic Manipulation
 - **Build Volume & Floor Grid (`apps/nestcraft/src/viewport.rs`):**

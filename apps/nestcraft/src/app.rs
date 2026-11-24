@@ -11,8 +11,7 @@ use nestcraft_core::io::threemf::ThreeMfLoadedItem;
 use nestcraft_core::io::{nestc, stl, threemf};
 use nestcraft_core::manifold::{self, ManifoldReport};
 use nestcraft_core::model::{
-    BedOrigin, BuildJob, GroupId, IDENTITY_TRANSFORM, InstanceId, MachineProfile, NoBuildZone, PartId,
-    RotationConstraint, TriMesh,
+    BedOrigin, BuildJob, GroupId, IDENTITY_TRANSFORM, InstanceId, MachineProfile, NoBuildZone, PartId, TriMesh,
 };
 use nestcraft_core::sinterbox::{self, CageShape, LabelPanel, SinterboxConfig};
 use serde::{Deserialize, Serialize};
@@ -31,9 +30,12 @@ pub(crate) struct DragState {
 #[derive(Debug, Clone)]
 pub(crate) struct RotateDragState {
     pub(crate) pivot: [f32; 3],
-    pub(crate) instances: Vec<(InstanceId, [[f32; 4]; 3], RotationConstraint)>,
-    pub(crate) accum_dx: f32,
-    pub(crate) accum_dy: f32,
+    pub(crate) pivot_screen: egui::Pos2,
+    pub(crate) axis: usize,
+    pub(crate) angle_rad: f32,
+    pub(crate) prev_pos: egui::Pos2,
+    pub(crate) edge_tangent: egui::Vec2,
+    pub(crate) instances: Vec<(InstanceId, [[f32; 4]; 3])>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,6 +234,7 @@ pub(crate) struct NestCraftApp {
     pub(crate) export_stl_include_id: bool,
     pub(crate) export_stl_apply_transform: bool,
     pub(crate) drag_state: Option<DragState>,
+    pub(crate) rotate_gizmo_open: bool,
     pub(crate) rotate_drag: Option<RotateDragState>,
     pub(crate) drag_zone: Option<DragZoneState>,
     pub(crate) box_select: Option<BoxSelectState>,
@@ -257,6 +260,7 @@ pub(crate) struct NestCraftApp {
     pub(crate) custom_min_z: f32,
     pub(crate) custom_clearance: f32,
     pub(crate) custom_bed_origin: BedOrigin,
+    pub(crate) orthographic_view: bool,
     pub(crate) new_group_name: String,
     pub(crate) view_bar_rect: Option<egui::Rect>,
     pub(crate) repair_badge_rect: Option<egui::Rect>,
@@ -734,6 +738,7 @@ impl NestCraftApp {
             export_stl_include_id: true,
             export_stl_apply_transform: true,
             drag_state: None,
+            rotate_gizmo_open: false,
             rotate_drag: None,
             drag_zone: None,
             box_select: None,
@@ -759,6 +764,7 @@ impl NestCraftApp {
             custom_min_z,
             custom_clearance,
             custom_bed_origin,
+            orthographic_view: false,
             new_group_name: String::new(),
             view_bar_rect: None,
             repair_badge_rect: None,
@@ -797,7 +803,7 @@ impl NestCraftApp {
         self.job.clearance_mm = p.clearance_mm;
         self.job.bed_origin = p.bed_origin.into();
         self.job.no_build_zone = no_build_zone_dir_for_slot(idx).and_then(|d| load_no_build_zone_from_dir(&d));
-        self.camera = viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
+        self.camera = self.default_camera_for_job();
         self.mark_dirty();
         self.status = format!("Active machine: {}", self.job.machine.name());
     }
@@ -1628,7 +1634,8 @@ impl NestCraftApp {
         if let Some(v) = self.camera.aligned_standard_view(TOL) {
             return Some(v);
         }
-        let (iso_yaw, iso_pitch) = StandardView::Iso.angles();
+        let (_, iso_pitch) = StandardView::Iso.angles();
+        let iso_yaw = std::f64::consts::FRAC_PI_4;
         let dyaw = (self.camera.yaw - iso_yaw).rem_euclid(std::f64::consts::TAU);
         let dyaw = dyaw.min(std::f64::consts::TAU - dyaw);
         let dpitch = (self.camera.pitch - iso_pitch).abs();
@@ -1641,8 +1648,39 @@ impl NestCraftApp {
         }
     }
 
+    pub(crate) fn is_orthographic(&self) -> bool {
+        self.camera.fov <= 0.0
+    }
+
+    pub(crate) fn default_camera_for_job(&self) -> Camera {
+        let mut cam = viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
+        if self.orthographic_view {
+            cam.distance *= (cam.fov * 0.5).tan() / 0.4;
+            cam.fov = 0.0;
+        }
+        cam
+    }
+
+    pub(crate) fn toggle_projection(&mut self) {
+        const PERSP_FOV: f64 = 0.65;
+        if self.camera.fov > 0.0 {
+            self.camera.distance *= (self.camera.fov * 0.5).tan() / 0.4;
+            self.camera.fov = 0.0;
+            self.orthographic_view = true;
+            self.status = "Projection: Isometric (Orthographic)".to_owned();
+        } else {
+            self.camera.distance *= 0.4 / (PERSP_FOV * 0.5).tan();
+            self.camera.fov = PERSP_FOV;
+            self.orthographic_view = false;
+            self.status = "Projection: Perspective".to_owned();
+        }
+    }
+
     pub(crate) fn set_standard_view(&mut self, view: StandardView) {
         self.camera.set_view(view);
+        if view == StandardView::Iso {
+            self.camera.yaw = std::f64::consts::FRAC_PI_4;
+        }
         self.status = format!("View: {}", view_label(view));
     }
 
@@ -1791,7 +1829,7 @@ impl NestCraftApp {
                 self.cycle_standard_view();
             }
             if !cmd && !alt && i.key_pressed(egui::Key::F) {
-                self.camera = viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
+                self.camera = self.default_camera_for_job();
             }
 
             let step = if shift {
@@ -1829,7 +1867,7 @@ impl NestCraftApp {
                 } else if i.key_pressed(egui::Key::Num7) {
                     self.camera = self.camera.looking_from([0.0, 0.0, 1.0].into());
                 } else if i.key_pressed(egui::Key::Num0) {
-                    self.camera = viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
+                    self.camera = self.default_camera_for_job();
                 }
             }
         });
@@ -1918,7 +1956,7 @@ impl NestCraftApp {
         self.manifold_cache.clear();
         self.part_thumbs.clear();
         self.expanded_parts.clear();
-        self.camera = viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
+        self.camera = self.default_camera_for_job();
         self.mark_dirty();
         self.status = format!("Opened bed {path_display}");
     }
@@ -2306,6 +2344,15 @@ impl NestCraftApp {
 
     pub(crate) fn current_moving_layer(&self) -> Option<MovingLayer> {
         let target = self.moving_target.as_ref()?;
+        if matches!(target, viewport::DragExclude::Instances(_))
+            && let Some(rd) = &self.rotate_drag
+        {
+            return Some(MovingLayer {
+                key: self.moving_key,
+                slot: self.moving_slot.clone(),
+                transform: rotation_matrix_4x4_col_major(rd.pivot, world_axis(rd.axis), rd.angle_rad),
+            });
+        }
         let delta = match target {
             viewport::DragExclude::Instances(_) => {
                 let ds = self.drag_state.as_ref()?;
@@ -2382,6 +2429,43 @@ impl NestCraftApp {
 
 }
 
+pub(crate) fn world_axis(axis: usize) -> [f32; 3] {
+    match axis {
+        0 => [1.0, 0.0, 0.0],
+        1 => [0.0, 1.0, 0.0],
+        _ => [0.0, 0.0, 1.0],
+    }
+}
+
+pub(crate) fn rotation_matrix_4x4_col_major(pivot: [f32; 3], axis: [f32; 3], angle_rad: f32) -> [[f32; 4]; 4] {
+    let len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    if len < 1e-6 || angle_rad.abs() < 1e-6 {
+        return [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+    }
+    let (ux, uy, uz) = (axis[0] / len, axis[1] / len, axis[2] / len);
+    let (s, c) = angle_rad.sin_cos();
+    let t = 1.0 - c;
+    let r = [
+        [t * ux * ux + c, t * ux * uy - s * uz, t * ux * uz + s * uy],
+        [t * ux * uy + s * uz, t * uy * uy + c, t * uy * uz - s * ux],
+        [t * ux * uz - s * uy, t * uy * uz + s * ux, t * uz * uz + c],
+    ];
+    let tx = pivot[0] - (r[0][0] * pivot[0] + r[0][1] * pivot[1] + r[0][2] * pivot[2]);
+    let ty = pivot[1] - (r[1][0] * pivot[0] + r[1][1] * pivot[1] + r[1][2] * pivot[2]);
+    let tz = pivot[2] - (r[2][0] * pivot[0] + r[2][1] * pivot[1] + r[2][2] * pivot[2]);
+    [
+        [r[0][0], r[1][0], r[2][0], 0.0],
+        [r[0][1], r[1][1], r[2][1], 0.0],
+        [r[0][2], r[1][2], r[2][2], 0.0],
+        [tx, ty, tz, 1.0],
+    ]
+}
+
 pub(crate) fn rotate_transform_around_pivot(
     orig: [[f32; 4]; 3],
     pivot: [f32; 3],
@@ -2411,17 +2495,6 @@ pub(crate) fn rotate_transform_around_pivot(
         out[row][3] = pivot[row] + r[row][0] * dx + r[row][1] * dy + r[row][2] * dz;
     }
     out
-}
-
-pub(crate) fn snap_to_nearest_axis(v: [f32; 3]) -> [f32; 3] {
-    let (ax, ay, az) = (v[0].abs(), v[1].abs(), v[2].abs());
-    if ax >= ay && ax >= az {
-        [v[0].signum(), 0.0, 0.0]
-    } else if ay >= az {
-        [0.0, v[1].signum(), 0.0]
-    } else {
-        [0.0, 0.0, v[2].signum()]
-    }
 }
 
 pub(crate) fn create_sample_bracket_mesh(variant: u32) -> nestcraft_core::Result<TriMesh> {

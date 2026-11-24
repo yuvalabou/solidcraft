@@ -747,3 +747,70 @@ use solidcraft_viewport::StandardView;
         assert!(app.job.groups.is_empty());
         assert_eq!(app.job.instances.len(), 1);
     }
+
+    #[test]
+    fn rotation_matrix_matches_rotate_transform_and_moving_layer_active() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        let inst = &app.job.instances[0];
+        let orig = inst.transform;
+        let pivot = [10.0, 20.0, 5.0];
+        let axis = world_axis(0);
+        let angle = 0.75_f32;
+
+        let rotated = rotate_transform_around_pivot(orig, pivot, axis, angle);
+        let m4 = rotation_matrix_4x4_col_major(pivot, axis, angle);
+
+        // Apply `m4 * orig` to a test point [1, 2, 3] and compare with `rotated`.
+        let p = [1.0_f32, 2.0, 3.0];
+        let mut p_orig = [0.0_f32; 3];
+        let mut p_rot = [0.0_f32; 3];
+        for r in 0..3 {
+            p_orig[r] = orig[r][0] * p[0] + orig[r][1] * p[1] + orig[r][2] * p[2] + orig[r][3];
+            p_rot[r] = rotated[r][0] * p[0] + rotated[r][1] * p[1] + rotated[r][2] * p[2] + rotated[r][3];
+        }
+        let mut p_m4 = [0.0_f32; 3];
+        for r in 0..3 {
+            p_m4[r] = m4[0][r] * p_orig[0] + m4[1][r] * p_orig[1] + m4[2][r] * p_orig[2] + m4[3][r];
+            assert!((p_m4[r] - p_rot[r]).abs() < 1e-4, "mismatch at {r}: {} vs {}", p_m4[r], p_rot[r]);
+        }
+
+        let id = inst.id;
+        app.rotate_drag = Some(RotateDragState {
+            pivot,
+            pivot_screen: egui::pos2(100.0, 100.0),
+            axis: 2,
+            angle_rad: 0.5,
+            prev_pos: egui::pos2(110.0, 100.0),
+            edge_tangent: egui::vec2(1.0, 0.0),
+            instances: vec![(id, orig)],
+        });
+        app.start_moving_layer(viewport::DragExclude::Instances(vec![id]));
+        let layer = app.current_moving_layer().expect("moving layer during rotate_drag");
+        assert_eq!(layer.transform, rotation_matrix_4x4_col_major(pivot, world_axis(2), 0.5));
+    }
+
+    #[test]
+    fn projection_toggle_and_default_view_axes() {
+        let mut app = NestCraftApp::new();
+        assert!(!app.is_orthographic());
+
+        // Default view looks from Front-Left (+X right, +Y far/away).
+        let (right, _, back) = app.camera.basis();
+        assert!(right.x > 0.0, "Default view should put +X to the right: right={right:?}");
+        assert!(back.y < 0.0, "Default view should put +Y far/away: back={back:?}");
+
+        let initial_hh = app.camera.half_height();
+        app.toggle_projection();
+        assert!(app.is_orthographic());
+        assert_eq!(app.camera.fov, 0.0);
+        assert!((app.camera.half_height() - initial_hh).abs() < 1e-6);
+
+        let reset_cam = app.default_camera_for_job();
+        assert_eq!(reset_cam.fov, 0.0);
+        assert!((reset_cam.yaw - std::f64::consts::FRAC_PI_4).abs() < 1e-9);
+
+        app.toggle_projection();
+        assert!(!app.is_orthographic());
+        assert!((app.camera.half_height() - initial_hh).abs() < 1e-6);
+    }

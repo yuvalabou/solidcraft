@@ -23,6 +23,7 @@ pub static NESTCRAFT_ICONS: IconSet = IconSet::extended(
             ("sls_zoom_platform", "box", ""),
             ("sls_zoom_all", "fit", ""),
             ("sls_zoom_selection", "zoom", ""),
+            ("sls_view_ortho", "iso_analysis", ""),
         ],
         icon_accents: &[],
     },
@@ -61,6 +62,7 @@ mod tests {
             "sls_zoom_platform",
             "sls_zoom_all",
             "sls_zoom_selection",
+            "sls_view_ortho",
         ] {
             let entry = NESTCRAFT_ICONS
                 .extension()

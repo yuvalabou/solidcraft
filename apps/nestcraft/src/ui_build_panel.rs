@@ -1,7 +1,6 @@
 //! Right sidebar: Build Summary, Build Chamber, and No-Build Zone.
 
 use crate::app::*;
-use crate::viewport;
 
 use nestcraft_core::model::BedOrigin;
 use solidcraft_theme::Tokens;
@@ -120,8 +119,7 @@ impl NestCraftApp {
                                 } else {
                                     BedOrigin::FrontLeft
                                 };
-                                self.camera =
-                                    viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
+                                self.camera = self.default_camera_for_job();
                                 self.mark_dirty();
                             }
                         });

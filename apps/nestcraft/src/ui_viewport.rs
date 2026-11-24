@@ -63,11 +63,48 @@ impl NestCraftApp {
                     || self.repair_badge_rect.is_some_and(|r| r.contains(p))
             });
 
+            if self.selected_set.is_empty() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.rotate_gizmo_open = false;
+            }
+            let z_only_gizmo = !self.selected_set.is_empty()
+                && self
+                    .job
+                    .instances
+                    .iter()
+                    .filter(|i| {
+                        self.selected_set.contains(&i.id)
+                            && !i.locked
+                            && i.constraint != RotationConstraint::Fixed
+                    })
+                    .all(|i| i.constraint == RotationConstraint::ZOnly);
+            let gizmo = if self.rotate_gizmo_open && self.align_face_target.is_none() && !self.zoom_rect_mode {
+                viewport::project_rotation_gizmo(&self.job, &self.selected_set, &self.camera, rect, z_only_gizmo)
+            } else {
+                None
+            };
             let centerpoints = viewport::selected_centerpoints(&self.job, &self.selected_set, &self.camera, rect);
             let rot_handle = viewport::selected_rotation_handle(&self.job, &self.selected_set, &self.camera, rect);
             let pointer_hover = resp.hover_pos().filter(|_| !over_compass && !over_view_bar && self.align_face_target.is_none() && !self.zoom_rect_mode);
             let hovered_rot = rot_handle.filter(|(p, _)| pointer_hover.is_some_and(|hp| hp.distance(*p) <= 12.0));
-            let hovered_center = if hovered_rot.is_none() {
+            let hovered_ring_axis: Option<usize> = if hovered_rot.is_none()
+                && let (Some(g), Some(hp)) = (&gizmo, pointer_hover)
+            {
+                g.rings
+                    .iter()
+                    .filter_map(|ring| {
+                        let min_d = ring
+                            .screen_points
+                            .windows(2)
+                            .map(|w| point_segment_distance(hp, w[0], w[1]))
+                            .fold(f32::INFINITY, f32::min);
+                        (min_d <= 8.0).then_some((ring.axis, min_d))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(axis, _)| axis)
+            } else {
+                None
+            };
+            let hovered_center = if hovered_rot.is_none() && hovered_ring_axis.is_none() {
                 centerpoints
                     .iter()
                     .find(|c| pointer_hover.is_some_and(|hp| hp.distance(c.screen_pos) <= 9.0))
@@ -77,7 +114,7 @@ impl NestCraftApp {
             };
             if self.drag_state.is_some() || self.rotate_drag.is_some() {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-            } else if hovered_rot.is_some() || hovered_center.is_some() {
+            } else if hovered_rot.is_some() || hovered_ring_axis.is_some() || hovered_center.is_some() {
                 ctx.set_cursor_icon(egui::CursorIcon::Grab);
             }
 
@@ -126,8 +163,8 @@ impl NestCraftApp {
                 && resp.drag_started_by(egui::PointerButton::Primary)
                 && let Some(pos) = resp.interact_pointer_pos()
             {
-                if let Some((_, pivot)) = hovered_rot {
-                    let rot_instances: Vec<(InstanceId, [[f32; 4]; 3], RotationConstraint)> = self
+                if let (Some(axis), Some(g)) = (hovered_ring_axis, &gizmo) {
+                    let rot_instances: Vec<(InstanceId, [[f32; 4]; 3])> = self
                         .job
                         .instances
                         .iter()
@@ -135,20 +172,48 @@ impl NestCraftApp {
                             self.selected_set.contains(&i.id)
                                 && !i.locked
                                 && i.constraint != RotationConstraint::Fixed
+                                && (i.constraint != RotationConstraint::ZOnly || axis == 2)
                         })
-                        .map(|i| (i.id, i.transform, i.constraint))
+                        .map(|i| (i.id, i.transform))
                         .collect();
                     if !rot_instances.is_empty() {
                         self.push_undo();
-                        let rot_ids: Vec<InstanceId> = rot_instances.iter().map(|(id, _, _)| *id).collect();
+                        let rot_ids: Vec<InstanceId> = rot_instances.iter().map(|(id, _)| *id).collect();
+                        let edge_tangent = g
+                            .rings
+                            .iter()
+                            .find(|r| r.axis == axis)
+                            .and_then(|r| {
+                                let mut best = None;
+                                let mut best_d = f32::INFINITY;
+                                for w in r.screen_points.windows(2) {
+                                    let mid = egui::pos2((w[0].x + w[1].x) * 0.5, (w[0].y + w[1].y) * 0.5);
+                                    let d = pos.distance(mid);
+                                    if d < best_d {
+                                        best_d = d;
+                                        let v = w[1] - w[0];
+                                        let len = v.length();
+                                        if len > 1e-4 {
+                                            best = Some(v / len);
+                                        }
+                                    }
+                                }
+                                best
+                            })
+                            .unwrap_or(egui::vec2(1.0, 0.0));
                         self.rotate_drag = Some(RotateDragState {
-                            pivot,
+                            pivot: g.pivot,
+                            pivot_screen: g.pivot_screen,
+                            axis,
+                            angle_rad: 0.0,
+                            prev_pos: pos,
+                            edge_tangent,
                             instances: rot_instances,
-                            accum_dx: 0.0,
-                            accum_dy: 0.0,
                         });
                         self.start_moving_layer(viewport::DragExclude::Instances(rot_ids));
                     }
+                } else if hovered_rot.is_some() {
+                    // Clicking the rotation toggle handle is handled on click, not drag.
                 } else if let Some(ch) = hovered_center {
                     self.start_instance_drag(ch.id, rect, pos, ch.world_pos);
                 } else {
@@ -193,47 +258,38 @@ impl NestCraftApp {
                 && let Some(pos) = resp.interact_pointer_pos()
             {
                 if let Some(rd) = &mut self.rotate_drag {
-                    let delta = resp.drag_delta();
-                    rd.accum_dx += delta.x;
-                    rd.accum_dy += delta.y;
-                    let (cam_right, cam_up, _) = self.camera.basis();
-                    let cr = cam_right.to_f32();
-                    let cu = cam_up.to_f32();
-                    let ctrl = ui.input(|i| i.modifiers.command);
-                    let alt = ui.input(|i| i.modifiers.alt);
-                    let sensitivity = 0.012_f32;
-                    let raw_vec = [
-                        cu[0] * rd.accum_dx + cr[0] * rd.accum_dy,
-                        cu[1] * rd.accum_dx + cr[1] * rd.accum_dy,
-                        cu[2] * rd.accum_dx + cr[2] * rd.accum_dy,
-                    ];
-                    let raw_mag = (raw_vec[0] * raw_vec[0] + raw_vec[1] * raw_vec[1] + raw_vec[2] * raw_vec[2]).sqrt();
-                    let mut angle = raw_mag * sensitivity;
-                    if alt {
-                        let step = 10.0_f32.to_radians();
-                        angle = (angle / step).round() * step;
-                    }
-                    let free_axis = if ctrl && raw_mag > 1e-6 {
-                        snap_to_nearest_axis(raw_vec)
+                    let w_axis = world_axis(rd.axis);
+                    let (_, _, cam_back) = self.camera.basis();
+                    let cb = cam_back.to_f32();
+                    let view_dot = cb[0] * w_axis[0] + cb[1] * w_axis[1] + cb[2] * w_axis[2];
+                    let d_angle = if view_dot.abs() < 0.15 {
+                        let delta = pos - rd.prev_pos;
+                        delta.dot(rd.edge_tangent) * 0.012
                     } else {
-                        raw_vec
-                    };
-                    let pivot = rd.pivot;
-                    for (id, orig, constraint) in &rd.instances {
-                        let (axis, inst_angle) = match constraint {
-                            RotationConstraint::ZOnly => {
-                                let mut za = rd.accum_dx * sensitivity;
-                                if alt {
-                                    let step = 10.0_f32.to_radians();
-                                    za = (za / step).round() * step;
-                                }
-                                ([0.0, 0.0, 1.0], za)
+                        let v0 = rd.prev_pos - rd.pivot_screen;
+                        let v1 = pos - rd.pivot_screen;
+                        if v0.length_sq() > 16.0 && v1.length_sq() > 16.0 {
+                            let a0 = v0.y.atan2(v0.x);
+                            let a1 = v1.y.atan2(v1.x);
+                            let mut da = a1 - a0;
+                            while da > std::f32::consts::PI {
+                                da -= std::f32::consts::TAU;
                             }
-                            RotationConstraint::Free => (free_axis, angle),
-                            RotationConstraint::Fixed => continue,
-                        };
+                            while da < -std::f32::consts::PI {
+                                da += std::f32::consts::TAU;
+                            }
+                            if view_dot > 0.0 { -da } else { da }
+                        } else {
+                            0.0
+                        }
+                    };
+                    rd.prev_pos = pos;
+                    rd.angle_rad += d_angle;
+                    let pivot = rd.pivot;
+                    let angle_rad = rd.angle_rad;
+                    for (id, orig) in &rd.instances {
                         if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == *id) {
-                            inst.transform = rotate_transform_around_pivot(*orig, pivot, axis, inst_angle);
+                            inst.transform = rotate_transform_around_pivot(*orig, pivot, w_axis, angle_rad);
                             self.euler_edit.remove(id);
                         }
                     }
@@ -378,6 +434,13 @@ impl NestCraftApp {
                         self.clear_align_face_mode();
                         self.status = "Aligned selected face to -Z".to_owned();
                     }
+                } else if hovered_rot.is_some() {
+                    self.rotate_gizmo_open = !self.rotate_gizmo_open;
+                    self.status = if self.rotate_gizmo_open {
+                        "Rotation gizmo opened (drag X/Y/Z ring, Esc or click handle to close)".to_owned()
+                    } else {
+                        "Rotation gizmo closed".to_owned()
+                    };
                 } else {
                     let hit = viewport::pick_instance(&self.job, &self.camera, rect, pos);
                     if ui.input(|i| i.modifiers.command) {
@@ -709,6 +772,48 @@ impl NestCraftApp {
                 );
             }
 
+            if let Some(g) = &gizmo {
+                let p = ui.painter_at(rect);
+                let axis_colors = [
+                    egui::Color32::from_rgb(0xE0, 0x52, 0x52), // X: red
+                    egui::Color32::from_rgb(0x4C, 0xAF, 0x50), // Y: green
+                    egui::Color32::from_rgb(0x4A, 0x90, 0xE2), // Z: blue
+                ];
+                let axis_names = ["X", "Y", "Z"];
+                for ring in &g.rings {
+                    let color = axis_colors[ring.axis.min(2)];
+                    let is_active = self.rotate_drag.as_ref().is_some_and(|rd| rd.axis == ring.axis)
+                        || hovered_ring_axis == Some(ring.axis);
+                    let stroke_w = if is_active { 3.2 } else { 1.8 };
+                    let stroke_col = if is_active { color } else { color.gamma_multiply(0.85) };
+                    if ring.screen_points.len() >= 2 {
+                        p.add(egui::Shape::line(
+                            ring.screen_points.clone(),
+                            egui::Stroke::new(stroke_w, stroke_col),
+                        ));
+                    }
+                    if let Some(tip) = ring.axis_tip {
+                        p.line_segment([g.pivot_screen, tip], egui::Stroke::new(1.5, color.gamma_multiply(0.8)));
+                        p.text(
+                            tip + egui::vec2(5.0, -5.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            axis_names[ring.axis.min(2)],
+                            egui::FontId::proportional(11.5),
+                            color,
+                        );
+                    }
+                }
+                if let Some(rd) = &self.rotate_drag {
+                    let label = format!("{:+.1}° {}", rd.angle_rad.to_degrees(), axis_names[rd.axis.min(2)]);
+                    let badge_pos = rd.pivot_screen + egui::vec2(0.0, -24.0);
+                    let galley = p.layout_no_wrap(label, egui::FontId::monospace(12.0), t.text);
+                    let badge_rect = egui::Rect::from_center_size(badge_pos, galley.size() + egui::vec2(12.0, 6.0));
+                    p.rect_filled(badge_rect, 4.0, t.panel.gamma_multiply(0.92));
+                    p.rect_stroke(badge_rect, 4.0, egui::Stroke::new(1.0, axis_colors[rd.axis.min(2)]), egui::StrokeKind::Inside);
+                    p.galley(badge_rect.min + egui::vec2(6.0, 3.0), galley, t.text);
+                }
+            }
+
             if !centerpoints.is_empty() || rot_handle.is_some() {
                 let p = ui.painter_at(rect);
                 for ch in &centerpoints {
@@ -724,7 +829,7 @@ impl NestCraftApp {
                     );
                 }
                 if let Some((rot_pos, _)) = rot_handle {
-                    let active = self.rotate_drag.is_some() || hovered_rot.is_some();
+                    let active = self.rotate_gizmo_open || self.rotate_drag.is_some() || hovered_rot.is_some();
                     let r = if active { 10.5 } else { 9.0 };
                     let bg = if active { t.accent } else { t.panel.gamma_multiply(0.92) };
                     let fg = if active { t.selected_ink } else { t.accent };
@@ -783,7 +888,7 @@ impl NestCraftApp {
                         self.camera = self.camera.looking_from(dir.into());
                     }
                     Some(ViewAction::Home) => {
-                        self.camera = viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
+                        self.camera = self.default_camera_for_job();
                     }
                     None => {}
                 }
@@ -904,4 +1009,15 @@ impl NestCraftApp {
             }
         });
     }
+}
+
+/// Shortest Euclidean distance from point `p` to 2D line segment `a`–`b`.
+fn point_segment_distance(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    let len_sq = ab.length_sq();
+    if len_sq <= 1e-6 {
+        return p.distance(a);
+    }
+    let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+    p.distance(a + ab * t)
 }

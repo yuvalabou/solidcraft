@@ -448,11 +448,12 @@ fn draw_free_floor_and_bed(
     scene.line([0.0, 0.0, 0.0], [0.0, 0.0, 25.0], axes[2], 2.2, false);
 }
 
-/// Create a default isometric camera framed around `machine` and `origin`.
+/// Create a default isometric camera framed around `machine` and `origin` (+X right, +Y far).
 pub fn default_camera_with_origin(machine: &MachineProfile, origin: BedOrigin) -> Camera {
     let [w, d, h] = machine.size_mm();
     let diag = (w * w + d * d + h * h).sqrt();
-    let (yaw, pitch) = StandardView::Iso.angles();
+    let (_, pitch) = StandardView::Iso.angles();
+    let yaw = std::f64::consts::FRAC_PI_4;
     let (tx, ty) = match origin {
         BedOrigin::FrontLeft => (f64::from(w) * 0.5, f64::from(d) * 0.5),
         BedOrigin::Center => (0.0, 0.0),
@@ -871,6 +872,123 @@ pub fn selected_rotation_handle(
     )?;
     let screen_pos = egui::pos2(rect.left() + px as f32, rect.top() + py as f32);
     rect.contains(screen_pos).then_some((screen_pos, pivot))
+}
+
+/// Projected 3D world-axis ring for the interactive rotation gizmo.
+#[derive(Debug, Clone)]
+pub struct RotationGizmoRing {
+    pub axis: usize,
+    pub screen_points: Vec<egui::Pos2>,
+    pub axis_tip: Option<egui::Pos2>,
+}
+
+/// Projected world-axis rotation gizmo centered on the combined bounds of visible selected instances.
+#[derive(Debug, Clone)]
+pub struct RotationGizmo {
+    pub pivot: [f32; 3],
+    pub pivot_screen: egui::Pos2,
+    pub rings: Vec<RotationGizmoRing>,
+}
+
+/// Project 3D world-axis rotation rings (`X`, `Y`, `Z`, or `Z` only when `z_only` is true)
+/// centered on the combined bounding box of visible selected instances.
+pub fn project_rotation_gizmo(
+    job: &BuildJob,
+    selected: &HashSet<InstanceId>,
+    cam: &Camera,
+    rect: egui::Rect,
+    z_only: bool,
+) -> Option<RotationGizmo> {
+    if selected.is_empty() {
+        return None;
+    }
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    let mut any = false;
+    for inst in &job.instances {
+        if !selected.contains(&inst.id) || !job.is_instance_visible(inst) {
+            continue;
+        }
+        let Some(proto) = job.part(inst.part_id) else {
+            continue;
+        };
+        let wb = inst.world_bounds(proto.mesh.bounds);
+        for k in 0..3 {
+            lo[k] = lo[k].min(wb[0][k]);
+            hi[k] = hi[k].max(wb[1][k]);
+        }
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    let pivot = [
+        (lo[0] + hi[0]) * 0.5,
+        (lo[1] + hi[1]) * 0.5,
+        (lo[2] + hi[2]) * 0.5,
+    ];
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    let gizmo_r = (diag * 0.65).clamp(18.0, 220.0);
+
+    let w = f64::from(rect.width().max(1.0));
+    let h = f64::from(rect.height().max(1.0));
+    let [mw, md, mh] = job.machine.size_mm();
+    let radius = f64::from((mw * mw + md * md + mh * mh).sqrt()) * 2.0;
+
+    let project_pt = |pt: [f32; 3]| -> Option<egui::Pos2> {
+        let (px, py, _) = cam.to_screen(
+            [f64::from(pt[0]), f64::from(pt[1]), f64::from(pt[2])].into(),
+            w,
+            h,
+            radius,
+        )?;
+        Some(egui::pos2(rect.left() + px as f32, rect.top() + py as f32))
+    };
+
+    let pivot_screen = project_pt(pivot)?;
+    let axes: &[(usize, [f32; 3], [f32; 3], [f32; 3])] = if z_only {
+        &[(2, [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0])]
+    } else {
+        &[
+            (0, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+            (1, [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]),
+            (2, [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+        ]
+    };
+
+    const SEGMENTS: usize = 48;
+    let mut rings = Vec::with_capacity(axes.len());
+    for &(axis, dir, u, v) in axes {
+        let mut screen_points = Vec::with_capacity(SEGMENTS + 1);
+        for i in 0..=SEGMENTS {
+            let a = (i as f32 / SEGMENTS as f32) * std::f32::consts::TAU;
+            let (s, c) = a.sin_cos();
+            let pt = [
+                pivot[0] + gizmo_r * (c * u[0] + s * v[0]),
+                pivot[1] + gizmo_r * (c * u[1] + s * v[1]),
+                pivot[2] + gizmo_r * (c * u[2] + s * v[2]),
+            ];
+            if let Some(sp) = project_pt(pt) {
+                screen_points.push(sp);
+            }
+        }
+        let tip = [
+            pivot[0] + dir[0] * gizmo_r * 1.18,
+            pivot[1] + dir[1] * gizmo_r * 1.18,
+            pivot[2] + dir[2] * gizmo_r * 1.18,
+        ];
+        rings.push(RotationGizmoRing {
+            axis,
+            screen_points,
+            axis_tip: project_pt(tip),
+        });
+    }
+
+    Some(RotationGizmo {
+        pivot,
+        pivot_screen,
+        rings,
+    })
 }
 
 fn inverse_transform_ray(
