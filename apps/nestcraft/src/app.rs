@@ -1,0 +1,2456 @@
+//! NestCraft application state, I/O, and part-manipulation logic.
+
+use crate::viewport;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
+
+use nestcraft_core::io::threemf::ThreeMfLoadedItem;
+use nestcraft_core::io::{nestc, stl, threemf};
+use nestcraft_core::manifold::{self, ManifoldReport};
+use nestcraft_core::model::{
+    BedOrigin, BuildJob, GroupId, IDENTITY_TRANSFORM, InstanceId, MachineProfile, NoBuildZone, PartId,
+    RotationConstraint, TriMesh,
+};
+use nestcraft_core::sinterbox::{self, CageShape, LabelPanel, SinterboxConfig};
+use serde::{Deserialize, Serialize};
+use solidcraft_theme::Tokens;
+use solidcraft_ui_kit::view_compass::Drag as CompassDrag;
+use solidcraft_viewport::{Camera, StandardView};
+use solidcraft_viewport_gpu::view::{GpuScene, MovingLayer, SceneSlot, SharedTris};
+
+pub(crate) struct DragState {
+    pub(crate) anchor_id: InstanceId,
+    pub(crate) instances: Vec<(InstanceId, [f32; 3])>,
+    pub(crate) start_hit: [f32; 3],
+    pub(crate) plane_z: f32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RotateDragState {
+    pub(crate) pivot: [f32; 3],
+    pub(crate) instances: Vec<(InstanceId, [[f32; 4]; 3], RotationConstraint)>,
+    pub(crate) accum_dx: f32,
+    pub(crate) accum_dy: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DragZoneState {
+    pub(crate) start_position: [f32; 3],
+    pub(crate) start_hit: [f32; 3],
+    pub(crate) plane_z: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BoxSelectState {
+    pub(crate) start: egui::Pos2,
+    pub(crate) current: egui::Pos2,
+    pub(crate) additive: bool,
+}
+
+pub(crate) enum ImportedKind {
+    Stl(Arc<TriMesh>, Arc<SharedTris>),
+    ThreeMf(Vec<(ThreeMfLoadedItem, Arc<SharedTris>)>),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum KeepOrDeleteAction {
+    SplitShells(Vec<InstanceId>),
+    MergeSelected(Vec<InstanceId>),
+}
+
+pub(crate) enum BackgroundLoadOutcome {
+    Imported {
+        name: String,
+        kind: ImportedKind,
+    },
+    OpenedBed {
+        job: BuildJob,
+        path_display: String,
+    },
+    Failed(String),
+}
+
+pub(crate) struct LoadProgressMsg {
+    pub(crate) completed: usize,
+    pub(crate) total: usize,
+    pub(crate) current_label: String,
+    pub(crate) outcome: Option<BackgroundLoadOutcome>,
+}
+
+pub(crate) struct ActiveLoadTask {
+    pub(crate) rx: Receiver<LoadProgressMsg>,
+    pub(crate) completed: usize,
+    pub(crate) total: usize,
+    pub(crate) current_label: String,
+    pub(crate) imported_files: usize,
+    pub(crate) imported_items: usize,
+    pub(crate) below_zero_instances: Vec<(InstanceId, f32)>,
+    pub(crate) pushed_undo: bool,
+    pub(crate) errors: Vec<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct UndoSnapshot {
+    pub(crate) job: BuildJob,
+    pub(crate) selected: Option<InstanceId>,
+    pub(crate) selected_set: HashSet<InstanceId>,
+    pub(crate) selection_anchor: Option<InstanceId>,
+}
+
+pub(crate) fn load_single_file_outcome(path: &Path) -> BackgroundLoadOutcome {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return BackgroundLoadOutcome::Failed(format!("Failed to read {}: {e}", path.display())),
+    };
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if ext == "nestc" {
+        match nestc::read_nestc(&bytes) {
+            Ok(job) => BackgroundLoadOutcome::OpenedBed {
+                job,
+                path_display: path.display().to_string(),
+            },
+            Err(e) => BackgroundLoadOutcome::Failed(format!("Open bed error: {e}")),
+        }
+    } else if ext == "3mf" {
+        match threemf::read_threemf(&bytes) {
+            Ok(items) => {
+                let prepared = items
+                    .into_iter()
+                    .map(|item| {
+                        let tris = viewport::mesh_to_shared_tris(&item.mesh);
+                        (item, tris)
+                    })
+                    .collect();
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("file")
+                    .to_owned();
+                BackgroundLoadOutcome::Imported {
+                    name,
+                    kind: ImportedKind::ThreeMf(prepared),
+                }
+            }
+            Err(e) => BackgroundLoadOutcome::Failed(format!("3MF import error: {e}")),
+        }
+    } else if ext == "stl" {
+        match stl::parse_stl(&bytes) {
+            Ok(mesh) => {
+                let mesh = Arc::new(mesh);
+                let tris = viewport::mesh_to_shared_tris(&mesh);
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("part")
+                    .to_owned();
+                BackgroundLoadOutcome::Imported {
+                    name: stem,
+                    kind: ImportedKind::Stl(mesh, tris),
+                }
+            }
+            Err(e) => BackgroundLoadOutcome::Failed(format!("STL import error: {e}")),
+        }
+    } else {
+        BackgroundLoadOutcome::Failed(format!(
+            "Unsupported file '{}' (expected .stl, .3mf, or .nestc)",
+            path.display()
+        ))
+    }
+}
+
+pub(crate) struct NestCraftApp {
+    pub(crate) job: BuildJob,
+    pub(crate) selected: Option<InstanceId>,
+    pub(crate) selected_set: HashSet<InstanceId>,
+    pub(crate) selection_anchor: Option<InstanceId>,
+    pub(crate) camera: Camera,
+    pub(crate) scene_cache: viewport::SceneCache,
+    pub(crate) scene_slot: SceneSlot,
+    pub(crate) moving_slot: SceneSlot,
+    pub(crate) hl_slot: SceneSlot,
+    pub(crate) empty_slot: SceneSlot,
+    pub(crate) scene_key: u64,
+    pub(crate) hl_key: u64,
+    pub(crate) moving_key: u64,
+    pub(crate) moving_target: Option<viewport::DragExclude>,
+    pub(crate) align_face_target: Option<InstanceId>,
+    pub(crate) hovered_face: Option<(InstanceId, usize)>,
+    pub(crate) scene_dirty: bool,
+    pub(crate) status: String,
+    pub(crate) euler_edit: HashMap<InstanceId, [f32; 3]>,
+    pub(crate) dup_dialog_open: bool,
+    pub(crate) dup_axes: [bool; 3],
+    pub(crate) dup_counts: [usize; 3],
+    pub(crate) dup_total: usize,
+    pub(crate) dup_exact_total: bool,
+    pub(crate) dup_gap_mm: [f32; 3],
+    pub(crate) move_dialog_open: bool,
+    pub(crate) move_mode_idx: usize,
+    pub(crate) move_xyz: [f32; 3],
+    pub(crate) scale_dialog_open: bool,
+    pub(crate) scale_uniform: bool,
+    pub(crate) scale_keep_open: bool,
+    pub(crate) scale_mode_idx: usize,
+    pub(crate) scale_pct: [f32; 3],
+    pub(crate) scale_abs_mm: [f32; 3],
+    pub(crate) scale_factor: [f32; 3],
+    pub(crate) scale_base_dims: [f32; 3],
+    pub(crate) scale_initial_dims: [f32; 3],
+    pub(crate) scale_initial_snapshot: Option<UndoSnapshot>,
+    pub(crate) scale_applied_in_session: usize,
+    pub(crate) sinterbox_dialog_open: bool,
+    pub(crate) sinterbox_shape_idx: usize,
+    pub(crate) sinterbox_inner_clearance: f32,
+    pub(crate) sinterbox_window_mm: f32,
+    pub(crate) sinterbox_window_auto: bool,
+    pub(crate) sinterbox_bar_mm: f32,
+    pub(crate) sinterbox_bar_auto: bool,
+    pub(crate) sinterbox_label_enabled: bool,
+    pub(crate) sinterbox_label_text: String,
+    pub(crate) sinterbox_label_panel_idx: usize,
+    pub(crate) sinterbox_label_depth: f32,
+    pub(crate) sinterbox_group_name: String,
+    pub(crate) sinterbox_group_name_edited: bool,
+    pub(crate) sinterbox_transparent: bool,
+    pub(crate) sinterbox_single_copies: usize,
+    pub(crate) sinterbox_single_gap: f32,
+    pub(crate) color_picker_open: bool,
+    pub(crate) color_picker_rgb: [u8; 3],
+    pub(crate) color_picker_undo_pushed: bool,
+    pub(crate) pending_keep_delete: Option<KeepOrDeleteAction>,
+    pub(crate) export_stl_dialog_open: bool,
+    pub(crate) export_stl_selected_only: bool,
+    pub(crate) export_stl_prefix: String,
+    pub(crate) export_stl_suffix: String,
+    pub(crate) export_stl_include_id: bool,
+    pub(crate) export_stl_apply_transform: bool,
+    pub(crate) drag_state: Option<DragState>,
+    pub(crate) rotate_drag: Option<RotateDragState>,
+    pub(crate) drag_zone: Option<DragZoneState>,
+    pub(crate) box_select: Option<BoxSelectState>,
+    pub(crate) zoom_rect_mode: bool,
+    pub(crate) zoom_rect: Option<(egui::Pos2, egui::Pos2)>,
+    pub(crate) viewport_aspect: f64,
+    pub(crate) load_task: Option<ActiveLoadTask>,
+    pub(crate) below_zero_import_dialog: Vec<(InstanceId, f32)>,
+    pub(crate) undo_stack: Vec<UndoSnapshot>,
+    pub(crate) redo_stack: Vec<UndoSnapshot>,
+    pub(crate) viewport_ctx_menu: Option<InstanceId>,
+    pub(crate) compass_drag: CompassDrag,
+    pub(crate) sample_counter: u32,
+    pub(crate) manifold_cache: HashMap<PartId, ManifoldReport>,
+    pub(crate) part_thumbs: HashMap<PartId, egui::TextureHandle>,
+    pub(crate) expanded_parts: HashSet<PartId>,
+    pub(crate) active_machine_slot: usize,
+    pub(crate) machine_presets: [MachinePresetConfig; 3],
+    pub(crate) custom_platform_open: bool,
+    pub(crate) custom_name: String,
+    pub(crate) custom_size_mm: [f32; 3],
+    pub(crate) custom_wall_margin: f32,
+    pub(crate) custom_min_z: f32,
+    pub(crate) custom_clearance: f32,
+    pub(crate) custom_bed_origin: BedOrigin,
+    pub(crate) new_group_name: String,
+    pub(crate) view_bar_rect: Option<egui::Rect>,
+    pub(crate) repair_badge_rect: Option<egui::Rect>,
+}
+
+pub(crate) fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct NoBuildZoneConfig {
+    pub(crate) name: String,
+    pub(crate) position: [f32; 3],
+    pub(crate) rotation_deg: [f32; 3],
+    pub(crate) clearance_mm: f32,
+    pub(crate) enabled: bool,
+    pub(crate) visible: bool,
+    #[serde(default = "default_true")]
+    pub(crate) locked: bool,
+}
+
+impl From<&NoBuildZone> for NoBuildZoneConfig {
+    fn from(z: &NoBuildZone) -> Self {
+        Self {
+            name: z.name.clone(),
+            position: z.position,
+            rotation_deg: z.rotation_deg,
+            clearance_mm: z.clearance_mm,
+            enabled: z.enabled,
+            visible: z.visible,
+            locked: z.locked,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub(crate) enum BedOriginCfg {
+    #[default]
+    FrontLeft,
+    Center,
+}
+
+impl From<BedOrigin> for BedOriginCfg {
+    fn from(o: BedOrigin) -> Self {
+        match o {
+            BedOrigin::FrontLeft => Self::FrontLeft,
+            BedOrigin::Center => Self::Center,
+        }
+    }
+}
+
+impl From<BedOriginCfg> for BedOrigin {
+    fn from(o: BedOriginCfg) -> Self {
+        match o {
+            BedOriginCfg::FrontLeft => Self::FrontLeft,
+            BedOriginCfg::Center => Self::Center,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct MachinePresetConfig {
+    pub(crate) name: String,
+    pub(crate) size_mm: [f32; 3],
+    pub(crate) wall_margin_mm: f32,
+    pub(crate) min_z_mm: f32,
+    pub(crate) clearance_mm: f32,
+    #[serde(default)]
+    pub(crate) bed_origin: BedOriginCfg,
+}
+
+pub(crate) fn default_machine_presets() -> [MachinePresetConfig; 3] {
+    [
+        MachinePresetConfig {
+            name: "EOS Formiga P110".to_owned(),
+            size_mm: MachineProfile::FormigaP110.size_mm(),
+            wall_margin_mm: 5.0,
+            min_z_mm: 0.0,
+            clearance_mm: 2.5,
+            bed_origin: BedOriginCfg::FrontLeft,
+        },
+        MachinePresetConfig {
+            name: "Farsoon HT403P".to_owned(),
+            size_mm: MachineProfile::FarsoonHT403P.size_mm(),
+            wall_margin_mm: 5.0,
+            min_z_mm: 0.0,
+            clearance_mm: 2.5,
+            bed_origin: BedOriginCfg::Center,
+        },
+        MachinePresetConfig {
+            name: "Custom SLS".to_owned(),
+            size_mm: [250.0, 250.0, 300.0],
+            wall_margin_mm: 5.0,
+            min_z_mm: 0.0,
+            clearance_mm: 2.5,
+            bed_origin: BedOriginCfg::FrontLeft,
+        },
+    ]
+}
+
+pub(crate) fn nestcraft_data_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("APPDATA"));
+    #[cfg(not(target_os = "windows"))]
+    let base = std::env::var_os("XDG_DATA_HOME").or_else(|| {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share").into_os_string())
+    });
+    base.map(|b| PathBuf::from(b).join("NestCraft"))
+}
+
+pub(crate) fn save_machine_presets_to_dir(dir: &Path, presets: &[MachinePresetConfig; 3]) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
+    let json = serde_json::to_string_pretty(presets).map_err(|e| format!("Serialize error: {e}"))?;
+    std::fs::write(dir.join("machines.json"), json)
+        .map_err(|e| format!("Failed to write machines.json: {e}"))
+}
+
+pub(crate) fn load_machine_presets_from_dir(dir: &Path) -> Option<[MachinePresetConfig; 3]> {
+    let bytes = std::fs::read(dir.join("machines.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+pub(crate) fn no_build_zone_dir_for_slot(slot: usize) -> Option<PathBuf> {
+    nestcraft_data_dir().map(|d| d.join("no_build_zone").join(format!("slot_{}", slot.min(2))))
+}
+
+pub(crate) fn sanitize_ascii_filename_part(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii())
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' })
+        .collect()
+}
+
+pub(crate) fn export_part_menu_label(selected_count: usize) -> &'static str {
+    if selected_count > 1 {
+        "Export Parts..."
+    } else {
+        "Export Part..."
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ColorMenuChoice {
+    OpenPicker,
+    Set(Option<[u8; 3]>),
+}
+
+pub(crate) fn show_color_submenu(ui: &mut egui::Ui) -> Option<ColorMenuChoice> {
+    const PRESETS: &[(&str, [u8; 3])] = &[
+        ("Red", [224, 72, 72]),
+        ("Orange", [235, 140, 52]),
+        ("Yellow", [235, 200, 56]),
+        ("Green", [72, 188, 108]),
+        ("Cyan", [56, 188, 212]),
+        ("Blue", [72, 136, 236]),
+        ("Purple", [168, 104, 232]),
+        ("White", [232, 234, 238]),
+    ];
+    let mut choice = None;
+    ui.menu_button("Color", |ui| {
+        if ui.button("Color Picker...").clicked() {
+            choice = Some(ColorMenuChoice::OpenPicker);
+            ui.close();
+        }
+        ui.separator();
+        for &(label, rgb) in PRESETS {
+            let swatch = egui::RichText::new("■").color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+            ui.horizontal(|ui| {
+                ui.label(swatch);
+                if ui.button(label).clicked() {
+                    choice = Some(ColorMenuChoice::Set(Some(rgb)));
+                    ui.close();
+                }
+            });
+        }
+        ui.separator();
+        if ui.button("Reset Default").clicked() {
+            choice = Some(ColorMenuChoice::Set(None));
+            ui.close();
+        }
+    });
+    choice
+}
+
+pub(crate) const THUMB_PX: usize = 20;
+
+pub(crate) fn render_part_thumbnail(mesh: &TriMesh) -> egui::ColorImage {
+    let mut rgba = vec![0_u8; THUMB_PX * THUMB_PX * 4];
+    if mesh.positions.is_empty() || mesh.indices.is_empty() {
+        return egui::ColorImage::from_rgba_unmultiplied([THUMB_PX, THUMB_PX], &rgba);
+    }
+    let right = [0.707_106_77_f32, -0.707_106_77, 0.0];
+    let up = [-0.408_248_3_f32, -0.408_248_3, 0.816_496_6];
+    let fwd = [0.577_350_26_f32, 0.577_350_26, 0.577_350_26];
+    let light = [0.35_f32, -0.25, 0.90];
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+    let mut min_u = f32::INFINITY;
+    let mut max_u = f32::NEG_INFINITY;
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    let p_step = (mesh.positions.len() / 2000).max(1);
+    for p in mesh.positions.iter().step_by(p_step) {
+        let u = dot(*p, right);
+        let v = dot(*p, up);
+        min_u = min_u.min(u);
+        max_u = max_u.max(u);
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+    }
+    let span = (max_u - min_u).max(max_v - min_v).max(1e-4);
+    let pad = 1.5_f32;
+    let usable = THUMB_PX as f32 - 2.0 * pad;
+    let scale = usable / span;
+    let cx = (min_u + max_u) * 0.5;
+    let cy = (min_v + max_v) * 0.5;
+    let half = THUMB_PX as f32 * 0.5;
+    let project = |p: [f32; 3]| -> [f32; 3] {
+        [
+            half + (dot(p, right) - cx) * scale,
+            half - (dot(p, up) - cy) * scale,
+            dot(p, fwd),
+        ]
+    };
+
+    let mut zbuf = [f32::NEG_INFINITY; THUMB_PX * THUMB_PX];
+    let t_step = (mesh.indices.len() / 500).max(1);
+    for (tri_i, tri) in mesh.indices.iter().enumerate().step_by(t_step) {
+        let Some(&p0) = mesh.positions.get(tri[0] as usize) else { continue };
+        let Some(&p1) = mesh.positions.get(tri[1] as usize) else { continue };
+        let Some(&p2) = mesh.positions.get(tri[2] as usize) else { continue };
+        let a = project(p0);
+        let b = project(p1);
+        let c = project(p2);
+        let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        if area.abs() < 1e-4 {
+            continue;
+        }
+        let inv_area = 1.0 / area;
+        let n = mesh.tri_normals.get(tri_i).copied().unwrap_or([0.0, 0.0, 1.0]);
+        let shade = (0.38 + 0.62 * dot(n, light).abs()).clamp(0.0, 1.0);
+        let lum = (shade * 255.0).round() as u8;
+
+        let x0 = (a[0].min(b[0]).min(c[0]).floor() as isize).clamp(0, THUMB_PX as isize - 1) as usize;
+        let x1 = (a[0].max(b[0]).max(c[0]).ceil() as isize).clamp(0, THUMB_PX as isize - 1) as usize;
+        let y0 = (a[1].min(b[1]).min(c[1]).floor() as isize).clamp(0, THUMB_PX as isize - 1) as usize;
+        let y1 = (a[1].max(b[1]).max(c[1]).ceil() as isize).clamp(0, THUMB_PX as isize - 1) as usize;
+        for py in y0..=y1 {
+            let fy = py as f32 + 0.5;
+            for px in x0..=x1 {
+                let fx = px as f32 + 0.5;
+                let w0 = ((b[0] - fx) * (c[1] - fy) - (b[1] - fy) * (c[0] - fx)) * inv_area;
+                let w1 = ((c[0] - fx) * (a[1] - fy) - (c[1] - fy) * (a[0] - fx)) * inv_area;
+                let w2 = 1.0 - w0 - w1;
+                if w0 >= -1e-3 && w1 >= -1e-3 && w2 >= -1e-3 {
+                    let z = w0 * a[2] + w1 * b[2] + w2 * c[2];
+                    let idx = py * THUMB_PX + px;
+                    if z > zbuf[idx] {
+                        zbuf[idx] = z;
+                        let off = idx * 4;
+                        rgba[off] = lum;
+                        rgba[off + 1] = lum;
+                        rgba[off + 2] = lum;
+                        rgba[off + 3] = 255;
+                    }
+                }
+            }
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([THUMB_PX, THUMB_PX], &rgba)
+}
+
+pub(crate) fn format_export_stl_stem(
+    prefix: &str,
+    part_name: &str,
+    instance_id: u32,
+    include_id: bool,
+    suffix: &str,
+) -> String {
+    let clean_prefix = sanitize_ascii_filename_part(prefix);
+    let clean_suffix = sanitize_ascii_filename_part(suffix);
+    let clean_name = sanitize_ascii_filename_part(part_name);
+    let base = if include_id {
+        format!("{clean_prefix}{clean_name}_{instance_id}{clean_suffix}")
+    } else {
+        format!("{clean_prefix}{clean_name}{clean_suffix}")
+    };
+    if base.is_empty() {
+        format!("part_{instance_id}")
+    } else {
+        base
+    }
+}
+
+pub(crate) fn save_no_build_zone_config_to_dir(dir: &Path, zone: &NoBuildZone) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
+    let cfg = NoBuildZoneConfig::from(zone);
+    let json = serde_json::to_string_pretty(&cfg).map_err(|e| format!("Serialize error: {e}"))?;
+    std::fs::write(dir.join("config.json"), json)
+        .map_err(|e| format!("Failed to write no-build zone config: {e}"))
+}
+
+pub(crate) fn load_no_build_zone_from_dir(dir: &Path) -> Option<NoBuildZone> {
+    let stl_bytes = std::fs::read(dir.join("zone.stl")).ok()?;
+    let mesh = stl::parse_stl(&stl_bytes).ok()?;
+    let cfg_bytes = std::fs::read(dir.join("config.json")).ok()?;
+    let cfg: NoBuildZoneConfig = serde_json::from_slice(&cfg_bytes).ok()?;
+    Some(NoBuildZone {
+        name: cfg.name,
+        mesh: Arc::new(mesh),
+        position: cfg.position,
+        rotation_deg: cfg.rotation_deg,
+        clearance_mm: cfg.clearance_mm,
+        enabled: cfg.enabled,
+        visible: cfg.visible,
+        locked: cfg.locked,
+    })
+}
+
+pub(crate) const VIEW_CYCLE: [StandardView; 7] = [
+    StandardView::Iso,
+    StandardView::Top,
+    StandardView::Bottom,
+    StandardView::Front,
+    StandardView::Back,
+    StandardView::Right,
+    StandardView::Left,
+];
+
+pub(crate) fn view_label(view: StandardView) -> &'static str {
+    match view {
+        StandardView::Iso => "Iso",
+        StandardView::Top => "Top",
+        StandardView::Bottom => "Bottom",
+        StandardView::Front => "Front",
+        StandardView::Back => "Back",
+        StandardView::Right => "Right",
+        StandardView::Left => "Left",
+    }
+}
+
+pub(crate) fn distribute_compact_grid(total: usize, enabled: [bool; 3]) -> [usize; 3] {
+    let total = total.max(1);
+    let active: Vec<usize> = (0..3).filter(|&k| enabled[k]).collect();
+    let mut out = [1usize; 3];
+    match active.as_slice() {
+        [] => out[0] = total,
+        &[a] => out[a] = total,
+        &[a, b] => {
+            let mut best = (total, 1usize, total, total - 1);
+            let limit = (total as f64).sqrt().ceil() as usize + 1;
+            for x in 1..=limit {
+                let y = total.div_ceil(x);
+                let prod = x * y;
+                let spread = x.abs_diff(y);
+                let score = (prod, spread);
+                if score < (best.2, best.3) {
+                    best = (x.max(y), x.min(y), prod, spread);
+                }
+            }
+            out[a] = best.0;
+            out[b] = best.1;
+        }
+        _ => {
+            let mut best = (total, 1usize, 1usize, total, total - 1);
+            let limit = (total as f64).cbrt().ceil() as usize + 2;
+            for z in 1..=limit {
+                let rem = total.div_ceil(z);
+                let y_lim = (rem as f64).sqrt().ceil() as usize + 1;
+                for y in 1..=y_lim {
+                    let x = total.div_ceil(y * z);
+                    let prod = x * y * z;
+                    let max_d = x.max(y).max(z);
+                    let min_d = x.min(y).min(z);
+                    let spread = max_d - min_d;
+                    if (prod, spread) < (best.3, best.4) {
+                        let mut dims = [x, y, z];
+                        dims.sort_unstable_by(|a, b| b.cmp(a));
+                        best = (dims[0], dims[1], dims[2], prod, spread);
+                    }
+                }
+            }
+            out = [best.0, best.1, best.2];
+        }
+    }
+    out
+}
+
+
+impl NestCraftApp {
+    pub(crate) fn new() -> Self {
+        let machine_presets = nestcraft_data_dir()
+            .and_then(|d| load_machine_presets_from_dir(&d))
+            .unwrap_or_else(default_machine_presets);
+        let p0 = &machine_presets[0];
+        let mut job = BuildJob::new(MachineProfile::custom(&p0.name, p0.size_mm));
+        job.wall_margin_mm = p0.wall_margin_mm;
+        job.min_z_mm = p0.min_z_mm;
+        job.clearance_mm = p0.clearance_mm;
+        job.bed_origin = p0.bed_origin.into();
+        if let Some(dir) = no_build_zone_dir_for_slot(0) {
+            job.no_build_zone = load_no_build_zone_from_dir(&dir);
+        }
+        let camera = viewport::default_camera_with_origin(&job.machine, job.bed_origin);
+        let custom_name = p0.name.clone();
+        let custom_size_mm = job.machine.size_mm();
+        let custom_wall_margin = job.wall_margin_mm;
+        let custom_min_z = job.min_z_mm;
+        let custom_clearance = job.clearance_mm;
+        let custom_bed_origin = job.bed_origin;
+        Self {
+            job,
+            selected: None,
+            selected_set: HashSet::new(),
+            selection_anchor: None,
+            camera,
+            scene_cache: viewport::SceneCache::default(),
+            scene_slot: Arc::new(Mutex::new(None)),
+            moving_slot: Arc::new(Mutex::new(None)),
+            hl_slot: Arc::new(Mutex::new(None)),
+            empty_slot: Arc::new(Mutex::new(None)),
+            scene_key: 1,
+            hl_key: 0,
+            moving_key: 1,
+            moving_target: None,
+            align_face_target: None,
+            hovered_face: None,
+            scene_dirty: true,
+            status: "Ready — import an STL/3MF or add a sample part.".to_owned(),
+            euler_edit: HashMap::new(),
+            dup_dialog_open: false,
+            dup_axes: [true, true, false],
+            dup_counts: [2, 1, 1],
+            dup_total: 2,
+            dup_exact_total: false,
+            dup_gap_mm: [custom_clearance; 3],
+            move_dialog_open: false,
+            move_mode_idx: 0,
+            move_xyz: [0.0, 0.0, 0.0],
+            scale_dialog_open: false,
+            scale_uniform: true,
+            scale_keep_open: false,
+            scale_mode_idx: 0,
+            scale_pct: [100.0, 100.0, 100.0],
+            scale_abs_mm: [10.0, 10.0, 10.0],
+            scale_factor: [1.0, 1.0, 1.0],
+            scale_base_dims: [10.0, 10.0, 10.0],
+            scale_initial_dims: [10.0, 10.0, 10.0],
+            scale_initial_snapshot: None,
+            scale_applied_in_session: 0,
+            sinterbox_dialog_open: false,
+            sinterbox_shape_idx: 0,
+            sinterbox_inner_clearance: custom_clearance,
+            sinterbox_window_mm: 4.0,
+            sinterbox_window_auto: true,
+            sinterbox_bar_mm: 0.80,
+            sinterbox_bar_auto: true,
+            sinterbox_label_enabled: true,
+            sinterbox_label_text: String::new(),
+            sinterbox_label_panel_idx: 0,
+            sinterbox_label_depth: 0.8,
+            sinterbox_group_name: String::new(),
+            sinterbox_group_name_edited: false,
+            sinterbox_transparent: true,
+            sinterbox_single_copies: 1,
+            sinterbox_single_gap: custom_clearance,
+            color_picker_open: false,
+            color_picker_rgb: [220, 220, 220],
+            color_picker_undo_pushed: false,
+            pending_keep_delete: None,
+            export_stl_dialog_open: false,
+            export_stl_selected_only: false,
+            export_stl_prefix: String::new(),
+            export_stl_suffix: String::new(),
+            export_stl_include_id: true,
+            export_stl_apply_transform: true,
+            drag_state: None,
+            rotate_drag: None,
+            drag_zone: None,
+            box_select: None,
+            zoom_rect_mode: false,
+            zoom_rect: None,
+            viewport_aspect: 16.0 / 9.0,
+            load_task: None,
+            below_zero_import_dialog: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            viewport_ctx_menu: None,
+            compass_drag: CompassDrag::default(),
+            sample_counter: 0,
+            manifold_cache: HashMap::new(),
+            part_thumbs: HashMap::new(),
+            expanded_parts: HashSet::new(),
+            active_machine_slot: 0,
+            machine_presets,
+            custom_platform_open: false,
+            custom_name,
+            custom_size_mm,
+            custom_wall_margin,
+            custom_min_z,
+            custom_clearance,
+            custom_bed_origin,
+            new_group_name: String::new(),
+            view_bar_rect: None,
+            repair_badge_rect: None,
+        }
+    }
+
+    pub(crate) fn manifold_report(&mut self, part_id: PartId) -> Option<ManifoldReport> {
+        if let Some(report) = self.manifold_cache.get(&part_id) {
+            return Some(report.clone());
+        }
+        let mesh = self.job.part(part_id)?.mesh.clone();
+        let report = manifold::analyze_mesh(&mesh);
+        self.manifold_cache.insert(part_id, report.clone());
+        Some(report)
+    }
+
+    pub(crate) fn faulty_placed_instance_ids(&mut self) -> Vec<InstanceId> {
+        let pairs: Vec<(InstanceId, PartId)> = self.job.instances.iter().map(|i| (i.id, i.part_id)).collect();
+        pairs
+            .into_iter()
+            .filter_map(|(iid, pid)| {
+                self.manifold_report(pid)
+                    .filter(|r| !r.is_watertight_manifold())
+                    .map(|_| iid)
+            })
+            .collect()
+    }
+
+    pub(crate) fn apply_machine_slot(&mut self, slot: usize) {
+        let idx = slot.min(2);
+        self.active_machine_slot = idx;
+        let p = &self.machine_presets[idx];
+        self.job.machine = MachineProfile::custom(&p.name, p.size_mm);
+        self.job.wall_margin_mm = p.wall_margin_mm;
+        self.job.min_z_mm = p.min_z_mm;
+        self.job.clearance_mm = p.clearance_mm;
+        self.job.bed_origin = p.bed_origin.into();
+        self.job.no_build_zone = no_build_zone_dir_for_slot(idx).and_then(|d| load_no_build_zone_from_dir(&d));
+        self.camera = viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
+        self.mark_dirty();
+        self.status = format!("Active machine: {}", self.job.machine.name());
+    }
+
+    pub(crate) fn open_custom_platform_dialog(&mut self) {
+        let p = &self.machine_presets[self.active_machine_slot.min(2)];
+        self.custom_name = p.name.clone();
+        self.custom_size_mm = self.job.machine.size_mm();
+        self.custom_wall_margin = self.job.wall_margin_mm;
+        self.custom_min_z = self.job.min_z_mm;
+        self.custom_clearance = self.job.clearance_mm;
+        self.custom_bed_origin = self.job.bed_origin;
+        self.custom_platform_open = true;
+    }
+
+    pub(crate) fn split_part_shells(&mut self, part_id: PartId) {
+        let Some(proto) = self.job.part(part_id).cloned() else {
+            return;
+        };
+        let Ok(shells) = manifold::split_shells(&proto.mesh) else {
+            self.status = format!("Failed to split shells for '{}'", proto.name);
+            return;
+        };
+        if shells.len() <= 1 {
+            self.status = format!("'{}' has only 1 shell.", proto.name);
+            return;
+        }
+        let count = shells.len();
+        for (idx, shell_mesh) in shells.into_iter().enumerate() {
+            let name = format!("{} [Shell {}]", proto.name, idx + 1);
+            let pid = self.job.add_part(name, Arc::new(shell_mesh));
+            if let Ok(iid) = self.job.add_instance_on_floor_next(pid) {
+                self.select_instance(Some(iid));
+            }
+        }
+        self.mark_dirty();
+        self.status = format!("Split '{}' into {count} shell parts.", proto.name);
+    }
+
+    pub(crate) fn request_shells_to_parts(&mut self, ids: Vec<InstanceId>) {
+        if ids.is_empty() {
+            return;
+        }
+        let any_multi_shell = ids.iter().any(|id| {
+            self.job
+                .instances
+                .iter()
+                .find(|i| i.id == *id)
+                .and_then(|inst| self.job.part(inst.part_id))
+                .and_then(|proto| manifold::split_shells(&proto.mesh).ok())
+                .is_some_and(|shells| shells.len() > 1)
+        });
+        if !any_multi_shell {
+            self.status = "Selected part(s) have only 1 shell.".to_owned();
+            return;
+        }
+        self.pending_keep_delete = Some(KeepOrDeleteAction::SplitShells(ids));
+    }
+
+    pub(crate) fn shells_to_parts_for(&mut self, ids: Vec<InstanceId>) {
+        self.shells_to_parts_for_with_keep(ids, false);
+    }
+
+    pub(crate) fn shells_to_parts_for_with_keep(&mut self, ids: Vec<InstanceId>, keep_source: bool) {
+        if ids.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let mut split_sources = 0usize;
+        let mut created_all = Vec::new();
+        for id in ids {
+            if let Ok(created) = self.job.split_instance_shells_with_options(id, keep_source)
+                && !created.is_empty()
+            {
+                split_sources += 1;
+                if !keep_source {
+                    self.euler_edit.remove(&id);
+                    self.selected_set.remove(&id);
+                }
+                created_all.extend(created);
+            }
+        }
+        if created_all.is_empty() {
+            self.undo_stack.pop();
+            self.status = "Selected part(s) have only 1 shell.".to_owned();
+            return;
+        }
+        self.selected_set.clear();
+        for &id in &created_all {
+            self.selected_set.insert(id);
+        }
+        self.selected = created_all.last().copied();
+        self.selection_anchor = self.selected;
+        self.mark_dirty();
+        self.status = format!(
+            "Split {split_sources} part(s) into {} shell parts{}.",
+            created_all.len(),
+            if keep_source { " (kept original)" } else { "" }
+        );
+    }
+
+    pub(crate) fn request_merge_selected_parts(&mut self) {
+        if self.selected_set.len() < 2 {
+            self.status = "Select at least 2 parts to merge.".to_owned();
+            return;
+        }
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        self.pending_keep_delete = Some(KeepOrDeleteAction::MergeSelected(ids));
+    }
+
+    pub(crate) fn merge_selected_parts(&mut self) {
+        if self.selected_set.len() < 2 {
+            self.status = "Select at least 2 parts to merge.".to_owned();
+            return;
+        }
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        self.merge_selected_parts_with_keep(&ids, false);
+    }
+
+    pub(crate) fn merge_selected_parts_with_keep(&mut self, ids: &[InstanceId], keep_sources: bool) {
+        if ids.len() < 2 {
+            self.status = "Select at least 2 parts to merge.".to_owned();
+            return;
+        }
+        self.push_undo();
+        match self.job.merge_instances_with_options(ids, keep_sources) {
+            Ok(merged_id) => {
+                if !keep_sources {
+                    for id in ids {
+                        self.euler_edit.remove(id);
+                    }
+                }
+                self.select_instance(Some(merged_id));
+                self.mark_dirty();
+                self.status = format!(
+                    "Merged {} parts into #{}{}",
+                    ids.len(),
+                    merged_id.0,
+                    if keep_sources { " (kept originals)" } else { "" }
+                );
+            }
+            Err(e) => {
+                self.undo_stack.pop();
+                self.status = format!("Merge failed: {e}");
+            }
+        }
+    }
+
+    pub(crate) fn group_selected_parts(&mut self, name: String) {
+        if self.selected_set.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let gid = self.job.create_group(name);
+        let sel_ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        let mut assigned = 0usize;
+        for sel in sel_ids {
+            if self.job.set_instance_group(sel, Some(gid)) {
+                assigned += 1;
+            }
+        }
+        self.mark_dirty();
+        self.status = format!("Grouped {assigned} part(s)");
+    }
+
+    pub(crate) fn ungroup_selected_parts(&mut self) {
+        let grouped_ids: Vec<InstanceId> = self
+            .job
+            .instances
+            .iter()
+            .filter(|i| self.selected_set.contains(&i.id) && i.group_id.is_some())
+            .map(|i| i.id)
+            .collect();
+        if grouped_ids.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let mut changed = 0usize;
+        for id in grouped_ids {
+            if self.job.set_instance_group(id, None) {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.mark_dirty();
+            self.status = format!("Ungrouped {changed} part(s)");
+        }
+    }
+
+    pub(crate) fn select_instance(&mut self, id: Option<InstanceId>) {
+        self.selected_set.clear();
+        if let Some(iid) = id {
+            self.selected_set.insert(iid);
+            if let Some(inst) = self.job.instances.iter().find(|i| i.id == iid) {
+                self.euler_edit.insert(iid, inst.euler_deg());
+            }
+        }
+        self.selected = id;
+        self.selection_anchor = id;
+        self.mark_dirty();
+    }
+
+    pub(crate) fn toggle_select_instance(&mut self, id: InstanceId) {
+        if self.selected_set.contains(&id) {
+            self.selected_set.remove(&id);
+            if self.selected == Some(id) {
+                self.selected = self.selected_set.iter().copied().next();
+            }
+        } else {
+            self.selected_set.insert(id);
+            self.selected = Some(id);
+            if let Some(inst) = self.job.instances.iter().find(|i| i.id == id) {
+                self.euler_edit.insert(id, inst.euler_deg());
+            }
+        }
+        self.selection_anchor = Some(id);
+        self.mark_dirty();
+    }
+
+    pub(crate) fn select_tree_range(&mut self, ordered_ids: &[InstanceId], target: InstanceId) {
+        let anchor = self.selection_anchor.or(self.selected).unwrap_or(target);
+        if let (Some(a), Some(b)) = (
+            ordered_ids.iter().position(|&id| id == anchor),
+            ordered_ids.iter().position(|&id| id == target),
+        ) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            self.selected_set.clear();
+            for &id in &ordered_ids[lo..=hi] {
+                self.selected_set.insert(id);
+            }
+            self.selected = Some(target);
+            self.selection_anchor = Some(anchor);
+            if let Some(inst) = self.job.instances.iter().find(|i| i.id == target) {
+                self.euler_edit.insert(target, inst.euler_deg());
+            }
+            self.mark_dirty();
+        } else {
+            self.select_instance(Some(target));
+        }
+    }
+
+    pub(crate) fn add_sample_part(&mut self) {
+        self.sample_counter += 1;
+        let idx = self.sample_counter;
+        if let Ok(mesh) = create_sample_bracket_mesh(idx) {
+            self.push_undo();
+            let name = format!("Sample Bracket #{idx}");
+            let pid = self.job.add_part(name.clone(), Arc::new(mesh));
+            if let Ok(iid) = self.job.add_instance_on_floor_next(pid) {
+                self.select_instance(Some(iid));
+                self.status = format!("Added {name}");
+            }
+        }
+    }
+
+    pub(crate) fn rotate_selected_90(&mut self, axis: usize) {
+        self.rotate_selected_by(axis, 90.0);
+    }
+
+    pub(crate) fn rotate_selected_by(&mut self, axis: usize, deg: f32) {
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.push_undo();
+        for sel_id in ids {
+            let new_euler = if let Some(inst) = self.job.instances.iter().find(|i| i.id == sel_id) {
+                let euler = self.euler_edit.entry(sel_id).or_insert_with(|| inst.euler_deg());
+                euler[axis] = (euler[axis] + deg).rem_euclid(360.0);
+                Some(*euler)
+            } else {
+                None
+            };
+            if let Some(euler) = new_euler {
+                self.job.set_instance_euler_around_center(sel_id, euler);
+                self.job.clamp_instance_above_floor(sel_id);
+            }
+        }
+        self.mark_dirty();
+    }
+
+    pub(crate) fn open_move_dialog(&mut self) {
+        if self.selected_set.is_empty() {
+            return;
+        }
+        if self.move_mode_idx == 1
+            && let Some(primary) = self.selected
+            && let Some(inst) = self.job.instances.iter().find(|i| i.id == primary)
+        {
+            self.move_xyz = inst.translation();
+        }
+        self.move_dialog_open = true;
+    }
+
+    pub(crate) fn selected_primary_dims(&self) -> [f32; 3] {
+        self.selected
+            .or_else(|| self.selected_set.iter().copied().next())
+            .and_then(|id| self.job.instances.iter().find(|i| i.id == id))
+            .and_then(|inst| {
+                self.job.part(inst.part_id).map(|p| {
+                    let wb = inst.world_bounds(p.mesh.bounds);
+                    [
+                        (wb[1][0] - wb[0][0]).max(0.01),
+                        (wb[1][1] - wb[0][1]).max(0.01),
+                        (wb[1][2] - wb[0][2]).max(0.01),
+                    ]
+                })
+            })
+            .unwrap_or([10.0, 10.0, 10.0])
+    }
+
+    pub(crate) fn open_scale_dialog(&mut self) {
+        if self.selected_set.is_empty() {
+            self.status = "Select part(s) to scale".to_owned();
+            return;
+        }
+        let dims = self.selected_primary_dims();
+        self.scale_pct = [100.0, 100.0, 100.0];
+        self.scale_factor = [1.0, 1.0, 1.0];
+        self.scale_abs_mm = dims;
+        self.scale_base_dims = dims;
+        self.scale_initial_dims = dims;
+        self.scale_initial_snapshot = Some(self.snapshot());
+        self.scale_applied_in_session = 0;
+        self.scale_dialog_open = true;
+    }
+
+    pub(crate) fn reset_scale_in_dialog(&mut self) {
+        if self.scale_applied_in_session > 0
+            && let Some(initial) = self.scale_initial_snapshot.clone()
+        {
+            self.push_undo();
+            self.restore_snapshot(initial);
+            self.scale_applied_in_session = 0;
+            self.status = "Reset scale to original dimensions".to_owned();
+        }
+        self.scale_pct = [100.0, 100.0, 100.0];
+        self.scale_factor = [1.0, 1.0, 1.0];
+        self.scale_abs_mm = self.scale_initial_dims;
+        self.scale_base_dims = self.scale_initial_dims;
+    }
+
+    pub(crate) fn apply_scale_selection(&mut self, factors: [f32; 3]) {
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let mut scaled = 0usize;
+        for id in ids {
+            match self.job.scale_instance(id, factors) {
+                Ok(pid) => {
+                    self.scene_cache.parts.remove(&pid);
+                    self.manifold_cache.remove(&pid);
+                    self.part_thumbs.remove(&pid);
+                    scaled += 1;
+                }
+                Err(e) => {
+                    self.undo_stack.pop();
+                    self.status = format!("Scale failed: {e}");
+                    return;
+                }
+            }
+        }
+        if scaled > 0 {
+            self.mark_dirty();
+            self.status = format!(
+                "Scaled {scaled} part(s) by ({:.3}×, {:.3}×, {:.3}×)",
+                factors[0], factors[1], factors[2]
+            );
+        }
+    }
+
+    pub(crate) fn apply_move_selection(&mut self, absolute: bool, xyz: [f32; 3]) {
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        let delta = if absolute {
+            let Some(anchor_id) = self.selected.or_else(|| ids.first().copied()) else {
+                return;
+            };
+            let Some(anchor) = self.job.instances.iter().find(|i| i.id == anchor_id) else {
+                return;
+            };
+            let cur = anchor.translation();
+            [xyz[0] - cur[0], xyz[1] - cur[1], xyz[2] - cur[2]]
+        } else {
+            xyz
+        };
+        self.push_undo();
+
+        let mut moved = 0usize;
+        for id in ids {
+            if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == id) {
+                let mut pos = inst.translation();
+                pos[0] += delta[0];
+                pos[1] += delta[1];
+                pos[2] += delta[2];
+                inst.set_translation(pos);
+                self.job.clamp_instance_above_floor(id);
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            self.mark_dirty();
+            self.status = if absolute {
+                format!("Moved {moved} part(s) to ({:.1}, {:.1}, {:.1})", xyz[0], xyz[1], xyz[2])
+            } else {
+                format!("Moved {moved} part(s) by ({:.1}, {:.1}, {:.1})", delta[0], delta[1], delta[2])
+            };
+        }
+    }
+
+    pub(crate) fn open_duplicate_dialog(&mut self) {
+        if self.selected.is_none() {
+            return;
+        }
+        self.dup_gap_mm = [self.job.clearance_mm; 3];
+        self.dup_dialog_open = true;
+    }
+
+    pub(crate) fn select_group_instances(&mut self, gid: GroupId) {
+        let members: Vec<InstanceId> = self
+            .job
+            .instances
+            .iter()
+            .filter(|i| i.group_id == Some(gid))
+            .map(|i| i.id)
+            .collect();
+        self.selected_set.clear();
+        for &id in &members {
+            self.selected_set.insert(id);
+            if let Some(inst) = self.job.instances.iter().find(|i| i.id == id) {
+                self.euler_edit.insert(id, inst.euler_deg());
+            }
+        }
+        self.selected = members.first().copied();
+        self.selection_anchor = self.selected;
+        self.mark_dirty();
+        self.status = format!("Selected {} part(s) in group", members.len());
+    }
+
+    pub(crate) fn open_sinterbox_dialog(&mut self) {
+        if self.selected_set.is_empty() {
+            self.status = "Select part(s) to create a Sinterbox".to_owned();
+            return;
+        }
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        match sinterbox::analyze_sinterbox_inputs(&self.job, &ids) {
+            Ok((_bounds, min_dim, default_name)) => {
+                let rec_win = sinterbox::recommended_window_size_mm(min_dim);
+                let rec_bar = sinterbox::recommended_bar_thickness_mm(rec_win);
+                self.sinterbox_inner_clearance = self.job.clearance_mm.max(0.5);
+                self.sinterbox_window_mm = rec_win;
+                self.sinterbox_window_auto = true;
+                self.sinterbox_bar_mm = rec_bar;
+                self.sinterbox_bar_auto = true;
+                self.sinterbox_label_enabled = true;
+                self.sinterbox_label_text = default_name.clone();
+                self.sinterbox_label_panel_idx = 0;
+                self.sinterbox_label_depth = 0.8;
+                self.sinterbox_group_name = format!("Sinterbox: {default_name}");
+                self.sinterbox_group_name_edited = false;
+                self.sinterbox_transparent = true;
+                self.sinterbox_single_copies = 1;
+                self.sinterbox_single_gap = self.job.clearance_mm.max(0.0);
+                self.sinterbox_dialog_open = true;
+            }
+            Err(e) => {
+                self.status = format!("Sinterbox unavailable: {e}");
+            }
+        }
+    }
+
+    pub(crate) fn current_sinterbox_config(&self) -> SinterboxConfig {
+        let shape = if self.sinterbox_shape_idx == 1 {
+            CageShape::TightFit
+        } else {
+            CageShape::Box
+        };
+        let label_panel = match self.sinterbox_label_panel_idx {
+            1 => LabelPanel::TopPosZ,
+            2 => LabelPanel::FrontNegY,
+            3 => LabelPanel::RightPosX,
+            4 => LabelPanel::BackPosY,
+            5 => LabelPanel::LeftNegX,
+            6 => LabelPanel::BottomNegZ,
+            _ => LabelPanel::AutoLargest,
+        };
+        SinterboxConfig {
+            shape,
+            inner_clearance_mm: self.sinterbox_inner_clearance,
+            window_size_mm: self.sinterbox_window_mm,
+            bar_thickness_mm: self.sinterbox_bar_mm,
+            label_enabled: self.sinterbox_label_enabled,
+            label_text: self.sinterbox_label_text.clone(),
+            label_panel,
+            label_depth_mm: self.sinterbox_label_depth,
+            group_name: self.sinterbox_group_name.clone(),
+            cage_transparent: self.sinterbox_transparent,
+        }
+    }
+
+    pub(crate) fn apply_create_sinterbox(&mut self) {
+        let mut target_ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        if target_ids.is_empty() {
+            return;
+        }
+        self.push_undo();
+
+        if target_ids.len() == 1 && self.sinterbox_single_copies > 1 {
+            let primary = target_ids[0];
+            let grid_counts = distribute_compact_grid(self.sinterbox_single_copies, [true, true, false]);
+            let gap = [self.sinterbox_single_gap.max(0.0); 3];
+            match self.job.duplicate_instance_grid(
+                primary,
+                grid_counts,
+                gap,
+                Some(self.sinterbox_single_copies.saturating_sub(1)),
+            ) {
+                Ok(extra) => target_ids.extend(extra),
+                Err(e) => {
+                    self.undo_stack.pop();
+                    self.status = format!("Sinterbox multiply failed: {e}");
+                    return;
+                }
+            }
+        }
+
+        let cfg = self.current_sinterbox_config();
+        match sinterbox::create_sinterbox(
+            &mut self.job,
+            &target_ids,
+            &cfg,
+            Some(solidcraft_look::fonts::PLEX_SANS),
+        ) {
+            Ok(res) => {
+                self.selected_set.clear();
+                for &id in &target_ids {
+                    self.selected_set.insert(id);
+                }
+                self.selected_set.insert(res.cage_instance_id);
+                self.selected = Some(res.cage_instance_id);
+                self.selection_anchor = Some(res.cage_instance_id);
+                self.mark_dirty();
+                let shape_str = match cfg.shape {
+                    CageShape::Box => "Box",
+                    CageShape::TightFit => "Tight Fit",
+                };
+                self.status = format!(
+                    "Created {shape_str} Sinterbox ({:.1}×{:.1}×{:.1} mm, window {:.1} mm, bar {:.2} mm)",
+                    res.metrics.outer_size_mm[0],
+                    res.metrics.outer_size_mm[1],
+                    res.metrics.outer_size_mm[2],
+                    cfg.window_size_mm,
+                    cfg.bar_thickness_mm,
+                );
+            }
+            Err(e) => {
+                if let Some(snap) = self.undo_stack.pop() {
+                    self.restore_snapshot(snap);
+                }
+                self.status = format!("Sinterbox failed: {e}");
+            }
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> UndoSnapshot {
+        UndoSnapshot {
+            job: self.job.clone(),
+            selected: self.selected,
+            selected_set: self.selected_set.clone(),
+            selection_anchor: self.selection_anchor,
+        }
+    }
+
+    pub(crate) fn push_undo(&mut self) {
+        self.undo_stack.push(self.snapshot());
+        self.redo_stack.clear();
+    }
+
+    pub(crate) fn restore_snapshot(&mut self, snap: UndoSnapshot) {
+        self.job = snap.job;
+        self.selected = snap.selected;
+        self.selected_set = snap.selected_set;
+        self.selection_anchor = snap.selection_anchor;
+        self.euler_edit.clear();
+        self.drag_state = None;
+        self.drag_zone = None;
+        self.moving_target = None;
+        self.clear_align_face_mode();
+        self.below_zero_import_dialog.clear();
+        self.mark_dirty();
+    }
+
+    pub(crate) fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo_stack.pop() else {
+            self.status = "Nothing to undo".to_owned();
+            return false;
+        };
+        let cur = self.snapshot();
+        self.redo_stack.push(cur);
+        self.restore_snapshot(prev);
+        self.status = format!("Undo ({} step(s) left)", self.undo_stack.len());
+        true
+    }
+
+    pub(crate) fn redo(&mut self) -> bool {
+        let Some(next) = self.redo_stack.pop() else {
+            self.status = "Nothing to redo".to_owned();
+            return false;
+        };
+        let cur = self.snapshot();
+        self.undo_stack.push(cur);
+        self.restore_snapshot(next);
+        self.status = format!("Redo ({} step(s) left)", self.redo_stack.len());
+        true
+    }
+
+    pub(crate) fn duplicate_selected(&mut self) {
+        let Some(sel) = self.selected else {
+            return;
+        };
+        self.push_undo();
+        let counts = [
+            if self.dup_axes[0] { self.dup_counts[0].max(1) } else { 1 },
+            if self.dup_axes[1] { self.dup_counts[1].max(1) } else { 1 },
+            if self.dup_axes[2] { self.dup_counts[2].max(1) } else { 1 },
+        ];
+        let max_new = self.dup_exact_total.then(|| self.dup_total.saturating_sub(1));
+        if let Ok(ids) = self.job.duplicate_instance_grid(sel, counts, self.dup_gap_mm, max_new) {
+            if let Some(last) = ids.last().copied() {
+                self.select_instance(Some(last));
+            } else {
+                self.mark_dirty();
+            }
+            let created = ids.len();
+            self.status = format!("Duplicated {created} instance(s)");
+        }
+    }
+
+    pub(crate) fn start_align_face_mode(&mut self, target: InstanceId) {
+        self.clear_align_face_mode();
+        self.align_face_target = Some(target);
+        self.status = "Align mode: hover a face to highlight and click to snap it to -Z (Esc to cancel)".to_owned();
+    }
+
+    pub(crate) fn clear_align_face_mode(&mut self) {
+        self.align_face_target = None;
+        self.hovered_face = None;
+        if let Ok(mut guard) = self.hl_slot.lock() {
+            *guard = Some(GpuScene::default());
+        }
+        self.hl_key = self.hl_key.wrapping_add(1).max(1);
+    }
+
+    pub(crate) fn delete_selected(&mut self) {
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let mut removed = 0usize;
+        for id in ids {
+            if self.job.remove_instance(id) {
+                self.euler_edit.remove(&id);
+                removed += 1;
+            }
+        }
+        self.selected_set.clear();
+        self.selected = None;
+        self.selection_anchor = None;
+        if removed > 0 {
+            self.mark_dirty();
+            self.status = if removed == 1 {
+                "Removed selected instance".to_owned()
+            } else {
+                format!("Removed {removed} selected instances")
+            };
+        }
+    }
+
+    pub(crate) fn nudge_selected(&mut self, delta: [f32; 3]) {
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.push_undo();
+        for sel_id in ids {
+            if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == sel_id) {
+                let mut pos = inst.translation();
+                pos[0] += delta[0];
+                pos[1] += delta[1];
+                pos[2] += delta[2];
+                inst.set_translation(pos);
+                if delta[2] < 0.0 {
+                    self.job.clamp_instance_above_floor(sel_id);
+                }
+            }
+        }
+        self.mark_dirty();
+    }
+
+    pub(crate) fn toggle_selected_hidden(&mut self) {
+        let Some(primary) = self.selected else {
+            return;
+        };
+        self.push_undo();
+        let currently_hidden = self
+            .job
+            .instances
+            .iter()
+            .find(|i| i.id == primary)
+            .is_some_and(|i| i.hidden);
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        let mut changed = 0usize;
+        for id in ids {
+            if self.job.set_instance_hidden(id, !currently_hidden) {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.mark_dirty();
+            self.status = if !currently_hidden {
+                format!("Hidden {changed} instance(s)")
+            } else {
+                format!("Shown {changed} instance(s)")
+            };
+        }
+    }
+
+    pub(crate) fn toggle_selected_transparent(&mut self) {
+        let Some(primary) = self.selected else {
+            return;
+        };
+        self.push_undo();
+        let currently_transparent = self
+            .job
+            .instances
+            .iter()
+            .find(|i| i.id == primary)
+            .is_some_and(|i| i.transparent);
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        let mut changed = 0usize;
+        for id in ids {
+            if self.job.set_instance_transparent(id, !currently_transparent) {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.mark_dirty();
+            self.status = if currently_transparent {
+                format!("Set {changed} instance(s) opaque")
+            } else {
+                format!("Set {changed} instance(s) 50% transparent")
+            };
+        }
+    }
+
+    pub(crate) fn set_selected_color(&mut self, color: Option<[u8; 3]>) {
+        if self.selected_set.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        let mut changed = 0usize;
+        for id in ids {
+            if self.job.set_instance_color(id, color) {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.mark_dirty();
+            self.status = match color {
+                Some([r, g, b]) => format!("Set color #{r:02X}{g:02X}{b:02X} on {changed} instance(s)"),
+                None => format!("Reset color on {changed} instance(s)"),
+            };
+        }
+    }
+
+    pub(crate) fn open_color_picker(&mut self) {
+        let fallback = {
+            let t = Tokens::get();
+            [t.text.r(), t.text.g(), t.text.b()]
+        };
+        let current = self
+            .selected
+            .and_then(|id| self.job.instances.iter().find(|i| i.id == id))
+            .and_then(|i| i.color)
+            .unwrap_or(fallback);
+        self.color_picker_rgb = current;
+        self.color_picker_undo_pushed = false;
+        self.color_picker_open = true;
+    }
+
+
+
+    pub(crate) fn toggle_selected_locked(&mut self) {
+        let Some(primary) = self.selected else {
+            return;
+        };
+        self.push_undo();
+        let target_locked = !self
+            .job
+            .instances
+            .iter()
+            .find(|i| i.id == primary)
+            .is_some_and(|i| i.locked);
+        let mut changed = 0usize;
+        for inst in &mut self.job.instances {
+            if self.selected_set.contains(&inst.id) {
+                inst.locked = target_locked;
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.status = if target_locked {
+                format!("Locked {changed} instance(s)")
+            } else {
+                format!("Unlocked {changed} instance(s)")
+            };
+        }
+    }
+
+    pub(crate) fn current_standard_view(&self) -> Option<StandardView> {
+        const TOL: f64 = 0.05;
+        if let Some(v) = self.camera.aligned_standard_view(TOL) {
+            return Some(v);
+        }
+        let (iso_yaw, iso_pitch) = StandardView::Iso.angles();
+        let dyaw = (self.camera.yaw - iso_yaw).rem_euclid(std::f64::consts::TAU);
+        let dyaw = dyaw.min(std::f64::consts::TAU - dyaw);
+        let dpitch = (self.camera.pitch - iso_pitch).abs();
+        let droll = self.camera.roll.rem_euclid(std::f64::consts::TAU);
+        let droll = droll.min(std::f64::consts::TAU - droll);
+        if dyaw <= TOL && dpitch <= TOL && droll <= TOL {
+            Some(StandardView::Iso)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn set_standard_view(&mut self, view: StandardView) {
+        self.camera.set_view(view);
+        self.status = format!("View: {}", view_label(view));
+    }
+
+    pub(crate) fn cycle_standard_view(&mut self) {
+        let next = match self.current_standard_view().and_then(|cur| VIEW_CYCLE.iter().position(|&v| v == cur)) {
+            Some(idx) => VIEW_CYCLE[(idx + 1) % VIEW_CYCLE.len()],
+            None => StandardView::Iso,
+        };
+        self.set_standard_view(next);
+    }
+
+    pub(crate) fn arrow_nudge_axes(&self) -> ([f32; 3], [f32; 3]) {
+        match self.current_standard_view() {
+            Some(StandardView::Front | StandardView::Back | StandardView::Left | StandardView::Right) => {
+                let (right, _, _) = self.camera.basis();
+                let horiz = if right.x.abs() >= right.y.abs() {
+                    [right.x.signum() as f32, 0.0, 0.0]
+                } else {
+                    [0.0, right.y.signum() as f32, 0.0]
+                };
+                (horiz, [0.0, 0.0, 1.0])
+            }
+            _ => ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+        }
+    }
+
+    pub(crate) fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input()
+            || self.custom_platform_open
+            || self.dup_dialog_open
+            || self.move_dialog_open
+            || self.scale_dialog_open
+            || self.sinterbox_dialog_open
+            || self.color_picker_open
+            || self.export_stl_dialog_open
+            || !self.below_zero_import_dialog.is_empty()
+        {
+            return;
+        }
+        ctx.input(|i| {
+            let cmd = i.modifiers.command;
+            let shift = i.modifiers.shift;
+            let alt = i.modifiers.alt;
+
+            if cmd && !shift && i.key_pressed(egui::Key::Z) {
+                self.undo();
+                return;
+            }
+            if (cmd && i.key_pressed(egui::Key::Y)) || (cmd && shift && i.key_pressed(egui::Key::Z)) {
+                self.redo();
+                return;
+            }
+            if cmd && shift && i.key_pressed(egui::Key::S) {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("NestCraft Bed", &["nestc"])
+                    .set_file_name("bed.nestc")
+                    .save_file()
+                {
+                    self.save_bed_file(&path);
+                }
+                return;
+            }
+            if cmd && !shift && i.key_pressed(egui::Key::S) {
+                self.open_scale_dialog();
+                return;
+            }
+            if cmd && i.key_pressed(egui::Key::D) {
+                self.open_duplicate_dialog();
+                return;
+            }
+            if !cmd && !alt && !shift && i.key_pressed(egui::Key::M) {
+                self.open_move_dialog();
+                return;
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::Escape) {
+                if self.align_face_target.is_some() {
+                    self.clear_align_face_mode();
+                    self.status = "Cancelled face alignment".to_owned();
+                    return;
+                }
+                if self.zoom_rect_mode || self.zoom_rect.is_some() {
+                    self.zoom_rect_mode = false;
+                    self.zoom_rect = None;
+                    self.status = "Cancelled zoom to selection".to_owned();
+                    return;
+                }
+            }
+            if !cmd && !alt && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+                self.delete_selected();
+            }
+            if cmd && !shift && !alt && i.key_pressed(egui::Key::ArrowDown) {
+                let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+                if !ids.is_empty() {
+                    self.push_undo();
+                    let mut dropped = false;
+                    for id in ids {
+                        dropped |= self.job.drop_instance_to_floor(id);
+                    }
+                    if dropped {
+                        self.mark_dirty();
+                        self.status = "Dropped selection to Min Z".to_owned();
+                    } else {
+                        self.undo_stack.pop();
+                    }
+                }
+                return;
+            }
+            let rot_step_45 = if shift { -45.0 } else { 45.0 };
+            if !cmd && !alt && i.key_pressed(egui::Key::X) {
+                self.rotate_selected_by(0, rot_step_45);
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::Y) {
+                self.rotate_selected_by(1, rot_step_45);
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::Z) {
+                self.rotate_selected_by(2, rot_step_45);
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::C)
+                && let Some(sel) = self.selected
+            {
+                self.push_undo();
+                if self.job.center_instance_xy(sel) {
+                    self.mark_dirty();
+                    self.status = "Centered part in XY".to_owned();
+                } else {
+                    self.undo_stack.pop();
+                }
+            }
+            if !cmd && i.key_pressed(egui::Key::R) {
+                let axis = if shift {
+                    0
+                } else if alt {
+                    1
+                } else {
+                    2
+                };
+                self.rotate_selected_90(axis);
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::H) {
+                self.toggle_selected_hidden();
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::L) {
+                self.toggle_selected_locked();
+            }
+            if !cmd && !alt && !shift && i.key_pressed(egui::Key::Space) {
+                self.cycle_standard_view();
+            }
+            if !cmd && !alt && i.key_pressed(egui::Key::F) {
+                self.camera = viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
+            }
+
+            let step = if shift {
+                10.0
+            } else if cmd {
+                0.1
+            } else {
+                1.0
+            };
+            let (horiz, vert) = self.arrow_nudge_axes();
+            if i.key_pressed(egui::Key::ArrowLeft) {
+                self.nudge_selected([-horiz[0] * step, -horiz[1] * step, -horiz[2] * step]);
+            }
+            if i.key_pressed(egui::Key::ArrowRight) {
+                self.nudge_selected([horiz[0] * step, horiz[1] * step, horiz[2] * step]);
+            }
+            if i.key_pressed(egui::Key::ArrowUp) {
+                self.nudge_selected([vert[0] * step, vert[1] * step, vert[2] * step]);
+            }
+            if i.key_pressed(egui::Key::ArrowDown) {
+                self.nudge_selected([-vert[0] * step, -vert[1] * step, -vert[2] * step]);
+            }
+            if i.key_pressed(egui::Key::PageUp) {
+                self.nudge_selected([0.0, 0.0, step]);
+            }
+            if i.key_pressed(egui::Key::PageDown) {
+                self.nudge_selected([0.0, 0.0, -step]);
+            }
+
+            if !cmd && !alt {
+                if i.key_pressed(egui::Key::Num1) {
+                    self.camera = self.camera.looking_from([0.0, -1.0, 0.0].into());
+                } else if i.key_pressed(egui::Key::Num3) {
+                    self.camera = self.camera.looking_from([1.0, 0.0, 0.0].into());
+                } else if i.key_pressed(egui::Key::Num7) {
+                    self.camera = self.camera.looking_from([0.0, 0.0, 1.0].into());
+                } else if i.key_pressed(egui::Key::Num0) {
+                    self.camera = viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
+                }
+            }
+        });
+    }
+
+    pub(crate) fn mark_dirty(&mut self) {
+        self.scene_dirty = true;
+    }
+
+    pub(crate) fn import_no_build_zone_stl(&mut self, path: &Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Failed to read {}: {e}", path.display());
+                return;
+            }
+        };
+        let mesh = match stl::parse_stl(&bytes) {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                self.status = format!("No-Build Zone STL error: {e}");
+                return;
+            }
+        };
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("No-Build Zone")
+            .to_owned();
+        let zone = NoBuildZone::new(name.clone(), mesh);
+        if let Some(dir) = no_build_zone_dir_for_slot(self.active_machine_slot) {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                self.status = format!("Failed to create {}: {e}", dir.display());
+                return;
+            }
+            if let Err(e) = std::fs::write(dir.join("zone.stl"), &bytes) {
+                self.status = format!("Failed to save {}: {e}", dir.display());
+                return;
+            }
+            if let Err(e) = save_no_build_zone_config_to_dir(&dir, &zone) {
+                self.status = e;
+                return;
+            }
+        }
+        self.job.no_build_zone = Some(zone);
+        self.mark_dirty();
+        self.status = format!("Saved No-Build Zone '{name}'");
+    }
+
+    pub(crate) fn persist_no_build_zone(&mut self) {
+        if let (Some(dir), Some(zone)) = (no_build_zone_dir_for_slot(self.active_machine_slot), &self.job.no_build_zone)
+            && let Err(e) = save_no_build_zone_config_to_dir(&dir, zone)
+        {
+            self.status = e;
+        }
+    }
+
+    pub(crate) fn save_bed_file(&mut self, path: &Path) {
+        match nestc::write_nestc(&self.job) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, bytes) {
+                    self.status = format!("Save bed failed: {e}");
+                } else {
+                    self.status = format!("Saved bed to {}", path.display());
+                }
+            }
+            Err(e) => {
+                self.status = format!("Save bed error: {e}");
+            }
+        }
+    }
+
+    pub(crate) fn apply_loaded_bed(&mut self, job: BuildJob, path_display: &str) {
+        self.job = job;
+        self.selected = None;
+        self.selected_set.clear();
+        self.selection_anchor = None;
+        self.euler_edit.clear();
+        self.scene_cache = viewport::SceneCache::default();
+        self.drag_state = None;
+        self.drag_zone = None;
+        self.moving_target = None;
+        self.clear_align_face_mode();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.manifold_cache.clear();
+        self.part_thumbs.clear();
+        self.expanded_parts.clear();
+        self.camera = viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
+        self.mark_dirty();
+        self.status = format!("Opened bed {path_display}");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_bed_file(&mut self, path: &Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Open bed failed: {e}");
+                return;
+            }
+        };
+        match nestc::read_nestc(&bytes) {
+            Ok(job) => {
+                let display = path.display().to_string();
+                self.apply_loaded_bed(job, &display);
+            }
+            Err(e) => {
+                self.status = format!("Open bed error: {e}");
+            }
+        }
+    }
+
+    pub(crate) fn start_import_files(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        if paths.is_empty() {
+            return;
+        }
+        let total = paths.len();
+        let (tx, rx) = mpsc::channel();
+        let ctx_bg = ctx.clone();
+        self.load_task = Some(ActiveLoadTask {
+            rx,
+            completed: 0,
+            total,
+            current_label: format!("Starting import ({total} file(s))..."),
+            imported_files: 0,
+            imported_items: 0,
+            below_zero_instances: Vec::new(),
+            pushed_undo: false,
+            errors: Vec::new(),
+        });
+
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(total)
+            .clamp(1, 16);
+        let queue = Arc::new(Mutex::new(VecDeque::from(paths)));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..workers {
+            let queue = Arc::clone(&queue);
+            let completed = Arc::clone(&completed);
+            let tx = tx.clone();
+            let ctx_bg = ctx_bg.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let next_path = queue.lock().ok().and_then(|mut q| q.pop_front());
+                    let Some(path) = next_path else {
+                        break;
+                    };
+                    let file_name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("file")
+                        .to_owned();
+                    let outcome = load_single_file_outcome(&path);
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = tx.send(LoadProgressMsg {
+                        completed: done,
+                        total,
+                        current_label: format!("Loaded {file_name}"),
+                        outcome: Some(outcome),
+                    });
+                    ctx_bg.request_repaint();
+                }
+            });
+        }
+    }
+
+    pub(crate) fn start_open_bed(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.start_import_files(vec![path], ctx);
+    }
+
+    pub(crate) fn poll_load_task(&mut self, ctx: &egui::Context) {
+        let Some(mut task) = self.load_task.take() else {
+            return;
+        };
+        let mut disconnected = false;
+        let mut opened_bed = false;
+        let mut last_imported_id = None;
+        let mut any_imported = false;
+        loop {
+            match task.rx.try_recv() {
+                Ok(msg) => {
+                    task.completed = msg.completed.max(task.completed);
+                    task.total = msg.total;
+                    task.current_label = msg.current_label;
+                    if let Some(outcome) = msg.outcome {
+                        match outcome {
+                            BackgroundLoadOutcome::Imported { name, kind } => {
+                                if !task.pushed_undo {
+                                    self.push_undo();
+                                    task.pushed_undo = true;
+                                }
+                                task.imported_files += 1;
+                                match kind {
+                                    ImportedKind::Stl(mesh, shared_tris) => {
+                                        let pid = self.job.add_part(name, mesh);
+                                        self.scene_cache.parts.insert(pid, shared_tris);
+                                        if let Ok(iid) = self.job.add_instance(pid, IDENTITY_TRANSFORM) {
+                                            if let Some(min_z) = self.job.instance_min_z(iid)
+                                                && min_z < -1e-4
+                                            {
+                                                task.below_zero_instances.push((iid, min_z));
+                                            }
+                                            last_imported_id = Some(iid);
+                                            task.imported_items += 1;
+                                            any_imported = true;
+                                        }
+                                    }
+                                    ImportedKind::ThreeMf(items) => {
+                                        for (item, shared_tris) in items {
+                                            let pid = self.job.add_part(item.name, item.mesh);
+                                            self.scene_cache.parts.insert(pid, shared_tris);
+                                            if let Ok(iid) = self.job.add_instance(pid, item.transform) {
+                                                if let Some(min_z) = self.job.instance_min_z(iid)
+                                                    && min_z < -1e-4
+                                                {
+                                                    task.below_zero_instances.push((iid, min_z));
+                                                }
+                                                last_imported_id = Some(iid);
+                                                task.imported_items += 1;
+                                                any_imported = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            BackgroundLoadOutcome::OpenedBed { job, path_display } => {
+                                self.apply_loaded_bed(job, &path_display);
+                                opened_bed = true;
+                            }
+                            BackgroundLoadOutcome::Failed(err) => {
+                                task.errors.push(err);
+                            }
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if let Some(iid) = last_imported_id {
+            self.select_instance(Some(iid));
+        } else if any_imported {
+            self.mark_dirty();
+        }
+
+        if disconnected || task.completed >= task.total {
+            if !opened_bed {
+                if !task.below_zero_instances.is_empty() {
+                    self.below_zero_import_dialog.extend(task.below_zero_instances);
+                }
+                if task.imported_items > 0 {
+                    self.status = if task.errors.is_empty() {
+                        format!("Imported {} item(s) from {} file(s)", task.imported_items, task.imported_files)
+                    } else {
+                        format!(
+                            "Imported {} item(s) from {} file(s); {} failed ({})",
+                            task.imported_items,
+                            task.imported_files,
+                            task.errors.len(),
+                            task.errors[0]
+                        )
+                    };
+                } else if let Some(first_err) = task.errors.first() {
+                    self.status = first_err.clone();
+                }
+            }
+            self.load_task = None;
+        } else {
+            ctx.request_repaint();
+            self.load_task = Some(task);
+        }
+    }
+
+    pub(crate) fn export_individual_stls(&self, dir: &Path) -> Result<usize, String> {
+        let instances: Vec<&nestcraft_core::model::PartInstance> = self
+            .job
+            .instances
+            .iter()
+            .filter(|inst| {
+                if self.export_stl_selected_only {
+                    self.selected_set.contains(&inst.id)
+                } else {
+                    self.job.is_instance_visible(inst)
+                }
+            })
+            .collect();
+        if instances.is_empty() {
+            return Err("No matching parts to export".to_owned());
+        }
+        std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
+        let mut used_names: HashSet<String> = HashSet::new();
+        let mut count = 0usize;
+        for inst in instances {
+            let Some(proto) = self.job.part(inst.part_id) else {
+                continue;
+            };
+            let mut stem = format_export_stl_stem(
+                &self.export_stl_prefix,
+                &proto.name,
+                inst.id.0,
+                self.export_stl_include_id,
+                &self.export_stl_suffix,
+            );
+            if !used_names.insert(stem.to_ascii_lowercase()) {
+                let mut n = 2usize;
+                loop {
+                    let candidate = format!("{stem}_{n}");
+                    if used_names.insert(candidate.to_ascii_lowercase()) {
+                        stem = candidate;
+                        break;
+                    }
+                    n += 1;
+                }
+            }
+            let tf = self.export_stl_apply_transform.then_some(&inst.transform);
+            let bytes = stl::write_binary_stl(&proto.mesh, tf).map_err(|e| format!("STL write error: {e}"))?;
+            let out_path = dir.join(format!("{stem}.stl"));
+            std::fs::write(&out_path, bytes)
+                .map_err(|e| format!("Failed to write {}: {e}", out_path.display()))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn clear_no_build_zone(&mut self) {
+        self.job.no_build_zone = None;
+        if let Some(dir) = no_build_zone_dir_for_slot(self.active_machine_slot) {
+            let _ = std::fs::remove_file(dir.join("zone.stl"));
+            let _ = std::fs::remove_file(dir.join("config.json"));
+        }
+        self.mark_dirty();
+        self.status = "Cleared No-Build Zone".to_owned();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn import_single_file(&mut self, path: &Path) -> Result<(usize, String), String> {
+        let bytes = std::fs::read(path).map_err(|_| format!("Failed to read {}", path.display()))?;
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+
+        if ext == "nestc" {
+            self.open_bed_file(path);
+            Ok((self.job.instances.len(), format!("Opened bed {}", path.display())))
+        } else if ext == "3mf" {
+            let items = threemf::read_threemf(&bytes).map_err(|e| format!("3MF import error: {e}"))?;
+            let count = items.len();
+            for item in items {
+                let pid = self.job.add_part(item.name, item.mesh);
+                if let Ok(iid) = self.job.add_instance(pid, item.transform) {
+                    if let Some(min_z) = self.job.instance_min_z(iid)
+                        && min_z < -1e-4
+                    {
+                        self.below_zero_import_dialog.push((iid, min_z));
+                    }
+                    self.select_instance(Some(iid));
+                }
+            }
+            Ok((count, format!("Imported {count} build item(s) from {}", path.display())))
+        } else if ext == "stl" {
+            let mesh = stl::parse_stl(&bytes).map_err(|e| format!("STL import error: {e}"))?;
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("part")
+                .to_owned();
+            let pid = self.job.add_part(name.clone(), Arc::new(mesh));
+            if let Ok(iid) = self.job.add_instance(pid, IDENTITY_TRANSFORM) {
+                if let Some(min_z) = self.job.instance_min_z(iid)
+                    && min_z < -1e-4
+                {
+                    self.below_zero_import_dialog.push((iid, min_z));
+                }
+                self.select_instance(Some(iid));
+            }
+            Ok((1, format!("Imported '{name}'")))
+        } else {
+            Err(format!("Unsupported file '{}' (expected .stl or .3mf)", path.display()))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn import_files<P: AsRef<Path>>(&mut self, paths: &[P]) {
+        if paths.is_empty() {
+            return;
+        }
+        if paths.len() == 1 {
+            match self.import_single_file(paths[0].as_ref()) {
+                Ok((count, msg)) => {
+                    self.status = msg;
+                    if count > 0 {
+                        self.mark_dirty();
+                    }
+                }
+                Err(err) => self.status = err,
+            }
+            return;
+        }
+
+        let mut imported_files = 0usize;
+        let mut imported_items = 0usize;
+        let mut errors = Vec::new();
+
+        for path in paths {
+            match self.import_single_file(path.as_ref()) {
+                Ok((count, _)) => {
+                    imported_files += 1;
+                    imported_items += count;
+                }
+                Err(err) => errors.push(err),
+            }
+        }
+
+        if imported_items > 0 {
+            self.mark_dirty();
+        }
+        self.status = if errors.is_empty() {
+            format!("Imported {imported_items} item(s) from {imported_files} file(s)")
+        } else if imported_files > 0 {
+            format!(
+                "Imported {imported_items} item(s) from {imported_files} file(s); {} failed ({})",
+                errors.len(),
+                errors[0]
+            )
+        } else {
+            format!("Import failed for {} file(s): {}", errors.len(), errors[0])
+        };
+    }
+
+    pub(crate) fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+        if dropped.is_empty() {
+            return;
+        }
+        let paths: Vec<std::path::PathBuf> = dropped
+            .into_iter()
+            .map(|f| f.path().to_path_buf())
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        if !paths.is_empty() {
+            self.start_import_files(paths, ctx);
+        }
+    }
+
+
+    pub(crate) fn export_threemf_file(&mut self, path: &Path) {
+        match threemf::write_threemf(&self.job) {
+            Ok(bytes) => match std::fs::write(path, bytes) {
+                Ok(()) => self.status = format!("Exported 3MF to {}", path.display()),
+                Err(e) => self.status = format!("Write error: {e}"),
+            },
+            Err(e) => self.status = format!("3MF export error: {e}"),
+        }
+    }
+
+    pub(crate) fn start_moving_layer(&mut self, target: viewport::DragExclude) {
+        let tokens = Tokens::get();
+        let scene = viewport::build_moving_scene(&self.job, &self.selected_set, &tokens, &mut self.scene_cache, &target);
+        if let Ok(mut guard) = self.moving_slot.lock() {
+            *guard = Some(scene);
+        }
+        self.moving_key = self.moving_key.wrapping_add(1).max(1);
+        self.moving_target = Some(target);
+        self.mark_dirty();
+    }
+
+    pub(crate) fn current_moving_layer(&self) -> Option<MovingLayer> {
+        let target = self.moving_target.as_ref()?;
+        let delta = match target {
+            viewport::DragExclude::Instances(_) => {
+                let ds = self.drag_state.as_ref()?;
+                let (_, start_tr) = ds.instances.iter().find(|(id, _)| *id == ds.anchor_id)?;
+                let inst = self.job.instances.iter().find(|i| i.id == ds.anchor_id)?;
+                let cur = inst.translation();
+                [cur[0] - start_tr[0], cur[1] - start_tr[1], cur[2] - start_tr[2]]
+            }
+            viewport::DragExclude::NoBuildZone => {
+                let dz = self.drag_zone?;
+                let zone = self.job.no_build_zone.as_ref()?;
+                [
+                    zone.position[0] - dz.start_position[0],
+                    zone.position[1] - dz.start_position[1],
+                    zone.position[2] - dz.start_position[2],
+                ]
+            }
+        };
+        Some(MovingLayer {
+            key: self.moving_key,
+            slot: self.moving_slot.clone(),
+            transform: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [delta[0], delta[1], delta[2], 1.0],
+            ],
+        })
+    }
+
+    pub(crate) fn sync_scene_if_dirty(&mut self) {
+        if !self.scene_dirty {
+            return;
+        }
+        if let Some(viewport::DragExclude::Instances(ids)) = &self.moving_target
+            && !ids.iter().any(|id| self.job.instances.iter().any(|i| i.id == *id))
+        {
+            self.moving_target = None;
+            self.drag_state = None;
+        }
+        let tokens = Tokens::get();
+        let scene = viewport::build_gpu_scene_with_exclude(
+            &self.job,
+            &self.selected_set,
+            &tokens,
+            &mut self.scene_cache,
+            self.moving_target.as_ref(),
+        );
+        if let Ok(mut guard) = self.scene_slot.lock() {
+            *guard = Some(scene);
+        }
+        self.scene_key = self.scene_key.wrapping_add(1).max(1);
+        self.scene_dirty = false;
+    }
+
+
+    pub(crate) fn reset_below_zero_imported_parts(&mut self) {
+        let items = std::mem::take(&mut self.below_zero_import_dialog);
+        if items.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let mut adjusted = 0usize;
+        for (id, _) in items {
+            if self.job.reset_instance_z_to_zero(id) {
+                adjusted += 1;
+            }
+        }
+        if adjusted > 0 {
+            self.mark_dirty();
+            self.status = format!("Reset Z = 0 (kept XY) for {adjusted} imported part(s)");
+        }
+    }
+
+}
+
+pub(crate) fn rotate_transform_around_pivot(
+    orig: [[f32; 4]; 3],
+    pivot: [f32; 3],
+    axis: [f32; 3],
+    angle_rad: f32,
+) -> [[f32; 4]; 3] {
+    let len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    if len < 1e-6 || angle_rad.abs() < 1e-6 {
+        return orig;
+    }
+    let (ux, uy, uz) = (axis[0] / len, axis[1] / len, axis[2] / len);
+    let (s, c) = angle_rad.sin_cos();
+    let t = 1.0 - c;
+    let r = [
+        [t * ux * ux + c, t * ux * uy - s * uz, t * ux * uz + s * uy],
+        [t * ux * uy + s * uz, t * uy * uy + c, t * uy * uz - s * ux],
+        [t * ux * uz - s * uy, t * uy * uz + s * ux, t * uz * uz + c],
+    ];
+    let mut out = [[0.0; 4]; 3];
+    for row in 0..3 {
+        for col in 0..3 {
+            out[row][col] = r[row][0] * orig[0][col] + r[row][1] * orig[1][col] + r[row][2] * orig[2][col];
+        }
+        let dx = orig[0][3] - pivot[0];
+        let dy = orig[1][3] - pivot[1];
+        let dz = orig[2][3] - pivot[2];
+        out[row][3] = pivot[row] + r[row][0] * dx + r[row][1] * dy + r[row][2] * dz;
+    }
+    out
+}
+
+pub(crate) fn snap_to_nearest_axis(v: [f32; 3]) -> [f32; 3] {
+    let (ax, ay, az) = (v[0].abs(), v[1].abs(), v[2].abs());
+    if ax >= ay && ax >= az {
+        [v[0].signum(), 0.0, 0.0]
+    } else if ay >= az {
+        [0.0, v[1].signum(), 0.0]
+    } else {
+        [0.0, 0.0, v[2].signum()]
+    }
+}
+
+pub(crate) fn create_sample_bracket_mesh(variant: u32) -> nestcraft_core::Result<TriMesh> {
+    let scale = 1.0 + 0.15 * f32::from((variant % 3) as u8);
+    let (w, d, h) = (30.0 * scale, 20.0 * scale, 25.0 * scale);
+    let positions = vec![
+        [0.0, 0.0, 0.0],
+        [w, 0.0, 0.0],
+        [w, d, 0.0],
+        [0.0, d, 0.0],
+        [0.0, 0.0, h],
+        [w, 0.0, h],
+        [w, d, h],
+        [0.0, d, h],
+    ];
+    let indices = vec![
+        [0, 2, 1],
+        [0, 3, 2],
+        [4, 5, 6],
+        [4, 6, 7],
+        [0, 1, 5],
+        [0, 5, 4],
+        [1, 2, 6],
+        [1, 6, 5],
+        [2, 3, 7],
+        [2, 7, 6],
+        [3, 0, 4],
+        [3, 4, 7],
+    ];
+    TriMesh::from_indexed(positions, indices)
+}
+

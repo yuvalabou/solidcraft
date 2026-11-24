@@ -1,0 +1,540 @@
+//! Top, Edit, Analyze, View, and Status bars.
+
+use crate::app::*;
+use crate::viewport;
+
+use nestcraft_core::model::InstanceId;
+use solidcraft_theme::Tokens;
+use solidcraft_ui_kit::container::{BackingTooltipExt as _, Container, Edge, Surface};
+use solidcraft_ui_kit::{
+    Button, Segments, StageBar, button,
+    icon_label_button, scope, segmented,
+};
+use solidcraft_viewport::vec::Bounds;
+
+
+impl NestCraftApp {
+    pub(crate) fn draw_top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
+        let chrome = Container::new(ctx, Surface::Chrome);
+        let top_panel = chrome.edge("sls_top_bar", Edge::Top).exact_size(44.0).resizable(false);
+        chrome.show_edge(ui, top_panel, chrome.edge_frame(t.toolbar), |ui| {
+            scope(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("sls_top_scroll")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                    .show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.label(egui::RichText::new("NestCraft").strong().color(t.text));
+                            StageBar::separator(ui);
+
+                            let mut machine_idx = self.active_machine_slot.min(2);
+                            let machine_changed = ui
+                                .push_id("machine_seg", |ui| {
+                                    segmented(
+                                        ui,
+                                        &mut machine_idx,
+                                        &["Formiga P110", "Farsoon HT403P", "Custom"],
+                                        Segments {
+                                            dense: true,
+                                            intrinsic: true,
+                                            workspace_accent: true,
+                                            ..Default::default()
+                                        },
+                                    )
+                                })
+                                .inner;
+                            if machine_changed {
+                                self.apply_machine_slot(machine_idx);
+                                if machine_idx == 2 {
+                                    self.open_custom_platform_dialog();
+                                }
+                            }
+                            if button(ui, "Configure...", Button::Small)
+                                .backing_on_hover_text(
+                                    "Configure dimensions, wall distance, Min Z, and clearance for the active machine",
+                                )
+                                .clicked()
+                            {
+                                self.open_custom_platform_dialog();
+                            }
+
+                            StageBar::separator(ui);
+                            if icon_label_button(ui, "Open Bed", "open", self.load_task.is_none(), false)
+                                .backing_on_hover_text("Open a saved .nestc bed project")
+                                .clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("NestCraft Bed", &["nestc"])
+                                    .pick_file()
+                            {
+                                self.start_open_bed(path, ctx);
+                            }
+                            if icon_label_button(ui, "Save Bed", "save", true, false)
+                                .backing_on_hover_text("Save current bed, parts, and settings as .nestc (Ctrl+Shift+S)")
+                                .clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("NestCraft Bed", &["nestc"])
+                                    .set_file_name("bed.nestc")
+                                    .save_file()
+                            {
+                                self.save_bed_file(&path);
+                            }
+                            if icon_label_button(ui, "Import", "sls_import_mesh", self.load_task.is_none(), false)
+                                .backing_on_hover_text("Import STL or 3MF meshes into the build chamber")
+                                .clicked()
+                                && let Some(paths) = rfd::FileDialog::new()
+                                    .add_filter("3D Mesh", &["stl", "STL", "3mf", "3MF", "nestc"])
+                                    .pick_files()
+                            {
+                                self.start_import_files(paths, ctx);
+                            }
+                            if icon_label_button(ui, "Sample Part", "mesh_body", true, false)
+                                .backing_on_hover_text("Insert a sample 30x20x25 mm bracket into the chamber")
+                                .clicked()
+                            {
+                                self.add_sample_part();
+                            }
+                            if icon_label_button(ui, "Export 3MF", "export", !self.job.instances.is_empty(), false)
+                                .backing_on_hover_text("Export build job to Production 3MF")
+                                .clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("3MF", &["3mf"])
+                                    .set_file_name("build.3mf")
+                                    .save_file()
+                            {
+                                self.export_threemf_file(&path);
+                            }
+                            if icon_label_button(ui, "Export STLs", "export", !self.job.instances.is_empty(), false)
+                                .backing_on_hover_text(
+                                    "Export parts as individual STL files with configurable prefix/suffix",
+                                )
+                                .clicked()
+                            {
+                                self.export_stl_dialog_open = true;
+                            }
+
+                            StageBar::separator(ui);
+                            icon_label_button(ui, "Auto-Nest", "sls_auto_nest", false, false)
+                                .backing_on_hover_text("3D EDT Auto-Nest (coming in Stage 2)");
+                            if icon_label_button(ui, "Fit View", "fit", true, false)
+                                .backing_on_hover_text("Reset camera to default isometric build view")
+                                .clicked()
+                            {
+                                self.camera =
+                                    viewport::default_camera_with_origin(&self.job.machine, self.job.bed_origin);
+                            }
+                            let dark = solidcraft_theme::is_dark();
+                            if icon_label_button(
+                                ui,
+                                if dark { "Light" } else { "Dark" },
+                                if dark { "render_sun" } else { "moon" },
+                                true,
+                                false,
+                            )
+                            .backing_on_hover_text("Toggle Dark / Light SolidCraft theme")
+                            .clicked()
+                            {
+                                solidcraft_theme::set_dark(!dark);
+                                solidcraft_theme::apply(ctx);
+                                self.mark_dirty();
+                            }
+                            let _ = button(ui, "?", Button::Small).backing_on_hover_text(
+                                "Shortcuts:\n\
+                                 Ctrl+D: Duplicate   |   Ctrl+Z / Ctrl+Y: Undo / Redo   |   Del: Delete\n\
+                                 X / Y / Z: Rotate +45° X / Y / Z (Shift: -45°)   |   R: +90° Z\n\
+                                 Ctrl+Down: Drop Z=0   |   C: Center XY   |   H: Hide   |   L: Lock\n\
+                                 Arrows / PgUp/PgDn: Nudge 1 mm (Shift: 10 mm, Ctrl: 0.1 mm)\n\
+                                 1 / 3 / 7 / 0 / F: Front / Right / Top / Iso / Fit View",
+                            );
+                        });
+                    });
+            });
+        });
+    }
+
+    pub(crate) fn add_aabb_to_bounds(bounds: &mut Bounds, aabb: [[f32; 3]; 2]) {
+        bounds.add([f64::from(aabb[0][0]), f64::from(aabb[0][1]), f64::from(aabb[0][2])].into());
+        bounds.add([f64::from(aabb[1][0]), f64::from(aabb[1][1]), f64::from(aabb[1][2])].into());
+    }
+
+    pub(crate) fn platform_bounds(&self) -> Bounds {
+        let ([x0, y0], [x1, y1]) = self.job.bed_xy_bounds();
+        let [_, _, h] = self.job.machine.size_mm();
+        let mut bounds = Bounds::EMPTY;
+        Self::add_aabb_to_bounds(&mut bounds, [[x0, y0, 0.0], [x1, y1, h.max(1.0)]]);
+        bounds
+    }
+
+    pub(crate) fn all_parts_bounds(&self) -> Bounds {
+        let mut bounds = Bounds::EMPTY;
+        for inst in &self.job.instances {
+            if !self.job.is_instance_visible(inst) {
+                continue;
+            }
+            if let Some(proto) = self.job.part(inst.part_id) {
+                Self::add_aabb_to_bounds(&mut bounds, inst.world_bounds(proto.mesh.bounds));
+            }
+        }
+        bounds
+    }
+
+    pub(crate) fn selected_parts_bounds(&self) -> Bounds {
+        let mut bounds = Bounds::EMPTY;
+        for inst in &self.job.instances {
+            if !self.selected_set.contains(&inst.id) {
+                continue;
+            }
+            if let Some(proto) = self.job.part(inst.part_id) {
+                Self::add_aabb_to_bounds(&mut bounds, inst.world_bounds(proto.mesh.bounds));
+            }
+        }
+        bounds
+    }
+
+    pub(crate) fn zoom_to_all_parts(&mut self) {
+        let bounds = self.all_parts_bounds();
+        if self.camera.fit_aspect(&bounds, self.viewport_aspect) {
+            self.status = "Zoomed to all parts".to_owned();
+        }
+    }
+
+    pub(crate) fn zoom_to_selected(&mut self) {
+        let bounds = self.selected_parts_bounds();
+        if self.camera.fit_aspect(&bounds, self.viewport_aspect) {
+            self.status = "Zoomed to selected part(s)".to_owned();
+        }
+    }
+
+    pub(crate) fn zoom_to_platform(&mut self) {
+        let bounds = self.platform_bounds();
+        if self.camera.fit_aspect(&bounds, self.viewport_aspect) {
+            self.status = "Zoomed to platform".to_owned();
+        }
+    }
+
+    pub(crate) fn zoom_to_all(&mut self) {
+        let mut bounds = self.platform_bounds();
+        let parts = self.all_parts_bounds();
+        if !parts.is_empty() {
+            bounds.add(parts.min);
+            bounds.add(parts.max);
+        }
+        if let Some(zone) = &self.job.no_build_zone
+            && zone.visible
+        {
+            Self::add_aabb_to_bounds(&mut bounds, zone.world_bounds());
+        }
+        if self.camera.fit_aspect(&bounds, self.viewport_aspect) {
+            self.status = "Zoomed to all".to_owned();
+        }
+    }
+
+    pub(crate) fn zoom_to_screen_rect(&mut self, viewport_rect: egui::Rect, sel_rect: egui::Rect) {
+        let w = f64::from(viewport_rect.width().max(1.0));
+        let h = f64::from(viewport_rect.height().max(1.0));
+        let half_h = self.camera.half_height();
+        let half_w = half_h * (w / h);
+        let dx_ndc = f64::from(sel_rect.center().x - viewport_rect.center().x) / (w * 0.5);
+        let dy_ndc = -f64::from(sel_rect.center().y - viewport_rect.center().y) / (h * 0.5);
+        let (right, up, _) = self.camera.basis();
+        self.camera.target = self.camera.target + right * (dx_ndc * half_w) + up * (dy_ndc * half_h);
+        let scale = f64::from(sel_rect.width() / viewport_rect.width().max(1.0))
+            .max(f64::from(sel_rect.height() / viewport_rect.height().max(1.0)))
+            .clamp(0.02, 1.0);
+        self.camera.distance = (self.camera.distance * scale).clamp(15.0, 5000.0);
+        self.status = "Zoomed to selection rectangle".to_owned();
+    }
+
+    pub(crate) fn draw_view_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
+        let chrome = Container::new(ctx, Surface::Chrome);
+        let view_panel = chrome.edge("sls_view_bar", Edge::Top).exact_size(36.0).resizable(false);
+        chrome.show_edge(ui, view_panel, chrome.edge_frame(t.toolbar), |ui| {
+            scope(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("sls_view_scroll")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                    .show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.label(egui::RichText::new("View").strong().color(t.text));
+                            StageBar::separator(ui);
+
+                            let has_visible_parts = self.job.instances.iter().any(|i| self.job.is_instance_visible(i));
+                            if icon_label_button(ui, "Zoom to All Parts", "sls_zoom_parts", has_visible_parts, false)
+                                .backing_on_hover_text("Frame all visible parts in the viewport")
+                                .clicked()
+                            {
+                                self.zoom_to_all_parts();
+                            }
+                            if icon_label_button(
+                                ui,
+                                "Zoom to Selected",
+                                "sls_zoom_selected",
+                                !self.selected_set.is_empty(),
+                                false,
+                            )
+                            .backing_on_hover_text("Frame the currently selected part(s)")
+                            .clicked()
+                            {
+                                self.zoom_to_selected();
+                            }
+                            if icon_label_button(ui, "Zoom to Platform", "sls_zoom_platform", true, false)
+                                .backing_on_hover_text("Frame the machine build platform")
+                                .clicked()
+                            {
+                                self.zoom_to_platform();
+                            }
+                            if icon_label_button(ui, "Zoom to All", "sls_zoom_all", true, false)
+                                .backing_on_hover_text("Frame the platform and all visible parts")
+                                .clicked()
+                            {
+                                self.zoom_to_all();
+                            }
+                            if icon_label_button(
+                                ui,
+                                "Zoom to Selection",
+                                "sls_zoom_selection",
+                                true,
+                                self.zoom_rect_mode,
+                            )
+                            .backing_on_hover_text(
+                                "Toggle rectangle zoom: right-drag a rectangle in the viewport to zoom into it (Esc to cancel)",
+                            )
+                            .clicked()
+                            {
+                                self.zoom_rect_mode = !self.zoom_rect_mode;
+                                self.zoom_rect = None;
+                                self.status = if self.zoom_rect_mode {
+                                    "Right-drag a rectangle in the viewport to zoom (Esc to cancel)".to_owned()
+                                } else {
+                                    "Cancelled zoom to selection".to_owned()
+                                };
+                            }
+                        });
+                    });
+            });
+        });
+    }
+
+    pub(crate) fn draw_edit_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
+        let chrome = Container::new(ctx, Surface::Chrome);
+        let edit_panel = chrome.edge("sls_edit_bar", Edge::Top).exact_size(36.0).resizable(false);
+        chrome.show_edge(ui, edit_panel, chrome.edge_frame(t.toolbar), |ui| {
+            scope(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("sls_edit_scroll")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                    .show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.label(egui::RichText::new("Edit").strong().color(t.text));
+                            StageBar::separator(ui);
+
+                            if icon_label_button(ui, "Move", "move", !self.selected_set.is_empty(), false)
+                                .backing_on_hover_text("Move selected part(s) by relative offset or absolute position (M)")
+                                .clicked()
+                            {
+                                self.open_move_dialog();
+                            }
+                            if icon_label_button(ui, "Scale", "resize", !self.selected_set.is_empty(), false)
+                                .backing_on_hover_text("Scale selected part(s) uniformly or per-axis (Ctrl+S)")
+                                .clicked()
+                            {
+                                self.open_scale_dialog();
+                            }
+                            if icon_label_button(ui, "Duplicate", "sls_duplicate", self.selected.is_some(), false)
+                                .backing_on_hover_text("Duplicate selected part in X/Y/Z grid (Ctrl+D)")
+                                .clicked()
+                            {
+                                self.open_duplicate_dialog();
+                            }
+                            if icon_label_button(ui, "Drop Z=0", "sls_orient_lock", self.selected.is_some(), false)
+                                .backing_on_hover_text("Drop selected part to the build floor (Z)")
+                                .clicked()
+                                && let Some(sel) = self.selected
+                                && self.job.drop_instance_to_floor(sel)
+                            {
+                                self.mark_dirty();
+                                self.status = "Dropped part to Z = 0".to_owned();
+                            }
+                            if icon_label_button(ui, "Delete", "delete", self.selected.is_some(), true)
+                                .backing_on_hover_text("Remove selected instance from build (Del)")
+                                .clicked()
+                            {
+                                self.delete_selected();
+                            }
+                            if icon_label_button(
+                                ui,
+                                "Align",
+                                "sls_orient_lock",
+                                self.selected.is_some(),
+                                self.align_face_target.is_some(),
+                            )
+                            .backing_on_hover_text("Select a face on the part to snap its normal to -Z (build floor)")
+                            .clicked()
+                                && let Some(sel) = self.selected
+                            {
+                                if self.align_face_target.is_some() {
+                                    self.clear_align_face_mode();
+                                } else {
+                                    self.start_align_face_mode(sel);
+                                }
+                            }
+                            if icon_label_button(ui, "Shells to Parts", "mesh_body", !self.selected_set.is_empty(), false)
+                                .backing_on_hover_text("Split disconnected STL shells in selected part(s) into separate parts")
+                                .clicked()
+                            {
+                                let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+                                self.request_shells_to_parts(ids);
+                            }
+                            if icon_label_button(ui, "Merge Parts", "sls_auto_nest", self.selected_set.len() >= 2, false)
+                                .backing_on_hover_text("Combine selected parts into a single merged mesh part")
+                                .clicked()
+                            {
+                                self.request_merge_selected_parts();
+                            }
+
+                            StageBar::separator(ui);
+
+                            const PLACEHOLDERS: [(&str, &str, &str); 6] = [
+                                (
+                                    "Shell",
+                                    "mesh_body",
+                                    "Hollow selected part with configurable wall thickness & drain holes (coming soon)",
+                                ),
+                                (
+                                    "Labels",
+                                    "sls_duplicate",
+                                    "Add embossed or engraved part labels & serial numbers (coming soon)",
+                                ),
+                                (
+                                    "Repair Mesh",
+                                    "sls_orient_lock",
+                                    "Auto-fix non-manifold edges, holes, and inverted normals (coming soon)",
+                                ),
+                                (
+                                    "Boolean",
+                                    "sls_auto_nest",
+                                    "Union, subtract, or intersect selected parts (coming soon)",
+                                ),
+                                (
+                                    "Cut / Split",
+                                    "resize",
+                                    "Slice selected part along a plane with optional alignment pins (coming soon)",
+                                ),
+                                (
+                                    "Offset",
+                                    "move",
+                                    "Uniform surface offset / tolerance compensation (coming soon)",
+                                ),
+                            ];
+
+                            for (label, icon, tip) in PLACEHOLDERS {
+                                icon_label_button(ui, label, icon, false, false).backing_on_hover_text(tip);
+                            }
+                        });
+                    });
+            });
+        });
+    }
+
+    pub(crate) fn draw_analyze_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
+        let chrome = Container::new(ctx, Surface::Chrome);
+        let analyze_panel = chrome.edge("sls_analyze_bar", Edge::Top).exact_size(36.0).resizable(false);
+        chrome.show_edge(ui, analyze_panel, chrome.edge_frame(t.toolbar), |ui| {
+            scope(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("sls_analyze_scroll")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                    .show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.label(egui::RichText::new("Analyze").strong().color(t.text));
+                            StageBar::separator(ui);
+
+                            const PLACEHOLDERS: [(&str, &str, &str); 7] = [
+                                (
+                                    "Stair Highlight",
+                                    "sls_orient_lock",
+                                    "Highlight shallow-angle faces prone to layer stair-stepping (coming soon)",
+                                ),
+                                (
+                                    "Measure",
+                                    "resize",
+                                    "Measure point-to-point distance, angles, and diameters (coming soon)",
+                                ),
+                                (
+                                    "Wall Thickness",
+                                    "mesh_body",
+                                    "Check thin walls below critical SLS threshold (coming soon)",
+                                ),
+                                (
+                                    "Up / Downskin",
+                                    "sls_duplicate",
+                                    "Analyze upward-facing and downward-facing surface angles (coming soon)",
+                                ),
+                                (
+                                    "Shadow Area",
+                                    "sls_zoom_all",
+                                    "Project XY sintered shadow area and cross-section footprint (coming soon)",
+                                ),
+                                (
+                                    "Collision Check",
+                                    "sls_auto_nest",
+                                    "Highlight part-to-part clearance violations and overlaps (coming soon)",
+                                ),
+                                (
+                                    "Thermal Map",
+                                    "render_sun",
+                                    "Estimate sintered powder-bed thermal density hotspots (coming soon)",
+                                ),
+                            ];
+
+                            for (label, icon, tip) in PLACEHOLDERS {
+                                icon_label_button(ui, label, icon, false, false).backing_on_hover_text(tip);
+                            }
+                        });
+                    });
+            });
+        });
+    }
+
+    pub(crate) fn draw_bottom_bar(&self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
+        let chrome = Container::new(ctx, Surface::Chrome);
+        let bottom_panel = chrome.edge("sls_status_bar", Edge::Bottom).exact_size(30.0).resizable(false);
+        chrome.show_edge(ui, bottom_panel, chrome.edge_frame(t.dialog_footer), |ui| {
+            scope(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    if let Some(task) = &self.load_task {
+                        let frac = if task.total > 0 {
+                            (task.completed as f32 / task.total as f32).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_width(170.0)
+                                .text(format!("{}/{} — {}", task.completed, task.total, task.current_label)),
+                        );
+                    } else {
+                        ui.label(egui::RichText::new(&self.status).size(t.font_small).color(t.text_dim));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let [_, _, wz] = self.job.machine.size_mm();
+                        let max_z = self.job.max_z_mm();
+                        let layers = (max_z / 0.1).ceil() as u32;
+                        let metrics = format!(
+                            "Parts: {} ({} unique)   |   Vol: {:.2} cm³   |   Max Z: {:.1} / {:.0} mm ({layers} layers @ 0.10 mm)   |   Density: {:.2}%",
+                            self.job.instances.len(),
+                            self.job.parts.len(),
+                            self.job.total_part_volume_mm3() / 1000.0,
+                            max_z,
+                            wz,
+                            self.job.packing_density_pct(),
+                        );
+                        ui.label(egui::RichText::new(metrics).size(t.font_small).color(t.text)).backing_on_hover_text(
+                            "Build summary: total instances (unique parts) | total sintered volume (cm³) | max Z vs platform height (0.10 mm layers) | occupied cake density = volume / (W × D × max Z)",
+                        );
+                    });
+                });
+            });
+        });
+    }
+
+}
