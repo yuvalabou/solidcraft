@@ -15,6 +15,7 @@ pub mod model;
 pub mod report;
 pub mod sinterbox;
 pub mod slice;
+pub mod thermal;
 
 use thiserror::Error;
 

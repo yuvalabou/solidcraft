@@ -377,6 +377,27 @@ impl NestCraftApp {
                     }
                 });
 
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Scale").small().color(t.text_dim));
+                    let mut scale_idx = usize::from(self.slice_dist_bed_scale);
+                    if ui
+                        .push_id("sls_slice_scale_seg", |ui| {
+                            segmented(
+                                ui,
+                                &mut scale_idx,
+                                &["Peak", "Bed %"],
+                                Segments {
+                                    dense: true,
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .inner
+                    {
+                        self.slice_dist_bed_scale = scale_idx == 1;
+                    }
+                });
+
                 if let Some(dist) = &self.slice_dist_cache {
                     if dist.excluded_oob_count > 0 {
                         status_line(
@@ -403,7 +424,7 @@ impl NestCraftApp {
                     } else {
                         let avail = ui.available_size();
                         let chart_h = (avail.y - 36.0).max(160.0);
-                        let chart_w = avail.x.max(120.0);
+                        let chart_w = ui.available_width().max(120.0);
                         let (rect, resp) = ui.allocate_exact_size(
                             egui::vec2(chart_w, chart_h),
                             egui::Sense::hover(),
@@ -419,9 +440,20 @@ impl NestCraftApp {
 
                         let pad = 6.0_f32;
                         let inner = rect.shrink(pad);
+                        for tick in [0.25_f32, 0.5, 0.75, 1.0] {
+                            let gx = inner.left() + inner.width() * tick;
+                            p.line_segment(
+                                [egui::pos2(gx, inner.top()), egui::pos2(gx, inner.bottom())],
+                                egui::Stroke::new(1.0, t.border.gamma_multiply(0.45)),
+                            );
+                        }
                         let n = dist.layers.len().max(1);
                         let row_h = (inner.height() / n as f32).max(1.0);
-                        let peak = dist.peak_area_mm2.max(1e-6);
+                        let max_ref = if self.slice_dist_bed_scale {
+                            dist.bed_area_mm2.max(1e-6)
+                        } else {
+                            dist.peak_area_mm2.max(1e-6)
+                        };
 
                         let hovered_idx = resp.hover_pos().and_then(|hp| {
                             if !inner.contains(hp) {
@@ -437,7 +469,7 @@ impl NestCraftApp {
                             let rev = n - 1 - idx;
                             let y0 = inner.top() + rev as f32 * row_h;
                             let y1 = (y0 + row_h - 0.5).max(y0 + 1.0);
-                            let frac = (layer.area_mm2 / peak).clamp(0.0, 1.0) as f32;
+                            let frac = (layer.area_mm2 / max_ref).clamp(0.0, 1.0) as f32;
                             let bar_w = (inner.width() * frac).max(if layer.area_mm2 > 0.0 { 2.0 } else { 0.0 });
                             let bar_rect = egui::Rect::from_min_max(
                                 egui::pos2(inner.left(), y0),
@@ -475,6 +507,125 @@ impl NestCraftApp {
                 &self.job,
                 self.slice_dist_step_mm,
             ));
+        }
+    }
+
+    pub(crate) fn draw_thermal_map_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
+        if !self.thermal_map_open {
+            return;
+        }
+        if self.thermal_report.is_none() {
+            self.refresh_thermal_map();
+        }
+
+        let side_c = Container::new(ctx, Surface::Panel);
+        let panel = side_c
+            .edge("sls_thermal_map_panel", Edge::Right)
+            .default_size(230.0)
+            .min_size(190.0)
+            .max_size(520.0)
+            .resizable(true);
+        let frame = side_c
+            .edge_frame(t.panel)
+            .inner_margin(egui::Margin::symmetric(t.space_10 as i8, t.space_10 as i8));
+
+        let mut close_now = false;
+        let mut recompute = false;
+        let mut select_part: Option<nestcraft_core::model::InstanceId> = None;
+
+        side_c.show_edge(ui, panel, frame, |ui| {
+            scope(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(t.space_6, t.space_6);
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Thermal Map").strong().color(t.text));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if button(ui, "×", Button::Small)
+                            .backing_on_hover_text("Close Thermal Map")
+                            .clicked()
+                        {
+                            close_now = true;
+                        }
+                        if button(ui, "Refresh", Button::Small).clicked() {
+                            recompute = true;
+                        }
+                    });
+                });
+
+                if let Some(rep) = &self.thermal_report {
+                    if rep.excluded_oob_count > 0 {
+                        status_line(
+                            ui,
+                            &format!("{} out-of-bounds part(s) excluded", rep.excluded_oob_count),
+                            StatusTone::Warning,
+                        );
+                    }
+                    value_row(ui, "Kernel", &format!("{:.0}×{:.0}×{:.0} mm ({:.1} mm pitch)", rep.kernel_mm, rep.kernel_mm, rep.kernel_mm, rep.pitch_mm));
+                    value_row(ui, "Peak Density", &format!("{:.1}%", rep.peak_density_pct));
+                    value_row(
+                        ui,
+                        "Hotspot XYZ",
+                        &format!(
+                            "({:.0}, {:.0}, {:.0}) mm",
+                            rep.hotspot_xyz[0], rep.hotspot_xyz[1], rep.hotspot_xyz[2]
+                        ),
+                    );
+                    if rep.hotspot_part_count > 0 {
+                        status_line(
+                            ui,
+                            &format!("{} part(s) >= 30% local density (curl / cake risk)", rep.hotspot_part_count),
+                            StatusTone::Warning,
+                        );
+                    }
+
+                    // Compact 4-stop color legend
+                    ui.horizontal(|ui| {
+                        for (label, pct) in [("Cool", 5.0_f32), ("15%", 15.0), ("25%", 25.0), ("35%+", 35.0)] {
+                            let [r, g, b, _] = nestcraft_core::thermal::thermal_rgba(pct);
+                            let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            ui.painter().rect_filled(dot, 2.0, egui::Color32::from_rgb(r, g, b));
+                            ui.label(egui::RichText::new(label).small().color(t.text_dim));
+                        }
+                    });
+
+                    ui.separator();
+                    if rep.parts.is_empty() {
+                        status_line(ui, "No parts inside machine to analyze.", StatusTone::Dim);
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .id_salt("sls_thermal_parts_scroll")
+                            .show(ui, |ui| {
+                                for p in &rep.parts {
+                                    let [r, g, b, _] = nestcraft_core::thermal::thermal_rgba(p.peak_density_pct);
+                                    let resp = ui.horizontal(|ui| {
+                                        let (dot, _) =
+                                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                                        ui.painter().rect_filled(dot, 2.0, egui::Color32::from_rgb(r, g, b));
+                                        let is_sel = self.selected_set.contains(&p.instance_id);
+                                        let lbl = format!("{} — {:.1}% (avg {:.1}%)", p.name, p.peak_density_pct, p.mean_density_pct);
+                                        ui.selectable_label(is_sel, lbl)
+                                    });
+                                    if resp.inner.clicked() {
+                                        select_part = Some(p.instance_id);
+                                    }
+                                }
+                            });
+                    }
+                }
+            });
+        });
+
+        if close_now {
+            self.toggle_thermal_map();
+        } else if recompute {
+            self.refresh_thermal_map();
+            self.scene_dirty = true;
+        } else if let Some(iid) = select_part {
+            self.selected_set.clear();
+            self.selected_set.insert(iid);
+            self.selected = Some(iid);
+            self.selection_anchor = Some(iid);
+            self.scene_dirty = true;
         }
     }
 }

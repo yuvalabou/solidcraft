@@ -491,7 +491,22 @@ impl NestCraftApp {
                                 }
                             }
 
-                            const PLACEHOLDERS: [(&str, &str, &str); 7] = [
+                            if icon_label_button(
+                                ui,
+                                "Thermal Map",
+                                "sls_thermal_map",
+                                true,
+                                self.thermal_map_open,
+                            )
+                            .backing_on_hover_text(
+                                "Toggle 3D sintered powder-bed thermal density map (20×20×20 mm local density)",
+                            )
+                            .clicked()
+                            {
+                                self.toggle_thermal_map();
+                            }
+
+                            const PLACEHOLDERS: [(&str, &str, &str); 6] = [
                                 (
                                     "Stair Highlight",
                                     "sls_orient_lock",
@@ -521,11 +536,6 @@ impl NestCraftApp {
                                     "Collision Check",
                                     "sls_auto_nest",
                                     "Highlight part-to-part clearance violations and overlaps (coming soon)",
-                                ),
-                                (
-                                    "Thermal Map",
-                                    "render_sun",
-                                    "Estimate sintered powder-bed thermal density hotspots (coming soon)",
                                 ),
                             ];
 

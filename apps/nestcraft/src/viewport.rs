@@ -41,6 +41,7 @@ pub fn mesh_to_shared_tris(mesh: &TriMesh) -> Arc<SharedTris> {
 pub struct SceneCache {
     pub parts: HashMap<PartId, Arc<SharedTris>>,
     pub no_build_zone: Option<(Arc<TriMesh>, Arc<SharedTris>)>,
+    pub thermal_colors: Option<HashMap<InstanceId, [u8; 4]>>,
 }
 
 impl SceneCache {
@@ -181,19 +182,27 @@ pub fn build_gpu_scene_with_exclude(
         let in_nbz = job.world_bounds_in_no_build_zone(wb);
         let valid = above_floor && !in_nbz;
         let is_selected = selected.contains(&inst.id);
-        let color = instance_palette_color(
-            &mut scene,
-            inst.color,
-            valid,
-            is_selected,
-            inst.transparent,
-            part_color,
-            part_faded,
-            selected_color,
-            selected_faded,
-            oob_color,
-            oob_faded,
-        );
+        let color = if let Some(t_rgba) = cache.thermal_colors.as_ref().and_then(|m| m.get(&inst.id)) {
+            let mut rgba = *t_rgba;
+            if inst.transparent {
+                rgba[3] = 128;
+            }
+            scene.color(rgba)
+        } else {
+            instance_palette_color(
+                &mut scene,
+                inst.color,
+                valid,
+                is_selected,
+                inst.transparent,
+                part_color,
+                part_faded,
+                selected_color,
+                selected_faded,
+                oob_color,
+                oob_faded,
+            )
+        };
         entry.place(inst.transform, color);
 
         if is_selected {

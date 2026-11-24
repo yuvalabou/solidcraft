@@ -232,7 +232,10 @@ pub(crate) struct NestCraftApp {
     pub(crate) report_preview: Option<nestcraft_core::report::BuildReport>,
     pub(crate) slice_dist_open: bool,
     pub(crate) slice_dist_step_mm: f32,
+    pub(crate) slice_dist_bed_scale: bool,
     pub(crate) slice_dist_cache: Option<nestcraft_core::slice::SliceDistribution>,
+    pub(crate) thermal_map_open: bool,
+    pub(crate) thermal_report: Option<nestcraft_core::thermal::ThermalMapReport>,
     pub(crate) export_stl_selected_only: bool,
     pub(crate) export_stl_prefix: String,
     pub(crate) export_stl_suffix: String,
@@ -741,7 +744,10 @@ impl NestCraftApp {
             report_preview: None,
             slice_dist_open: false,
             slice_dist_step_mm: 1.0,
+            slice_dist_bed_scale: false,
             slice_dist_cache: None,
+            thermal_map_open: false,
+            thermal_report: None,
             export_stl_selected_only: false,
             export_stl_prefix: String::new(),
             export_stl_suffix: String::new(),
@@ -1894,6 +1900,32 @@ impl NestCraftApp {
         if self.slice_dist_open {
             self.slice_dist_cache = None;
         }
+        if self.thermal_map_open {
+            self.refresh_thermal_map();
+        }
+    }
+
+    pub(crate) fn refresh_thermal_map(&mut self) {
+        let rep = nestcraft_core::thermal::ThermalMapReport::compute(&self.job);
+        let mut colors = HashMap::with_capacity(rep.parts.len());
+        for p in &rep.parts {
+            colors.insert(p.instance_id, nestcraft_core::thermal::thermal_rgba(p.peak_density_pct));
+        }
+        self.scene_cache.thermal_colors = Some(colors);
+        self.thermal_report = Some(rep);
+    }
+
+    pub(crate) fn toggle_thermal_map(&mut self) {
+        self.thermal_map_open = !self.thermal_map_open;
+        if self.thermal_map_open {
+            self.refresh_thermal_map();
+            self.status = "Thermal Map enabled (20×20×20 mm local sintered density)".to_owned();
+        } else {
+            self.scene_cache.thermal_colors = None;
+            self.thermal_report = None;
+            self.status = "Thermal Map disabled".to_owned();
+        }
+        self.scene_dirty = true;
     }
 
     pub(crate) fn import_no_build_zone_stl(&mut self, path: &Path) {
