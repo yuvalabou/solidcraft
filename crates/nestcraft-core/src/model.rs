@@ -1103,6 +1103,15 @@ impl BuildJob {
     ///
     /// Returns the newly created instance IDs, or an empty `Vec` if the mesh has <= 1 shell.
     pub fn split_instance_shells(&mut self, inst_id: InstanceId) -> Result<Vec<InstanceId>> {
+        self.split_instance_shells_with_options(inst_id, false)
+    }
+
+    /// Split disconnected shells of `inst_id` into separate parts/instances, optionally keeping the source.
+    pub fn split_instance_shells_with_options(
+        &mut self,
+        inst_id: InstanceId,
+        keep_source: bool,
+    ) -> Result<Vec<InstanceId>> {
         let src = self
             .instances
             .iter()
@@ -1117,7 +1126,9 @@ impl BuildJob {
         if shells.len() <= 1 {
             return Ok(Vec::new());
         }
-        self.remove_instance(inst_id);
+        if !keep_source {
+            self.remove_instance(inst_id);
+        }
         let mut created = Vec::with_capacity(shells.len());
         for (idx, shell_mesh) in shells.into_iter().enumerate() {
             let name = format!("{} [Shell {}]", proto.name, idx + 1);
@@ -1140,6 +1151,12 @@ impl BuildJob {
     ///
     /// Removes the source instances and returns the newly created merged instance ID.
     pub fn merge_instances(&mut self, ids: &[InstanceId]) -> Result<InstanceId> {
+        self.merge_instances_with_options(ids, false)
+    }
+
+    /// Merge 2 or more instances into a single combined part/instance in world coordinates,
+    /// optionally keeping the source instances.
+    pub fn merge_instances_with_options(&mut self, ids: &[InstanceId], keep_sources: bool) -> Result<InstanceId> {
         let id_set: std::collections::HashSet<InstanceId> = ids.iter().copied().collect();
         let sources: Vec<PartInstance> = self
             .instances
@@ -1190,8 +1207,10 @@ impl BuildJob {
             new_inst.color = shared_color;
             new_inst.transparent = all_transparent;
         }
-        for src in &sources {
-            self.remove_instance(src.id);
+        if !keep_sources {
+            for src in &sources {
+                self.remove_instance(src.id);
+            }
         }
         Ok(new_id)
     }

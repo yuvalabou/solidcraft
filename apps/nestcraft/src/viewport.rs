@@ -763,6 +763,116 @@ pub fn instances_in_screen_rect(
     hits
 }
 
+/// Projected screen-space centerpoint handle for a visible selected instance.
+#[derive(Debug, Clone, Copy)]
+pub struct CenterpointHandle {
+    pub id: InstanceId,
+    pub screen_pos: egui::Pos2,
+    pub world_pos: [f32; 3],
+    pub valid: bool,
+}
+
+/// Project the world-space bounding-box centers of visible selected instances to viewport coordinates.
+pub fn selected_centerpoints(
+    job: &BuildJob,
+    selected: &HashSet<InstanceId>,
+    cam: &Camera,
+    rect: egui::Rect,
+) -> Vec<CenterpointHandle> {
+    if selected.is_empty() {
+        return Vec::new();
+    }
+    let w = f64::from(rect.width().max(1.0));
+    let h = f64::from(rect.height().max(1.0));
+    let [mw, md, mh] = job.machine.size_mm();
+    let radius = f64::from((mw * mw + md * md + mh * mh).sqrt()) * 2.0;
+
+    let mut centers = Vec::new();
+    for inst in &job.instances {
+        if !selected.contains(&inst.id) || !job.is_instance_visible(inst) {
+            continue;
+        }
+        let Some(proto) = job.part(inst.part_id) else {
+            continue;
+        };
+        let wb = inst.world_bounds(proto.mesh.bounds);
+        let world_pos = [
+            (wb[0][0] + wb[1][0]) * 0.5,
+            (wb[0][1] + wb[1][1]) * 0.5,
+            (wb[0][2] + wb[1][2]) * 0.5,
+        ];
+        if let Some((px, py, _)) = cam.to_screen(
+            [f64::from(world_pos[0]), f64::from(world_pos[1]), f64::from(world_pos[2])].into(),
+            w,
+            h,
+            radius,
+        ) {
+            let screen_pos = egui::pos2(rect.left() + px as f32, rect.top() + py as f32);
+            if rect.contains(screen_pos) {
+                let valid = job.world_bounds_above_floor(wb) && !job.world_bounds_in_no_build_zone(wb);
+                centers.push(CenterpointHandle {
+                    id: inst.id,
+                    screen_pos,
+                    world_pos,
+                    valid,
+                });
+            }
+        }
+    }
+    centers
+}
+
+/// Project the top-left-front corner of the combined bounding box of visible selected instances
+/// for the free-rotation handle, returning `(screen_pos, combined_center_pivot)`.
+pub fn selected_rotation_handle(
+    job: &BuildJob,
+    selected: &HashSet<InstanceId>,
+    cam: &Camera,
+    rect: egui::Rect,
+) -> Option<(egui::Pos2, [f32; 3])> {
+    if selected.is_empty() {
+        return None;
+    }
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    let mut any = false;
+    for inst in &job.instances {
+        if !selected.contains(&inst.id) || !job.is_instance_visible(inst) {
+            continue;
+        }
+        let Some(proto) = job.part(inst.part_id) else {
+            continue;
+        };
+        let wb = inst.world_bounds(proto.mesh.bounds);
+        for k in 0..3 {
+            lo[k] = lo[k].min(wb[0][k]);
+            hi[k] = hi[k].max(wb[1][k]);
+        }
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    let corner = [lo[0], lo[1], hi[2]];
+    let pivot = [
+        (lo[0] + hi[0]) * 0.5,
+        (lo[1] + hi[1]) * 0.5,
+        (lo[2] + hi[2]) * 0.5,
+    ];
+    let w = f64::from(rect.width().max(1.0));
+    let h = f64::from(rect.height().max(1.0));
+    let [mw, md, mh] = job.machine.size_mm();
+    let radius = f64::from((mw * mw + md * md + mh * mh).sqrt()) * 2.0;
+    let (px, py, _) = cam.to_screen(
+        [f64::from(corner[0]), f64::from(corner[1]), f64::from(corner[2])].into(),
+        w,
+        h,
+        radius,
+    )?;
+    let screen_pos = egui::pos2(rect.left() + px as f32, rect.top() + py as f32);
+    rect.contains(screen_pos).then_some((screen_pos, pivot))
+}
+
 fn inverse_transform_ray(
     m: &Transform3x4,
     origin: [f32; 3],
@@ -1041,5 +1151,15 @@ mod tests {
         assert_eq!(instances_in_screen_rect(&job, &cam, rect, rect), vec![iid]);
         let empty = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(5.0, 5.0));
         assert!(instances_in_screen_rect(&job, &cam, rect, empty).is_empty());
+
+        let selected = HashSet::from([iid]);
+        let centers = selected_centerpoints(&job, &selected, &cam, rect);
+        assert_eq!(centers.len(), 1);
+        assert!(centers[0].valid);
+        assert!(rect.contains(centers[0].screen_pos));
+        assert!(selected_rotation_handle(&job, &selected, &cam, rect).is_some());
+
+        assert!(selected_centerpoints(&job, &HashSet::new(), &cam, rect).is_empty());
+        assert!(selected_rotation_handle(&job, &HashSet::new(), &cam, rect).is_none());
     }
 }

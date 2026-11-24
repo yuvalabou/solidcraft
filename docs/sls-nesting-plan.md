@@ -58,11 +58,13 @@ Before starting implementation, three repository/environment details were verifi
 - **Startup Initialization (`apps/nestcraft/src/main.rs`):**
   - Define `static NESTCRAFT_ICONS: IconSet = IconSet::extended(solidcraft_look::icons::DATA, IconExtension { masters: &[], aliases: &[...], icon_accents: &[] })` mapping the 10 semantic actions (`sls_import_mesh`, `sls_auto_nest`, `sls_sinterbox`, `sls_orient_lock`, `sls_duplicate`, `sls_emboss_id`, `sls_hollow`, `sls_slice_z`, `sls_collision`, `sls_thermal_map`) to existing `crates/look/icons/design/svg/model/` masters.
   - Call `solidcraft_look::glyphs::install()`, `solidcraft_look::themes::install()`, `solidcraft_ui_kit::icons::install(&NESTCRAFT_ICONS)`, and `solidcraft_look::fonts::install(&ctx)` — **never** calling `solidcraft_look::install(&ctx)` so `OnceLock` does not lock out `&NESTCRAFT_ICONS`.
-- **UI Layout (`apps/nestcraft/src/ui/`):**
-  - Route every window, panel, ribbon, menu, and tooltip through `solidcraft_ui_kit::Container` and `BackingTooltipExt` (`cargo xtask ui-containers` compliant).
-  - **Top Ribbon / Toolbar:** Machine selector (Formiga P110 / HT403P), Import STL/3MF, Export 3MF, Duplicate (`×N`), Orientation Lock (`Free` / `ZOnly` / `Fixed`), Auto-Nest (stubbed/disabled until Stage 2C).
-  - **Left Parts Tree Panel:** List of `PartPrototype`s and `PartInstance`s with triangle count, dimensions, quantity, and selection sync.
-  - **Right Inspector / Metrics Panel:** Selected part transform (`X, Y, Z, Rx, Ry, Rz`), rotation constraint, and live build metrics (build volume, `max_Z`, packing density %).
+- **UI Layout (`apps/nestcraft/src/main.rs`):**
+  - Route every window, panel, ribbon, menu, and tooltip through `solidcraft_ui_kit::Container` and `BackingTooltipExt` (`cargo xtask ui-containers` compliant), with draggable pop-up modals (`movable(true)`).
+  - **Top Banner:** Machine selector (Formiga P110 / HT403P / Custom + Configure), Open/Save `.nestc`, Import STL/3MF, Sample Part, Export 3MF / STLs, Auto-Nest (stubbed), Fit View, Theme toggle.
+  - **Edit Banner:** Part-editing actions (`Move`, `Scale`, `Duplicate`, `Drop Z=0`, `Delete`, `Align`, `Shells to Parts`, `Merge Parts` with Keep/Delete Original prompt) plus placeholder mesh tools (`Shell`, `Labels`, `Repair Mesh`, `Boolean`, `Cut / Split`, `Offset`).
+  - **View Banner:** `Zoom to All Parts`, `Zoom to Selected`, `Zoom to Platform`, `Zoom to All`, `Zoom to Selection` (right-drag rect).
+  - **Left Sidebar (Part Scope):** Aerated `Build Parts Browser` (groups, 20×20 thumbnails, visibility/transparency/lock/color, context menu) + `Selected Part` configuration and metrics.
+  - **Right Sidebar (Build Scope):** Aerated `Build Summary` (counts, volume, surface area, Z height/layers, density, floor/NBZ warnings), `Build Chamber` (machine, origin, margins, clearance), and `No-Build Zone`.
 
 ### Stage 1C — Instanced 3D Viewport & Basic Manipulation
 - **Build Volume & Floor Grid (`apps/nestcraft/src/viewport.rs`):**

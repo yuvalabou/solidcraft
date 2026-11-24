@@ -89,6 +89,14 @@ struct DragState {
     plane_z: f32,
 }
 
+#[derive(Debug, Clone)]
+struct RotateDragState {
+    pivot: [f32; 3],
+    instances: Vec<(InstanceId, [[f32; 4]; 3], RotationConstraint)>,
+    accum_dx: f32,
+    accum_dy: f32,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DragZoneState {
     start_position: [f32; 3],
@@ -106,6 +114,12 @@ struct BoxSelectState {
 enum ImportedKind {
     Stl(Arc<TriMesh>, Arc<SharedTris>),
     ThreeMf(Vec<(ThreeMfLoadedItem, Arc<SharedTris>)>),
+}
+
+#[derive(Debug, Clone)]
+enum KeepOrDeleteAction {
+    SplitShells(Vec<InstanceId>),
+    MergeSelected(Vec<InstanceId>),
 }
 
 enum BackgroundLoadOutcome {
@@ -271,6 +285,7 @@ struct NestCraftApp {
     color_picker_open: bool,
     color_picker_rgb: [u8; 3],
     color_picker_undo_pushed: bool,
+    pending_keep_delete: Option<KeepOrDeleteAction>,
     export_stl_dialog_open: bool,
     export_stl_selected_only: bool,
     export_stl_prefix: String,
@@ -278,6 +293,7 @@ struct NestCraftApp {
     export_stl_include_id: bool,
     export_stl_apply_transform: bool,
     drag_state: Option<DragState>,
+    rotate_drag: Option<RotateDragState>,
     drag_zone: Option<DragZoneState>,
     box_select: Option<BoxSelectState>,
     zoom_rect_mode: bool,
@@ -304,6 +320,7 @@ struct NestCraftApp {
     custom_bed_origin: BedOrigin,
     new_group_name: String,
     view_bar_rect: Option<egui::Rect>,
+    repair_badge_rect: Option<egui::Rect>,
 }
 
 fn default_true() -> bool {
@@ -769,6 +786,7 @@ impl NestCraftApp {
             color_picker_open: false,
             color_picker_rgb: [220, 220, 220],
             color_picker_undo_pushed: false,
+            pending_keep_delete: None,
             export_stl_dialog_open: false,
             export_stl_selected_only: false,
             export_stl_prefix: String::new(),
@@ -776,6 +794,7 @@ impl NestCraftApp {
             export_stl_include_id: true,
             export_stl_apply_transform: true,
             drag_state: None,
+            rotate_drag: None,
             drag_zone: None,
             box_select: None,
             zoom_rect_mode: false,
@@ -802,6 +821,7 @@ impl NestCraftApp {
             custom_bed_origin,
             new_group_name: String::new(),
             view_bar_rect: None,
+            repair_badge_rect: None,
         }
     }
 
@@ -813,6 +833,18 @@ impl NestCraftApp {
         let report = manifold::analyze_mesh(&mesh);
         self.manifold_cache.insert(part_id, report.clone());
         Some(report)
+    }
+
+    fn faulty_placed_instance_ids(&mut self) -> Vec<InstanceId> {
+        let pairs: Vec<(InstanceId, PartId)> = self.job.instances.iter().map(|i| (i.id, i.part_id)).collect();
+        pairs
+            .into_iter()
+            .filter_map(|(iid, pid)| {
+                self.manifold_report(pid)
+                    .filter(|r| !r.is_watertight_manifold())
+                    .map(|_| iid)
+            })
+            .collect()
     }
 
     fn apply_machine_slot(&mut self, slot: usize) {
@@ -865,7 +897,31 @@ impl NestCraftApp {
         self.status = format!("Split '{}' into {count} shell parts.", proto.name);
     }
 
+    fn request_shells_to_parts(&mut self, ids: Vec<InstanceId>) {
+        if ids.is_empty() {
+            return;
+        }
+        let any_multi_shell = ids.iter().any(|id| {
+            self.job
+                .instances
+                .iter()
+                .find(|i| i.id == *id)
+                .and_then(|inst| self.job.part(inst.part_id))
+                .and_then(|proto| manifold::split_shells(&proto.mesh).ok())
+                .is_some_and(|shells| shells.len() > 1)
+        });
+        if !any_multi_shell {
+            self.status = "Selected part(s) have only 1 shell.".to_owned();
+            return;
+        }
+        self.pending_keep_delete = Some(KeepOrDeleteAction::SplitShells(ids));
+    }
+
     fn shells_to_parts_for(&mut self, ids: Vec<InstanceId>) {
+        self.shells_to_parts_for_with_keep(ids, false);
+    }
+
+    fn shells_to_parts_for_with_keep(&mut self, ids: Vec<InstanceId>, keep_source: bool) {
         if ids.is_empty() {
             return;
         }
@@ -873,12 +929,14 @@ impl NestCraftApp {
         let mut split_sources = 0usize;
         let mut created_all = Vec::new();
         for id in ids {
-            if let Ok(created) = self.job.split_instance_shells(id)
+            if let Ok(created) = self.job.split_instance_shells_with_options(id, keep_source)
                 && !created.is_empty()
             {
                 split_sources += 1;
-                self.euler_edit.remove(&id);
-                self.selected_set.remove(&id);
+                if !keep_source {
+                    self.euler_edit.remove(&id);
+                    self.selected_set.remove(&id);
+                }
                 created_all.extend(created);
             }
         }
@@ -895,9 +953,19 @@ impl NestCraftApp {
         self.selection_anchor = self.selected;
         self.mark_dirty();
         self.status = format!(
-            "Split {split_sources} part(s) into {} shell parts.",
-            created_all.len()
+            "Split {split_sources} part(s) into {} shell parts{}.",
+            created_all.len(),
+            if keep_source { " (kept original)" } else { "" }
         );
+    }
+
+    fn request_merge_selected_parts(&mut self) {
+        if self.selected_set.len() < 2 {
+            self.status = "Select at least 2 parts to merge.".to_owned();
+            return;
+        }
+        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        self.pending_keep_delete = Some(KeepOrDeleteAction::MergeSelected(ids));
     }
 
     fn merge_selected_parts(&mut self) {
@@ -906,15 +974,30 @@ impl NestCraftApp {
             return;
         }
         let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        self.merge_selected_parts_with_keep(&ids, false);
+    }
+
+    fn merge_selected_parts_with_keep(&mut self, ids: &[InstanceId], keep_sources: bool) {
+        if ids.len() < 2 {
+            self.status = "Select at least 2 parts to merge.".to_owned();
+            return;
+        }
         self.push_undo();
-        match self.job.merge_instances(&ids) {
+        match self.job.merge_instances_with_options(ids, keep_sources) {
             Ok(merged_id) => {
-                for id in &ids {
-                    self.euler_edit.remove(id);
+                if !keep_sources {
+                    for id in ids {
+                        self.euler_edit.remove(id);
+                    }
                 }
                 self.select_instance(Some(merged_id));
                 self.mark_dirty();
-                self.status = format!("Merged {} parts into #{}", ids.len(), merged_id.0);
+                self.status = format!(
+                    "Merged {} parts into #{}{}",
+                    ids.len(),
+                    merged_id.0,
+                    if keep_sources { " (kept originals)" } else { "" }
+                );
             }
             Err(e) => {
                 self.undo_stack.pop();
@@ -1584,7 +1667,9 @@ impl NestCraftApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
                 let mut c = egui::Color32::from_rgb(
                     self.color_picker_rgb[0],
@@ -2435,7 +2520,7 @@ impl NestCraftApp {
             scope(ui, |ui| {
                 egui::ScrollArea::horizontal()
                     .id_salt("sls_top_scroll")
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                     .show(ui, |ui| {
                         ui.horizontal_centered(|ui| {
                             ui.label(egui::RichText::new("NestCraft").strong().color(t.text));
@@ -2524,71 +2609,6 @@ impl NestCraftApp {
                                 .clicked()
                             {
                                 self.export_stl_dialog_open = true;
-                            }
-
-                            StageBar::separator(ui);
-                            if icon_label_button(ui, "Move", "move", !self.selected_set.is_empty(), false)
-                                .backing_on_hover_text("Move selected part(s) by relative offset or absolute position (M)")
-                                .clicked()
-                            {
-                                self.open_move_dialog();
-                            }
-                            if icon_label_button(ui, "Scale", "resize", !self.selected_set.is_empty(), false)
-                                .backing_on_hover_text("Scale selected part(s) uniformly or per-axis (Ctrl+S)")
-                                .clicked()
-                            {
-                                self.open_scale_dialog();
-                            }
-                            if icon_label_button(ui, "Duplicate", "sls_duplicate", self.selected.is_some(), false)
-                                .backing_on_hover_text("Duplicate selected part in X/Y/Z grid (Ctrl+D)")
-                                .clicked()
-                            {
-                                self.open_duplicate_dialog();
-                            }
-                            if icon_label_button(ui, "Drop Z=0", "sls_orient_lock", self.selected.is_some(), false)
-                                .backing_on_hover_text("Drop selected part to the build floor (Z)")
-                                .clicked()
-                                && let Some(sel) = self.selected
-                                && self.job.drop_instance_to_floor(sel)
-                            {
-                                self.mark_dirty();
-                                self.status = "Dropped part to Z = 0".to_owned();
-                            }
-                            if icon_label_button(ui, "Delete", "delete", self.selected.is_some(), true)
-                                .backing_on_hover_text("Remove selected instance from build (Del)")
-                                .clicked()
-                            {
-                                self.delete_selected();
-                            }
-                            if icon_label_button(
-                                ui,
-                                "Align",
-                                "sls_orient_lock",
-                                self.selected.is_some(),
-                                self.align_face_target.is_some(),
-                            )
-                            .backing_on_hover_text("Select a face on the part to snap its normal to -Z (build floor)")
-                            .clicked()
-                                && let Some(sel) = self.selected
-                            {
-                                if self.align_face_target.is_some() {
-                                    self.clear_align_face_mode();
-                                } else {
-                                    self.start_align_face_mode(sel);
-                                }
-                            }
-                            if icon_label_button(ui, "Shells to Parts", "mesh_body", !self.selected_set.is_empty(), false)
-                                .backing_on_hover_text("Split disconnected STL shells in selected part(s) into separate parts")
-                                .clicked()
-                            {
-                                let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
-                                self.shells_to_parts_for(ids);
-                            }
-                            if icon_label_button(ui, "Merge Parts", "sls_auto_nest", self.selected_set.len() >= 2, false)
-                                .backing_on_hover_text("Combine selected parts into a single merged mesh part")
-                                .clicked()
-                            {
-                                self.merge_selected_parts();
                             }
 
                             StageBar::separator(ui);
@@ -2730,7 +2750,7 @@ impl NestCraftApp {
             scope(ui, |ui| {
                 egui::ScrollArea::horizontal()
                     .id_salt("sls_view_scroll")
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                     .show(ui, |ui| {
                         ui.horizontal_centered(|ui| {
                             ui.label(egui::RichText::new("View").strong().color(t.text));
@@ -2786,6 +2806,187 @@ impl NestCraftApp {
                                 } else {
                                     "Cancelled zoom to selection".to_owned()
                                 };
+                            }
+                        });
+                    });
+            });
+        });
+    }
+
+    fn draw_edit_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
+        let chrome = Container::new(ctx, Surface::Chrome);
+        let edit_panel = chrome.edge("sls_edit_bar", Edge::Top).exact_size(36.0).resizable(false);
+        chrome.show_edge(ui, edit_panel, chrome.edge_frame(t.toolbar), |ui| {
+            scope(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("sls_edit_scroll")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                    .show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.label(egui::RichText::new("Edit").strong().color(t.text));
+                            StageBar::separator(ui);
+
+                            if icon_label_button(ui, "Move", "move", !self.selected_set.is_empty(), false)
+                                .backing_on_hover_text("Move selected part(s) by relative offset or absolute position (M)")
+                                .clicked()
+                            {
+                                self.open_move_dialog();
+                            }
+                            if icon_label_button(ui, "Scale", "resize", !self.selected_set.is_empty(), false)
+                                .backing_on_hover_text("Scale selected part(s) uniformly or per-axis (Ctrl+S)")
+                                .clicked()
+                            {
+                                self.open_scale_dialog();
+                            }
+                            if icon_label_button(ui, "Duplicate", "sls_duplicate", self.selected.is_some(), false)
+                                .backing_on_hover_text("Duplicate selected part in X/Y/Z grid (Ctrl+D)")
+                                .clicked()
+                            {
+                                self.open_duplicate_dialog();
+                            }
+                            if icon_label_button(ui, "Drop Z=0", "sls_orient_lock", self.selected.is_some(), false)
+                                .backing_on_hover_text("Drop selected part to the build floor (Z)")
+                                .clicked()
+                                && let Some(sel) = self.selected
+                                && self.job.drop_instance_to_floor(sel)
+                            {
+                                self.mark_dirty();
+                                self.status = "Dropped part to Z = 0".to_owned();
+                            }
+                            if icon_label_button(ui, "Delete", "delete", self.selected.is_some(), true)
+                                .backing_on_hover_text("Remove selected instance from build (Del)")
+                                .clicked()
+                            {
+                                self.delete_selected();
+                            }
+                            if icon_label_button(
+                                ui,
+                                "Align",
+                                "sls_orient_lock",
+                                self.selected.is_some(),
+                                self.align_face_target.is_some(),
+                            )
+                            .backing_on_hover_text("Select a face on the part to snap its normal to -Z (build floor)")
+                            .clicked()
+                                && let Some(sel) = self.selected
+                            {
+                                if self.align_face_target.is_some() {
+                                    self.clear_align_face_mode();
+                                } else {
+                                    self.start_align_face_mode(sel);
+                                }
+                            }
+                            if icon_label_button(ui, "Shells to Parts", "mesh_body", !self.selected_set.is_empty(), false)
+                                .backing_on_hover_text("Split disconnected STL shells in selected part(s) into separate parts")
+                                .clicked()
+                            {
+                                let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+                                self.request_shells_to_parts(ids);
+                            }
+                            if icon_label_button(ui, "Merge Parts", "sls_auto_nest", self.selected_set.len() >= 2, false)
+                                .backing_on_hover_text("Combine selected parts into a single merged mesh part")
+                                .clicked()
+                            {
+                                self.request_merge_selected_parts();
+                            }
+
+                            StageBar::separator(ui);
+
+                            const PLACEHOLDERS: [(&str, &str, &str); 6] = [
+                                (
+                                    "Shell",
+                                    "mesh_body",
+                                    "Hollow selected part with configurable wall thickness & drain holes (coming soon)",
+                                ),
+                                (
+                                    "Labels",
+                                    "sls_duplicate",
+                                    "Add embossed or engraved part labels & serial numbers (coming soon)",
+                                ),
+                                (
+                                    "Repair Mesh",
+                                    "sls_orient_lock",
+                                    "Auto-fix non-manifold edges, holes, and inverted normals (coming soon)",
+                                ),
+                                (
+                                    "Boolean",
+                                    "sls_auto_nest",
+                                    "Union, subtract, or intersect selected parts (coming soon)",
+                                ),
+                                (
+                                    "Cut / Split",
+                                    "resize",
+                                    "Slice selected part along a plane with optional alignment pins (coming soon)",
+                                ),
+                                (
+                                    "Offset",
+                                    "move",
+                                    "Uniform surface offset / tolerance compensation (coming soon)",
+                                ),
+                            ];
+
+                            for (label, icon, tip) in PLACEHOLDERS {
+                                icon_label_button(ui, label, icon, false, false).backing_on_hover_text(tip);
+                            }
+                        });
+                    });
+            });
+        });
+    }
+
+    fn draw_analyze_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
+        let chrome = Container::new(ctx, Surface::Chrome);
+        let analyze_panel = chrome.edge("sls_analyze_bar", Edge::Top).exact_size(36.0).resizable(false);
+        chrome.show_edge(ui, analyze_panel, chrome.edge_frame(t.toolbar), |ui| {
+            scope(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("sls_analyze_scroll")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                    .show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.label(egui::RichText::new("Analyze").strong().color(t.text));
+                            StageBar::separator(ui);
+
+                            const PLACEHOLDERS: [(&str, &str, &str); 7] = [
+                                (
+                                    "Stair Highlight",
+                                    "sls_orient_lock",
+                                    "Highlight shallow-angle faces prone to layer stair-stepping (coming soon)",
+                                ),
+                                (
+                                    "Measure",
+                                    "resize",
+                                    "Measure point-to-point distance, angles, and diameters (coming soon)",
+                                ),
+                                (
+                                    "Wall Thickness",
+                                    "mesh_body",
+                                    "Check thin walls below critical SLS threshold (coming soon)",
+                                ),
+                                (
+                                    "Up / Downskin",
+                                    "sls_duplicate",
+                                    "Analyze upward-facing and downward-facing surface angles (coming soon)",
+                                ),
+                                (
+                                    "Shadow Area",
+                                    "sls_zoom_all",
+                                    "Project XY sintered shadow area and cross-section footprint (coming soon)",
+                                ),
+                                (
+                                    "Collision Check",
+                                    "sls_auto_nest",
+                                    "Highlight part-to-part clearance violations and overlaps (coming soon)",
+                                ),
+                                (
+                                    "Thermal Map",
+                                    "render_sun",
+                                    "Estimate sintered powder-bed thermal density hotspots (coming soon)",
+                                ),
+                            ];
+
+                            for (label, icon, tip) in PLACEHOLDERS {
+                                icon_label_button(ui, label, icon, false, false).backing_on_hover_text(tip);
                             }
                         });
                     });
@@ -3705,7 +3906,7 @@ impl NestCraftApp {
                             } else {
                                 vec![id]
                             };
-                            self.shells_to_parts_for(ids);
+                            self.request_shells_to_parts(ids);
                         }
                         TreeAction::AlignFace(id) => {
                             self.select_instance(Some(id));
@@ -3731,7 +3932,7 @@ impl NestCraftApp {
                             self.select_group_instances(gid);
                         }
                         TreeAction::MergeSelected => {
-                            self.merge_selected_parts();
+                            self.request_merge_selected_parts();
                         }
                     }
                 }
@@ -3769,7 +3970,9 @@ impl NestCraftApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
                 row(ui, "Profile Name", |ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.custom_name).desired_width(180.0));
@@ -3908,7 +4111,9 @@ impl NestCraftApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
                 let mut total = self.dup_total.max(1);
                 let total_changed = row(ui, "Total Count", |ui| {
@@ -4014,7 +4219,9 @@ impl NestCraftApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
                 let mode_changed = row(ui, "Mode", |ui| {
                     ui.push_id("move_mode_seg", |ui| {
@@ -4103,7 +4310,9 @@ impl NestCraftApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
                 let mut axis_mode = usize::from(!self.scale_uniform);
                 row(ui, "Axis Mode", |ui| {
@@ -4341,7 +4550,9 @@ impl NestCraftApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
                 if single_selected {
                     status_line(
@@ -4637,7 +4848,9 @@ impl NestCraftApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
                 let mut scope_idx = usize::from(self.export_stl_selected_only);
                 row(ui, "Scope", |ui| {
@@ -4772,7 +4985,9 @@ impl NestCraftApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
                 status_line(
                     ui,
@@ -4817,7 +5032,9 @@ impl NestCraftApp {
             .collapsible(false)
             .resizable(false)
             .title_bar(true)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
                 ui.set_min_width(320.0);
                 ui.label(&task.current_label);
@@ -4835,6 +5052,62 @@ impl NestCraftApp {
                     StatusTone::Dim,
                 );
             });
+    }
+
+    fn draw_keep_delete_modal(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.pending_keep_delete.clone() else {
+            return;
+        };
+        let (title, summary) = match &action {
+            KeepOrDeleteAction::SplitShells(ids) => (
+                "Split Shells",
+                format!(
+                    "Split {} selected part(s) into separate shell parts.\nKeep or delete the original part(s)?",
+                    ids.len()
+                ),
+            ),
+            KeepOrDeleteAction::MergeSelected(ids) => (
+                "Merge Parts",
+                format!(
+                    "Merge {} selected parts into a single combined part.\nKeep or delete the original parts?",
+                    ids.len()
+                ),
+            ),
+        };
+        let mut open = true;
+        let mut choice: Option<bool> = None;
+        let mut cancel = false;
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                ui.label(summary);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if button(ui, "Keep Original", Button::Primary).clicked() {
+                        choice = Some(true);
+                    }
+                    if button(ui, "Delete Original", Button::Small).clicked() {
+                        choice = Some(false);
+                    }
+                    if button(ui, "Cancel", Button::Small).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if let Some(keep) = choice {
+            self.pending_keep_delete = None;
+            match action {
+                KeepOrDeleteAction::SplitShells(ids) => self.shells_to_parts_for_with_keep(ids, keep),
+                KeepOrDeleteAction::MergeSelected(ids) => self.merge_selected_parts_with_keep(&ids, keep),
+            }
+        } else if cancel || !open {
+            self.pending_keep_delete = None;
+        }
     }
 
     fn draw_selected_part_section(&mut self, ui: &mut egui::Ui, t: &Tokens) {
@@ -5366,6 +5639,35 @@ impl NestCraftApp {
         });
     }
 
+    fn start_instance_drag(
+        &mut self,
+        anchor_id: InstanceId,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+        anchor_pos: [f32; 3],
+    ) {
+        let drag_instances: Vec<(InstanceId, [f32; 3])> = self
+            .job
+            .instances
+            .iter()
+            .filter(|i| self.selected_set.contains(&i.id) && !i.locked)
+            .map(|i| (i.id, i.translation()))
+            .collect();
+        if !drag_instances.is_empty()
+            && let Some(hit_pt) = viewport::intersect_camera_plane(&self.camera, rect, pos, anchor_pos)
+        {
+            self.push_undo();
+            let drag_ids: Vec<InstanceId> = drag_instances.iter().map(|(id, _)| *id).collect();
+            self.drag_state = Some(DragState {
+                anchor_id,
+                instances: drag_instances,
+                start_hit: hit_pt,
+                plane_z: anchor_pos[2],
+            });
+            self.start_moving_layer(viewport::DragExclude::Instances(drag_ids));
+        }
+    }
+
     fn draw_viewport(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: &Tokens) {
         let central = Container::new(ctx, Surface::Viewport).central();
         central.show(ui, |ui| {
@@ -5378,9 +5680,28 @@ impl NestCraftApp {
             let over_compass = resp
                 .hover_pos()
                 .is_some_and(|p| p.distance(compass_centre) <= 52.0 || p.distance(home_centre) <= 14.0);
-            let over_view_bar = resp
-                .hover_pos()
-                .is_some_and(|p| self.view_bar_rect.is_some_and(|r| r.contains(p)));
+            let over_view_bar = resp.hover_pos().is_some_and(|p| {
+                self.view_bar_rect.is_some_and(|r| r.contains(p))
+                    || self.repair_badge_rect.is_some_and(|r| r.contains(p))
+            });
+
+            let centerpoints = viewport::selected_centerpoints(&self.job, &self.selected_set, &self.camera, rect);
+            let rot_handle = viewport::selected_rotation_handle(&self.job, &self.selected_set, &self.camera, rect);
+            let pointer_hover = resp.hover_pos().filter(|_| !over_compass && !over_view_bar && self.align_face_target.is_none() && !self.zoom_rect_mode);
+            let hovered_rot = rot_handle.filter(|(p, _)| pointer_hover.is_some_and(|hp| hp.distance(*p) <= 12.0));
+            let hovered_center = if hovered_rot.is_none() {
+                centerpoints
+                    .iter()
+                    .find(|c| pointer_hover.is_some_and(|hp| hp.distance(c.screen_pos) <= 9.0))
+                    .copied()
+            } else {
+                None
+            };
+            if self.drag_state.is_some() || self.rotate_drag.is_some() {
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if hovered_rot.is_some() || hovered_center.is_some() {
+                ctx.set_cursor_icon(egui::CursorIcon::Grab);
+            }
 
             if !over_compass
                 && !over_view_bar
@@ -5427,66 +5748,118 @@ impl NestCraftApp {
                 && resp.drag_started_by(egui::PointerButton::Primary)
                 && let Some(pos) = resp.interact_pointer_pos()
             {
-                let hit = viewport::pick_instance(&self.job, &self.camera, rect, pos);
-                if let Some(iid) = hit {
-                    if !self.selected_set.contains(&iid) {
-                        self.select_instance(Some(iid));
+                if let Some((_, pivot)) = hovered_rot {
+                    let rot_instances: Vec<(InstanceId, [[f32; 4]; 3], RotationConstraint)> = self
+                        .job
+                        .instances
+                        .iter()
+                        .filter(|i| {
+                            self.selected_set.contains(&i.id)
+                                && !i.locked
+                                && i.constraint != RotationConstraint::Fixed
+                        })
+                        .map(|i| (i.id, i.transform, i.constraint))
+                        .collect();
+                    if !rot_instances.is_empty() {
+                        self.push_undo();
+                        let rot_ids: Vec<InstanceId> = rot_instances.iter().map(|(id, _, _)| *id).collect();
+                        self.rotate_drag = Some(RotateDragState {
+                            pivot,
+                            instances: rot_instances,
+                            accum_dx: 0.0,
+                            accum_dy: 0.0,
+                        });
+                        self.start_moving_layer(viewport::DragExclude::Instances(rot_ids));
                     }
-                    if let Some(inst) = self.job.instances.iter().find(|i| i.id == iid)
-                        && !inst.locked
-                    {
-                        let tr = inst.translation();
-                        let plane_z = tr[2];
-                        let drag_instances: Vec<(InstanceId, [f32; 3])> = self
-                            .job
-                            .instances
-                            .iter()
-                            .filter(|i| self.selected_set.contains(&i.id) && !i.locked)
-                            .map(|i| (i.id, i.translation()))
-                            .collect();
-                        if !drag_instances.is_empty()
-                            && let Some(hit_pt) = viewport::intersect_camera_plane(&self.camera, rect, pos, tr)
-                        {
-                            self.push_undo();
-                            let drag_ids: Vec<InstanceId> = drag_instances.iter().map(|(id, _)| *id).collect();
-                            self.drag_state = Some(DragState {
-                                anchor_id: iid,
-                                instances: drag_instances,
-                                start_hit: hit_pt,
-                                plane_z,
-                            });
-                            self.start_moving_layer(viewport::DragExclude::Instances(drag_ids));
-                        }
-                    }
-                } else if viewport::pick_no_build_zone(&self.job, &self.camera, rect, pos) {
-                    if let Some(zone) = &self.job.no_build_zone
-                        && !zone.locked
-                    {
-                        let zone_pos = zone.position;
-                        let plane_z = zone_pos[2];
-                        if let Some(hit_pt) = viewport::intersect_camera_plane(&self.camera, rect, pos, zone_pos) {
-                            self.push_undo();
-                            self.drag_zone = Some(DragZoneState {
-                                start_position: zone_pos,
-                                start_hit: hit_pt,
-                                plane_z,
-                            });
-                            self.start_moving_layer(viewport::DragExclude::NoBuildZone);
-                        }
-                    }
+                } else if let Some(ch) = hovered_center {
+                    self.start_instance_drag(ch.id, rect, pos, ch.world_pos);
                 } else {
-                    self.box_select = Some(BoxSelectState {
-                        start: pos,
-                        current: pos,
-                        additive: ui.input(|i| i.modifiers.command),
-                    });
+                    let hit = viewport::pick_instance(&self.job, &self.camera, rect, pos);
+                    if let Some(iid) = hit {
+                        if !self.selected_set.contains(&iid) {
+                            self.select_instance(Some(iid));
+                        }
+                        if let Some(inst) = self.job.instances.iter().find(|i| i.id == iid)
+                            && !inst.locked
+                        {
+                            let tr = inst.translation();
+                            self.start_instance_drag(iid, rect, pos, tr);
+                        }
+                    } else if viewport::pick_no_build_zone(&self.job, &self.camera, rect, pos) {
+                        if let Some(zone) = &self.job.no_build_zone
+                            && !zone.locked
+                        {
+                            let zone_pos = zone.position;
+                            let plane_z = zone_pos[2];
+                            if let Some(hit_pt) = viewport::intersect_camera_plane(&self.camera, rect, pos, zone_pos) {
+                                self.push_undo();
+                                self.drag_zone = Some(DragZoneState {
+                                    start_position: zone_pos,
+                                    start_hit: hit_pt,
+                                    plane_z,
+                                });
+                                self.start_moving_layer(viewport::DragExclude::NoBuildZone);
+                            }
+                        }
+                    } else {
+                        self.box_select = Some(BoxSelectState {
+                            start: pos,
+                            current: pos,
+                            additive: ui.input(|i| i.modifiers.command),
+                        });
+                    }
                 }
             }
 
             if resp.dragged_by(egui::PointerButton::Primary)
                 && let Some(pos) = resp.interact_pointer_pos()
             {
-                if let Some(bs) = &mut self.box_select {
+                if let Some(rd) = &mut self.rotate_drag {
+                    let delta = resp.drag_delta();
+                    rd.accum_dx += delta.x;
+                    rd.accum_dy += delta.y;
+                    let (cam_right, cam_up, _) = self.camera.basis();
+                    let cr = cam_right.to_f32();
+                    let cu = cam_up.to_f32();
+                    let ctrl = ui.input(|i| i.modifiers.command);
+                    let alt = ui.input(|i| i.modifiers.alt);
+                    let sensitivity = 0.012_f32;
+                    let raw_vec = [
+                        cu[0] * rd.accum_dx + cr[0] * rd.accum_dy,
+                        cu[1] * rd.accum_dx + cr[1] * rd.accum_dy,
+                        cu[2] * rd.accum_dx + cr[2] * rd.accum_dy,
+                    ];
+                    let raw_mag = (raw_vec[0] * raw_vec[0] + raw_vec[1] * raw_vec[1] + raw_vec[2] * raw_vec[2]).sqrt();
+                    let mut angle = raw_mag * sensitivity;
+                    if alt {
+                        let step = 10.0_f32.to_radians();
+                        angle = (angle / step).round() * step;
+                    }
+                    let free_axis = if ctrl && raw_mag > 1e-6 {
+                        snap_to_nearest_axis(raw_vec)
+                    } else {
+                        raw_vec
+                    };
+                    let pivot = rd.pivot;
+                    for (id, orig, constraint) in &rd.instances {
+                        let (axis, inst_angle) = match constraint {
+                            RotationConstraint::ZOnly => {
+                                let mut za = rd.accum_dx * sensitivity;
+                                if alt {
+                                    let step = 10.0_f32.to_radians();
+                                    za = (za / step).round() * step;
+                                }
+                                ([0.0, 0.0, 1.0], za)
+                            }
+                            RotationConstraint::Free => (free_axis, angle),
+                            RotationConstraint::Fixed => continue,
+                        };
+                        if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == *id) {
+                            inst.transform = rotate_transform_around_pivot(*orig, pivot, axis, inst_angle);
+                            self.euler_edit.remove(id);
+                        }
+                    }
+                } else if let Some(bs) = &mut self.box_select {
                     bs.current = pos;
                 } else if let Some(dz) = self.drag_zone {
                     let shift = ui.input(|i| i.modifiers.shift);
@@ -5547,6 +5920,10 @@ impl NestCraftApp {
             }
 
             if resp.drag_stopped() {
+                if self.rotate_drag.take().is_some() {
+                    self.mark_dirty();
+                    self.status = "Rotated selected part(s)".to_owned();
+                }
                 if let Some(bs) = self.box_select.take() {
                     let sel_rect = egui::Rect::from_two_pos(bs.start, bs.current);
                     if sel_rect.width() > 3.0 || sel_rect.height() > 3.0 {
@@ -5954,6 +6331,49 @@ impl NestCraftApp {
                 );
             }
 
+            if !centerpoints.is_empty() || rot_handle.is_some() {
+                let p = ui.painter_at(rect);
+                for ch in &centerpoints {
+                    let is_hovered = hovered_center.is_some_and(|h| h.id == ch.id);
+                    let fill = if ch.valid { t.accent } else { t.error };
+                    let size = if is_hovered { 9.0 } else { 7.0 };
+                    p.rect(
+                        egui::Rect::from_center_size(ch.screen_pos, egui::vec2(size, size)),
+                        1.0,
+                        fill,
+                        egui::Stroke::new(1.5, t.panel),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+                if let Some((rot_pos, _)) = rot_handle {
+                    let active = self.rotate_drag.is_some() || hovered_rot.is_some();
+                    let r = if active { 10.5 } else { 9.0 };
+                    let bg = if active { t.accent } else { t.panel.gamma_multiply(0.92) };
+                    let fg = if active { t.selected_ink } else { t.accent };
+                    p.circle(rot_pos, r, bg, egui::Stroke::new(1.5, t.accent));
+                    // Draw a curved rotation arc + arrowhead inside the handle.
+                    let arc_r = r * 0.54;
+                    let steps = 12usize;
+                    let start_a = -0.35_f32;
+                    let end_a = 4.05_f32;
+                    let pts: Vec<egui::Pos2> = (0..=steps)
+                        .map(|i| {
+                            let a = start_a + (end_a - start_a) * (i as f32 / steps as f32);
+                            egui::pos2(rot_pos.x + arc_r * a.cos(), rot_pos.y + arc_r * a.sin())
+                        })
+                        .collect();
+                    p.add(egui::Shape::line(pts, egui::Stroke::new(1.6, fg)));
+                    let tip = egui::pos2(rot_pos.x + arc_r * end_a.cos(), rot_pos.y + arc_r * end_a.sin());
+                    let tang = egui::vec2(-end_a.sin(), end_a.cos());
+                    let rad = egui::vec2(end_a.cos(), end_a.sin());
+                    p.add(egui::Shape::convex_polygon(
+                        vec![tip + tang * 2.5, tip - tang * 1.8 + rad * 2.6, tip - tang * 1.8 - rad * 2.4],
+                        fg,
+                        egui::Stroke::NONE,
+                    ));
+                }
+            }
+
             if rect.width() >= 140.0 && rect.height() >= 140.0 {
                 let nav = view_compass::orbit(ui, &mut self.compass_drag, ui.rect_contains_pointer(rect), |p| {
                     p.distance(compass_centre) <= 49.5
@@ -6032,6 +6452,78 @@ impl NestCraftApp {
             } else {
                 self.view_bar_rect = None;
             }
+
+            let faulty_ids = self.faulty_placed_instance_ids();
+            if !faulty_ids.is_empty() && rect.width() >= 180.0 && rect.height() >= 120.0 {
+                let badge_max_rect = egui::Rect::from_min_max(
+                    rect.right_bottom() - egui::vec2(220.0, 52.0),
+                    rect.right_bottom() - egui::vec2(12.0, 12.0),
+                );
+                let badge_resp = ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(badge_max_rect)
+                        .layout(egui::Layout::right_to_left(egui::Align::Max)),
+                    |ui| {
+                        let frame_resp = egui::Frame::new()
+                            .fill(t.panel.gamma_multiply(0.94))
+                            .stroke(egui::Stroke::new(1.25, t.error))
+                            .corner_radius(t.radius_sm)
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let (icon_rect, _) =
+                                        ui.allocate_exact_size(egui::vec2(18.0, 16.0), egui::Sense::hover());
+                                    let p = ui.painter();
+                                    let tri = vec![
+                                        egui::pos2(icon_rect.center().x, icon_rect.top() + 1.0),
+                                        egui::pos2(icon_rect.right() - 1.0, icon_rect.bottom() - 1.0),
+                                        egui::pos2(icon_rect.left() + 1.0, icon_rect.bottom() - 1.0),
+                                    ];
+                                    p.add(egui::Shape::convex_polygon(
+                                        tri,
+                                        t.error,
+                                        egui::Stroke::new(1.0, t.error),
+                                    ));
+                                    p.text(
+                                        icon_rect.center() + egui::vec2(0.0, 1.5),
+                                        egui::Align2::CENTER_CENTER,
+                                        "!",
+                                        egui::FontId::proportional(11.0),
+                                        t.selected_ink,
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!("{} mesh error(s)", faulty_ids.len()))
+                                            .small()
+                                            .strong()
+                                            .color(t.error),
+                                    );
+                                });
+                            });
+                        let click_resp = ui.interact(
+                            frame_resp.response.rect,
+                            ui.scope_id().with("sls_repair_gate_badge"),
+                            egui::Sense::click(),
+                        );
+                        let tip = format!(
+                            "{} placed part(s) have non-manifold, open-edge, or winding errors. Click to select faulty part(s).",
+                            faulty_ids.len()
+                        );
+                        if click_resp.backing_on_hover_text(tip).clicked() {
+                            self.selected_set.clear();
+                            for &id in &faulty_ids {
+                                self.selected_set.insert(id);
+                            }
+                            self.selected = faulty_ids.last().copied();
+                            self.selection_anchor = self.selected;
+                            self.status = format!("Selected {} part(s) with mesh errors", faulty_ids.len());
+                        }
+                        frame_resp.response
+                    },
+                );
+                self.repair_badge_rect = Some(badge_resp.inner.rect);
+            } else {
+                self.repair_badge_rect = None;
+            }
         });
     }
 }
@@ -6047,6 +6539,8 @@ impl eframe::App for NestCraftApp {
         self.handle_shortcuts(&ctx);
         self.handle_dropped_files(&ctx);
         self.draw_top_bar(ui, &ctx, &t);
+        self.draw_edit_bar(ui, &ctx, &t);
+        self.draw_analyze_bar(ui, &ctx, &t);
         self.draw_view_bar(ui, &ctx, &t);
         self.draw_bottom_bar(ui, &ctx, &t);
         self.draw_parts_browser(ui, &ctx, &t);
@@ -6060,8 +6554,51 @@ impl eframe::App for NestCraftApp {
         self.draw_color_picker_modal(&ctx);
         self.draw_export_stl_modal(&ctx);
         self.draw_below_zero_import_modal(&ctx);
+        self.draw_keep_delete_modal(&ctx);
         self.draw_load_progress_modal(&ctx);
         self.draw_drop_overlay(&ctx, window_rect, &t);
+    }
+}
+
+fn rotate_transform_around_pivot(
+    orig: [[f32; 4]; 3],
+    pivot: [f32; 3],
+    axis: [f32; 3],
+    angle_rad: f32,
+) -> [[f32; 4]; 3] {
+    let len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    if len < 1e-6 || angle_rad.abs() < 1e-6 {
+        return orig;
+    }
+    let (ux, uy, uz) = (axis[0] / len, axis[1] / len, axis[2] / len);
+    let (s, c) = angle_rad.sin_cos();
+    let t = 1.0 - c;
+    let r = [
+        [t * ux * ux + c, t * ux * uy - s * uz, t * ux * uz + s * uy],
+        [t * ux * uy + s * uz, t * uy * uy + c, t * uy * uz - s * ux],
+        [t * ux * uz - s * uy, t * uy * uz + s * ux, t * uz * uz + c],
+    ];
+    let mut out = [[0.0; 4]; 3];
+    for row in 0..3 {
+        for col in 0..3 {
+            out[row][col] = r[row][0] * orig[0][col] + r[row][1] * orig[1][col] + r[row][2] * orig[2][col];
+        }
+        let dx = orig[0][3] - pivot[0];
+        let dy = orig[1][3] - pivot[1];
+        let dz = orig[2][3] - pivot[2];
+        out[row][3] = pivot[row] + r[row][0] * dx + r[row][1] * dy + r[row][2] * dz;
+    }
+    out
+}
+
+fn snap_to_nearest_axis(v: [f32; 3]) -> [f32; 3] {
+    let (ax, ay, az) = (v[0].abs(), v[1].abs(), v[2].abs());
+    if ax >= ay && ax >= az {
+        [v[0].signum(), 0.0, 0.0]
+    } else if ay >= az {
+        [0.0, v[1].signum(), 0.0]
+    } else {
+        [0.0, 0.0, v[2].signum()]
     }
 }
 
@@ -6592,6 +7129,50 @@ mod tests {
         assert_eq!(app.job.instances.len(), 1);
         assert!(app.undo());
         assert_eq!(app.job.instances.len(), 2);
+
+        // Merging with keep_sources = true preserves originals (2 + 1 = 3).
+        app.select_instance(Some(i1));
+        app.toggle_select_instance(i2);
+        app.merge_selected_parts_with_keep(&[i1, i2], true);
+        assert_eq!(app.job.instances.len(), 3);
+        let kept_merged_id = app.selected.expect("kept_merged");
+
+        // Splitting with keep_source = true preserves the merged source (3 + 2 = 5).
+        app.shells_to_parts_for_with_keep(vec![kept_merged_id], true);
+        assert_eq!(app.job.instances.len(), 5);
+        assert!(app.undo());
+        assert_eq!(app.job.instances.len(), 3);
+    }
+
+    #[test]
+    fn faulty_placed_instance_ids_flags_non_watertight_meshes() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        assert!(app.faulty_placed_instance_ids().is_empty());
+
+        // Single open triangle is non-watertight and must be flagged.
+        let open_mesh = TriMesh::from_indexed(
+            vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+            vec![[0, 1, 2]],
+        )
+        .expect("open triangle mesh");
+        let pid = app.job.add_part("OpenTriangle".to_owned(), Arc::new(open_mesh));
+        let faulty_id = app.job.add_instance_on_floor_next(pid).expect("instance");
+        assert_eq!(app.faulty_placed_instance_ids(), vec![faulty_id]);
+    }
+
+    #[test]
+    fn rotate_transform_around_pivot_rotates_90_deg_around_z() {
+        let orig = [
+            [1.0, 0.0, 0.0, 20.0],
+            [0.0, 1.0, 0.0, 10.0],
+            [0.0, 0.0, 1.0, 5.0],
+        ];
+        let pivot = [10.0, 10.0, 5.0];
+        let rotated = rotate_transform_around_pivot(orig, pivot, [0.0, 0.0, 1.0], std::f32::consts::FRAC_PI_2);
+        assert!((rotated[0][3] - 10.0).abs() < 1e-4);
+        assert!((rotated[1][3] - 20.0).abs() < 1e-4);
+        assert!((rotated[2][3] - 5.0).abs() < 1e-4);
     }
 
     #[test]
