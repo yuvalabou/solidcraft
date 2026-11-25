@@ -31,7 +31,9 @@ pub fn mesh_to_shared_tris(mesh: &TriMesh) -> Arc<SharedTris> {
     Arc::new(SharedTris {
         vertices,
         indices,
-        flat: true,
+        // Vertices are emitted unshared with exact precomputed face normals; keep `flat: false`
+        // so the shader uses those normals directly instead of noisy `dpdx`/`dpdy` derivatives.
+        flat: false,
         bounds: mesh.bounds,
     })
 }
@@ -1425,5 +1427,25 @@ mod tests {
             scene.instanced.iter().all(|m| m.look == InstanceLook::Opaque),
             "colliding non-transparent parts should stay opaque"
         );
+    }
+
+    #[test]
+    fn mesh_to_shared_tris_uses_exact_vertex_normals_without_flat_derivatives() {
+        let mesh = TriMesh::from_indexed(
+            vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]],
+            vec![[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]],
+        )
+        .expect("valid tet");
+
+        let tris = mesh_to_shared_tris(&mesh);
+        assert!(!tris.flat, "must keep vertex normals instead of flat derivative reconstruction");
+        for (tri_i, corners) in tris.corners().enumerate() {
+            let expected = mesh.tri_normals[tri_i];
+            for (_, n) in corners {
+                for k in 0..3 {
+                    assert!((n[k] - expected[k]).abs() < 1e-6);
+                }
+            }
+        }
     }
 }
