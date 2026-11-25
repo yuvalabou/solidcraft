@@ -26,13 +26,13 @@ impl NestCraftApp {
                             ui.label(egui::RichText::new("NestCraft").strong().color(t.text));
                             StageBar::separator(ui);
 
-                            let mut machine_idx = self.active_machine_slot.min(2);
+                            let mut machine_idx = self.active_machine_slot.min(MACHINE_SLOT_COUNT - 1);
                             let machine_changed = ui
                                 .push_id("machine_seg", |ui| {
                                     segmented(
                                         ui,
                                         &mut machine_idx,
-                                        &["Formiga P110", "Farsoon HT403P", "Custom"],
+                                        &["P110", "P110 Velocis", "P100", "HT403P", "SS403P", "Custom"],
                                         Segments {
                                             dense: true,
                                             intrinsic: true,
@@ -44,7 +44,7 @@ impl NestCraftApp {
                                 .inner;
                             if machine_changed {
                                 self.apply_machine_slot(machine_idx);
-                                if machine_idx == 2 {
+                                if machine_idx == CUSTOM_MACHINE_SLOT {
                                     self.open_custom_platform_dialog();
                                 }
                             }
@@ -67,15 +67,15 @@ impl NestCraftApp {
                             {
                                 self.start_open_bed(path, ctx);
                             }
-                            if icon_label_button(ui, "Save Bed", "save", true, false)
+                            if icon_label_button(ui, "Save Bed", "save", self.save_task.is_none(), false)
                                 .backing_on_hover_text("Save current bed, parts, and settings as .nestc (Ctrl+Shift+S)")
                                 .clicked()
                                 && let Some(path) = rfd::FileDialog::new()
                                     .add_filter("NestCraft Bed", &["nestc"])
-                                    .set_file_name("bed.nestc")
+                                    .set_file_name(self.default_save_filename("nestc"))
                                     .save_file()
                             {
-                                self.save_bed_file(&path);
+                                self.start_save_bed(path, ctx);
                             }
                             if icon_label_button(ui, "Generate Report", "export", true, self.report_dialog_open)
                                 .backing_on_hover_text(
@@ -119,7 +119,7 @@ impl NestCraftApp {
                                 .clicked()
                                 && let Some(path) = rfd::FileDialog::new()
                                     .add_filter("3MF", &["3mf"])
-                                    .set_file_name("build.3mf")
+                                    .set_file_name(self.default_save_filename("3mf"))
                                     .save_file()
                             {
                                 self.export_threemf_file(&path);
@@ -498,10 +498,7 @@ impl NestCraftApp {
                             {
                                 self.slice_dist_open = !self.slice_dist_open;
                                 if self.slice_dist_open {
-                                    self.slice_dist_cache = Some(nestcraft_core::slice::SliceDistribution::compute(
-                                        &self.job,
-                                        self.slice_dist_step_mm,
-                                    ));
+                                    self.start_slice_distribution();
                                 }
                             }
 
@@ -520,7 +517,22 @@ impl NestCraftApp {
                                 self.toggle_thermal_map();
                             }
 
-                            const PLACEHOLDERS: [(&str, &str, &str); 6] = [
+                            if icon_label_button(
+                                ui,
+                                "Collision Check",
+                                "sls_collision",
+                                true,
+                                self.collision_check_active,
+                            )
+                            .backing_on_hover_text(
+                                "Detect part-to-part collisions & clearance violations with 3D voxel highlight (Ctrl+K)",
+                            )
+                            .clicked()
+                            {
+                                self.toggle_collision_check();
+                            }
+
+                            const PLACEHOLDERS: [(&str, &str, &str); 5] = [
                                 (
                                     "Stair Highlight",
                                     "sls_orient_lock",
@@ -545,11 +557,6 @@ impl NestCraftApp {
                                     "Shadow Area",
                                     "sls_zoom_all",
                                     "Project XY sintered shadow area and cross-section footprint (coming soon)",
-                                ),
-                                (
-                                    "Collision Check",
-                                    "sls_auto_nest",
-                                    "Highlight part-to-part clearance violations and overlaps (coming soon)",
                                 ),
                             ];
 

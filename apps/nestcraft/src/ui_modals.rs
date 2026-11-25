@@ -118,7 +118,7 @@ impl NestCraftApp {
         let mut apply = false;
         let mut reset_default = false;
         let mut cancel = false;
-        let slot = self.active_machine_slot.min(2);
+        let slot = self.active_machine_slot.min(MACHINE_SLOT_COUNT - 1);
         egui::Window::new("Configure Machine Platform")
             .open(&mut open)
             .collapsible(false)
@@ -204,12 +204,28 @@ impl NestCraftApp {
                         };
                     }
                 });
+                row(ui, "Default Material", |ui| {
+                    let cur = nestcraft_core::report::material_by_id(&self.custom_material_id);
+                    egui::ComboBox::from_id_salt("cfg_material_combo")
+                        .selected_text(cur.name)
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            for mat in nestcraft_core::report::SLS_MATERIALS {
+                                if ui
+                                    .selectable_label(self.custom_material_id == mat.id, mat.name)
+                                    .clicked()
+                                {
+                                    self.custom_material_id = mat.id.to_owned();
+                                }
+                            }
+                        });
+                });
                 ui.separator();
                 ui.horizontal(|ui| {
                     if button(ui, "Apply", Button::Primary).clicked() {
                         apply = true;
                     }
-                    if slot < 2 && button(ui, "Reset Default", Button::Small).clicked() {
+                    if slot < CUSTOM_MACHINE_SLOT && button(ui, "Reset Default", Button::Small).clicked() {
                         reset_default = true;
                     }
                     if button(ui, "Cancel", Button::Small).clicked() {
@@ -226,6 +242,7 @@ impl NestCraftApp {
             self.custom_min_z = d.min_z_mm;
             self.custom_clearance = d.clearance_mm;
             self.custom_bed_origin = d.bed_origin.into();
+            self.custom_material_id = d.material_id.clone();
         } else if apply {
             let clean_machine = MachineProfile::custom(&self.custom_name, self.custom_size_mm);
             self.machine_presets[slot] = MachinePresetConfig {
@@ -235,6 +252,7 @@ impl NestCraftApp {
                 min_z_mm: self.custom_min_z,
                 clearance_mm: self.custom_clearance,
                 bed_origin: self.custom_bed_origin.into(),
+                material_id: self.custom_material_id.clone(),
             };
             if let Some(dir) = nestcraft_data_dir()
                 && let Err(e) = save_machine_presets_to_dir(&dir, &self.machine_presets)
@@ -1190,6 +1208,63 @@ impl NestCraftApp {
             });
     }
 
+    pub(crate) fn draw_save_progress_modal(&self, ctx: &egui::Context, t: &Tokens) {
+        if let Some(task) = &self.save_task {
+            let permille = task
+                .progress_permille
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(1000);
+            let frac = (permille as f32 / 1000.0).clamp(0.0, 1.0);
+            let stage = task
+                .stage
+                .lock()
+                .ok()
+                .map(|s| s.clone())
+                .unwrap_or_else(|| "Saving...".to_owned());
+            egui::Window::new("Saving Job")
+                .collapsible(false)
+                .resizable(false)
+                .title_bar(true)
+                .movable(true)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
+                .show(ctx, |ui| {
+                    ui.set_min_width(320.0);
+                    ui.label(&stage);
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .show_percentage()
+                            .animate(true)
+                            .desired_width(320.0),
+                    );
+                    ui.add_space(4.0);
+                    status_line(ui, &task.file_name, StatusTone::Dim);
+                });
+        } else if let Some((msg, is_error, at)) = &self.save_hint {
+            let ttl = std::time::Duration::from_millis(2500);
+            let elapsed = at.elapsed();
+            if elapsed < ttl {
+                ctx.request_repaint_after(ttl - elapsed);
+                let stroke_color = if *is_error { t.form_error } else { t.accent };
+                egui::Area::new(egui::Id::unique("sls_save_hint"))
+                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
+                    .interactable(false)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::NONE
+                            .fill(t.panel)
+                            .stroke(egui::Stroke::new(1.0, stroke_color))
+                            .corner_radius(t.radius_md)
+                            .inner_margin(egui::Margin::symmetric(14, 8))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(msg).color(t.text).strong());
+                            });
+                    });
+            }
+        }
+    }
+
     pub(crate) fn draw_keep_delete_modal(&mut self, ctx: &egui::Context) {
         let Some(action) = self.pending_keep_delete.clone() else {
             return;
@@ -1854,7 +1929,7 @@ impl NestCraftApp {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if button(ui, "Run 2D Nest", Button::Primary).clicked() {
+                    if self.calc_task.is_none() && button(ui, "Run 2D Nest", Button::Primary).clicked() {
                         run_now = true;
                     }
                     if button(ui, "Close", Button::Small).clicked() {
@@ -1864,27 +1939,33 @@ impl NestCraftApp {
             });
 
         if run_now {
-            self.push_undo();
-            let sel = self.selected_set.clone();
-            match nestcraft_core::nest2d::nest_2d(&mut self.job, &self.nest2d_config, Some(&sel)) {
-                Ok(res) => {
-                    self.euler_edit.clear();
-                    self.mark_dirty();
-                    self.status = format!(
-                        "2D Nest: {} placed, {} overflow ({:.1}% fill, {} ms)",
-                        res.placed_count, res.overflow_count, res.used_area_pct, res.elapsed_ms
-                    );
-                    self.nest2d_last_result = Some(res);
-                }
-                Err(e) => {
-                    self.undo_stack.pop();
-                    self.status = format!("2D Nest error: {e}");
-                }
-            }
+            self.start_nest2d();
         }
         if close_now || !open {
             self.nest2d_dialog_open = false;
         }
+    }
+
+    pub(crate) fn draw_calc_progress_modal(&self, ctx: &egui::Context) {
+        let Some(task) = &self.calc_task else {
+            return;
+        };
+        if !task.show_progress {
+            return;
+        }
+        let total = task.total.load(std::sync::atomic::Ordering::Relaxed).max(1);
+        let done = task.completed.load(std::sync::atomic::Ordering::Relaxed).min(total);
+        let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
+        egui::Window::new(&task.title)
+            .collapsible(false)
+            .resizable(false)
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                ui.label(format!("Calculating... {done}/{total} ({:.0}%)", frac * 100.0));
+                ui.add(egui::ProgressBar::new(frac).animate(true).desired_width(280.0));
+            });
     }
 }
 

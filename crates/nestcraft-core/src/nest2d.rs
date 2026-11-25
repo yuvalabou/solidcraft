@@ -73,6 +73,16 @@ pub fn nest_2d(
     cfg: &Nest2dConfig,
     selected: Option<&HashSet<InstanceId>>,
 ) -> Result<Nest2dResult> {
+    nest_2d_with_progress(job, cfg, selected, None)
+}
+
+/// Run 2D auto-nesting on `job` in-place with optional `(done, total)` progress callback.
+pub fn nest_2d_with_progress(
+    job: &mut BuildJob,
+    cfg: &Nest2dConfig,
+    selected: Option<&HashSet<InstanceId>>,
+    progress: Option<&dyn Fn(usize, usize)>,
+) -> Result<Nest2dResult> {
     let t0 = Instant::now();
     let res = cfg.resolution_mm.clamp(0.25, 10.0);
     let min_dist = cfg.min_distance_mm.max(0.0);
@@ -314,7 +324,16 @@ pub fn nest_2d(
         merged
     };
 
+    let total_progress = (instance_angles.len() * 2).max(1);
+    if let Some(cb) = progress {
+        cb(instance_angles.len(), total_progress);
+    }
+    let mut placed_step = 0usize;
     for (idx, cands) in instance_angles {
+        placed_step += 1;
+        if let Some(cb) = progress {
+            cb(total_progress / 2 + placed_step, total_progress);
+        }
         let (part_id, orig_tr) = {
             let inst = &job.instances[idx];
             (inst.part_id, inst.transform)

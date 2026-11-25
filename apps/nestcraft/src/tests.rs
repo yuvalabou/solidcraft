@@ -353,7 +353,7 @@ use solidcraft_viewport::StandardView;
         // Switching machines does not carry over the active machine's No-Build Zone.
         let mesh = app.job.parts[0].mesh.clone();
         app.job.no_build_zone = Some(NoBuildZone::new("P110 Zone", mesh));
-        app.apply_machine_slot(1);
+        app.apply_machine_slot(3);
         assert_ne!(
             app.job.no_build_zone.as_ref().map(|z| z.name.as_str()),
             Some("P110 Zone")
@@ -813,4 +813,273 @@ use solidcraft_viewport::StandardView;
         app.toggle_projection();
         assert!(!app.is_orthographic());
         assert!((app.camera.half_height() - initial_hh).abs() < 1e-6);
+    }
+
+    #[test]
+    fn collision_check_updates_incrementally_for_single_part_moves_and_ignores_selection() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        let i1 = app.selected.expect("i1");
+        app.add_sample_part();
+        let i2 = app.selected.expect("i2");
+        app.add_sample_part();
+        let i3 = app.selected.expect("i3");
+
+        // Place i1 and i2 overlapping, and i3 far away in free space.
+        app.job.instances[0].set_translation([0.0, 0.0, 0.0]);
+        app.job.instances[1].set_translation([10.0, 0.0, 0.0]);
+        app.job.instances[2].set_translation([200.0, 0.0, 0.0]);
+
+        app.collision_check_active = true;
+        let initial_rep = app.collision_cache.sync(&app.job, COLLISION_VOXEL_PITCH_MM);
+        app.apply_collision_report(&initial_rep, true);
+        assert_eq!(app.collision_cache.last_tested_pairs(), 3);
+        assert_eq!(app.scene_cache.collision_ids, HashSet::from([i1, i2]));
+
+        // Selecting i3 must not spawn a background calc task or re-test any pairs.
+        app.select_instance(Some(i3));
+        assert!(app.calc_task.is_none());
+        assert_eq!(app.collision_cache.last_tested_pairs(), 3);
+
+        // Nudging i3 in free space completes synchronously without spawning a background task.
+        app.nudge_selected([5.0, 0.0, 0.0]);
+        assert!(app.calc_task.is_none());
+        assert_eq!(app.collision_cache.last_tested_pairs(), 2);
+        assert_eq!(app.scene_cache.collision_ids, HashSet::from([i1, i2]));
+
+        // Live-dragging i3 into i2 tests only 2 pairs (i3 vs i1, i3 vs i2) and adds i3 to collision_ids.
+        let i3_start = app.job.instances[2].translation();
+        app.drag_state = Some(DragState {
+            anchor_id: i3,
+            instances: vec![(i3, i3_start)],
+            start_hit: i3_start,
+            plane_z: i3_start[2],
+        });
+        app.job.instances[2].set_translation([15.0, 0.0, 0.0]);
+        app.update_live_drag_collision();
+        assert_eq!(app.collision_cache.last_tested_pairs(), 2);
+        assert_eq!(app.scene_cache.collision_ids, HashSet::from([i1, i2, i3]));
+
+        // Moving i3 back to free space resolves i3's collision while preserving static pair (i1, i2).
+        app.job.instances[2].set_translation([200.0, 0.0, 0.0]);
+        app.update_live_drag_collision();
+        assert_eq!(app.collision_cache.last_tested_pairs(), 2);
+        assert_eq!(app.scene_cache.collision_ids, HashSet::from([i1, i2]));
+    }
+
+    #[test]
+    fn calc_progress_modal_shown_only_for_initial_calculations_not_updates() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        app.add_sample_part();
+        app.add_sample_part();
+        app.job.instances[0].set_translation([0.0, 0.0, 0.0]);
+        app.job.instances[1].set_translation([10.0, 0.0, 0.0]);
+        app.job.instances[2].set_translation([200.0, 0.0, 0.0]);
+
+        // Pressing Collision Check button shows progress modal; toggling off cancels task; toggling on again shows it.
+        app.toggle_collision_check();
+        assert!(app.calc_task.as_ref().is_some_and(|t| t.show_progress));
+        app.toggle_collision_check();
+        assert!(app.calc_task.is_none());
+        app.toggle_collision_check();
+        assert!(app.calc_task.as_ref().is_some_and(|t| t.show_progress));
+
+        // After cache is initialized, moving a part into overlap triggers an update without progress modal.
+        app.calc_task = None;
+        let _ = app.collision_cache.sync(&app.job, COLLISION_VOXEL_PITCH_MM);
+        app.job.instances[2].set_translation([15.0, 0.0, 0.0]);
+        app.refresh_collision_check();
+        assert!(app.calc_task.as_ref().is_some_and(|t| !t.show_progress));
+
+        // Initial thermal map shows progress; refreshing existing thermal map does not.
+        app.calc_task = None;
+        app.start_thermal_map();
+        assert!(app.calc_task.as_ref().is_some_and(|t| t.show_progress));
+        app.calc_task = None;
+        app.thermal_report = Some(nestcraft_core::thermal::ThermalMapReport::compute(&app.job));
+        app.refresh_thermal_map();
+        assert!(app.calc_task.as_ref().is_some_and(|t| !t.show_progress));
+
+        // Initial slice distribution shows progress; dirtying & recomputing keeps cache and hides progress.
+        app.calc_task = None;
+        app.start_slice_distribution();
+        assert!(app.calc_task.as_ref().is_some_and(|t| t.show_progress));
+        app.calc_task = None;
+        app.slice_dist_cache = Some(nestcraft_core::slice::SliceDistribution::compute(&app.job, 1.0));
+        app.slice_dist_open = true;
+        app.mark_dirty();
+        assert!(app.slice_dist_cache.is_some());
+        assert!(app.slice_dist_dirty);
+        app.calc_task = None;
+        app.start_slice_distribution();
+        assert!(!app.slice_dist_dirty);
+        assert!(app.calc_task.as_ref().is_some_and(|t| !t.show_progress));
+    }
+
+    #[test]
+    fn async_save_bed_tracks_progress_writes_file_and_sets_hint() {
+        let dir = std::env::temp_dir().join(format!("nestcraft_async_save_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let bed_path = dir.join("saved_job.nestc");
+
+        let ctx = egui::Context::default();
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        app.add_sample_part();
+
+        app.start_save_bed(bed_path.clone(), &ctx);
+        assert!(app.save_task.is_some());
+
+        for _ in 0..100 {
+            app.poll_save_task(&ctx);
+            if app.save_task.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.save_task.is_none());
+        assert!(bed_path.exists());
+        assert!(matches!(
+            &app.save_hint,
+            Some((msg, false, _)) if msg.contains("Saved") && msg.contains("saved_job.nestc")
+        ));
+
+        let mut app2 = NestCraftApp::new();
+        app2.open_bed_file(&bed_path);
+        assert_eq!(app2.job.instances.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_save_filename_uses_date_bed_and_material_convention() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(20_782), (2026, 11, 25));
+
+        assert_eq!(
+            format_job_save_filename("20261125", "Farsoon HT403P", "pa2200", "nestc"),
+            "20261125_ht403_2200.nestc"
+        );
+        assert_eq!(
+            format_job_save_filename("20261125", "EOS Formiga P110", "pa2200", "nestc"),
+            "20261125_p110_2200.nestc"
+        );
+        assert_eq!(
+            format_job_save_filename("20261125", "Farsoon HT403P", "fs3300", "3mf"),
+            "20261125_ht403_3300.3mf"
+        );
+        assert_eq!(
+            format_job_save_filename("20261125", "EOS Formiga P110 Velocis", "pa2200", "nestc"),
+            "20261125_p110v_2200.nestc"
+        );
+        assert_eq!(
+            format_job_save_filename("20261125", "EOS Formiga P100", "pa2200", "nestc"),
+            "20261125_p100_2200.nestc"
+        );
+        assert_eq!(
+            format_job_save_filename("20261125", "Farsoon SS403P", "fs3300", "3mf"),
+            "20261125_ss403_3300.3mf"
+        );
+        assert_eq!(
+            format_job_save_filename("20261125", "Custom SLS", "pa2210fr", "nestc"),
+            "20261125_custom_sls_2210fr.nestc"
+        );
+
+        let app = NestCraftApp::new();
+        let name = app.default_save_filename("nestc");
+        assert!(name.ends_with("_p110_2200.nestc"), "unexpected name: {name}");
+        assert!(name[..8].bytes().all(|b| b.is_ascii_digit()), "expected yyyymmdd prefix: {name}");
+    }
+
+    #[test]
+    fn five_predefined_machines_configure_nbz_materials_and_legacy_migration() {
+        let presets = default_machine_presets();
+        assert_eq!(presets.len(), MACHINE_SLOT_COUNT);
+        assert_eq!(presets[0].name, "EOS Formiga P110");
+        assert_eq!(presets[1].name, "EOS Formiga P110 Velocis");
+        assert_eq!(presets[2].name, "EOS Formiga P100");
+        assert_eq!(presets[3].name, "Farsoon HT403P");
+        assert_eq!(presets[4].name, "Farsoon SS403P");
+        assert_eq!(presets[5].name, "Custom SLS");
+
+        // P110, P110 Velocis, P100 share [200, 250, 330] Front-Left.
+        for slot in [0, 1, 2] {
+            assert_eq!(presets[slot].size_mm, [200.0, 250.0, 330.0]);
+            assert_eq!(presets[slot].bed_origin, BedOriginCfg::FrontLeft);
+        }
+        // P110 & P110 Velocis share NBZ directory; P100 has no NBZ.
+        assert!(slot_supports_no_build_zone(0));
+        assert!(slot_supports_no_build_zone(1));
+        assert_eq!(no_build_zone_dir_for_slot(0), no_build_zone_dir_for_slot(1));
+        assert!(!slot_supports_no_build_zone(2));
+        assert!(no_build_zone_dir_for_slot(2).is_none());
+
+        // HT403P and SS403P share [400, 400, 450] Center origin with distinct default materials.
+        assert_eq!(presets[3].size_mm, [400.0, 400.0, 450.0]);
+        assert_eq!(presets[4].size_mm, [400.0, 400.0, 450.0]);
+        assert_eq!(presets[3].bed_origin, BedOriginCfg::Center);
+        assert_eq!(presets[4].bed_origin, BedOriginCfg::Center);
+        assert_eq!(presets[3].material_id, "pa2200");
+        assert_eq!(presets[4].material_id, "fs3300");
+
+        let mut app = NestCraftApp::new();
+        app.machine_presets = presets;
+        app.apply_machine_slot(3);
+        assert_eq!(app.job.material_id, "pa2200");
+        app.apply_machine_slot(4);
+        assert_eq!(app.job.material_id, "fs3300");
+
+        let mesh = app.job.parts.first().map(|p| p.mesh.clone()).unwrap_or_else(|| {
+            Arc::new(create_sample_bracket_mesh(0).expect("bracket"))
+        });
+        app.job.no_build_zone = Some(NoBuildZone::new("Temp Zone", mesh));
+        app.apply_machine_slot(2);
+        assert!(app.job.no_build_zone.is_none());
+
+        // Legacy 3-slot machines.json migrates cleanly to 6 slots preserving custom values.
+        let dir = std::env::temp_dir().join(format!("nestcraft_legacy_machines_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let legacy_json = serde_json::json!([
+            {
+                "name": "EOS Formiga P110",
+                "size_mm": [195.0, 245.0, 325.0],
+                "wall_margin_mm": 6.0,
+                "min_z_mm": 1.0,
+                "clearance_mm": 3.0,
+                "bed_origin": "FrontLeft"
+            },
+            {
+                "name": "Farsoon HT403P",
+                "size_mm": [390.0, 390.0, 440.0],
+                "wall_margin_mm": 5.0,
+                "min_z_mm": 0.0,
+                "clearance_mm": 2.5,
+                "bed_origin": "Center"
+            },
+            {
+                "name": "My Custom",
+                "size_mm": [300.0, 300.0, 300.0],
+                "wall_margin_mm": 4.0,
+                "min_z_mm": 0.0,
+                "clearance_mm": 2.0,
+                "bed_origin": "FrontLeft"
+            }
+        ]);
+        assert!(std::fs::write(dir.join("machines.json"), legacy_json.to_string()).is_ok());
+        let migrated = load_machine_presets_from_dir(&dir).expect("migrated 6 slots");
+        assert_eq!(migrated[0].size_mm, [195.0, 245.0, 325.0]);
+        assert_eq!(migrated[1].name, "EOS Formiga P110 Velocis");
+        assert_eq!(migrated[1].size_mm, [195.0, 245.0, 325.0]);
+        assert_eq!(migrated[2].name, "EOS Formiga P100");
+        assert_eq!(migrated[2].size_mm, [195.0, 245.0, 325.0]);
+        assert_eq!(migrated[3].size_mm, [390.0, 390.0, 440.0]);
+        assert_eq!(migrated[4].name, "Farsoon SS403P");
+        assert_eq!(migrated[4].size_mm, [390.0, 390.0, 440.0]);
+        assert_eq!(migrated[4].material_id, "fs3300");
+        assert_eq!(migrated[5].name, "My Custom");
+        assert_eq!(migrated[5].size_mm, [300.0, 300.0, 300.0]);
+        let _ = std::fs::remove_dir_all(&dir);
     }

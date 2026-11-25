@@ -1039,6 +1039,7 @@ impl NestCraftApp {
             }
 
             let mut applied_euler = None;
+            let mut inspector_dirty = false;
             if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == sel_id) {
                 let mut pos = inst.translation();
                 let mut changed = false;
@@ -1161,21 +1162,22 @@ impl NestCraftApp {
                     },
                 );
 
-                if changed {
-                    self.mark_dirty();
-                }
+                inspector_dirty = changed;
             }
 
             if let Some(new_euler) = applied_euler {
-                self.job.set_instance_euler_around_center(sel_id, new_euler);
+                inspector_dirty |= self.job.set_instance_euler_around_center(sel_id, new_euler);
             }
-            if drop_floor && self.job.drop_instance_to_floor(sel_id) {
-                self.mark_dirty();
+            if drop_floor {
+                inspector_dirty |= self.job.drop_instance_to_floor(sel_id);
             }
-            if clamp_floor && self.job.clamp_instance_above_floor(sel_id) {
-                self.mark_dirty();
+            if clamp_floor {
+                inspector_dirty |= self.job.clamp_instance_above_floor(sel_id);
             }
-            if center_xy && self.job.center_instance_xy(sel_id) {
+            if center_xy {
+                inspector_dirty |= self.job.center_instance_xy(sel_id);
+            }
+            if inspector_dirty {
                 self.mark_dirty();
             }
             if let Some(axis) = rot_step {

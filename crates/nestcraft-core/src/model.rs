@@ -1295,7 +1295,7 @@ impl BuildJob {
     }
 }
 
-fn aabbs_overlap(a: Aabb, b: Aabb) -> bool {
+pub(crate) fn aabbs_overlap(a: Aabb, b: Aabb) -> bool {
     a[0][0] <= b[1][0]
         && a[1][0] >= b[0][0]
         && a[0][1] <= b[1][1]
@@ -1304,7 +1304,7 @@ fn aabbs_overlap(a: Aabb, b: Aabb) -> bool {
         && a[1][2] >= b[0][2]
 }
 
-fn tri_aabb(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> Aabb {
+pub(crate) fn tri_aabb(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> Aabb {
     [
         [a[0].min(b[0]).min(c[0]), a[1].min(b[1]).min(c[1]), a[2].min(b[2]).min(c[2])],
         [a[0].max(b[0]).max(c[0]), a[1].max(b[1]).max(c[1]), a[2].max(b[2]).max(c[2])],
@@ -1327,7 +1327,11 @@ fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-fn point_tri_dist_sq(p: [f32; 3], tri: [[f32; 3]; 3]) -> f32 {
+pub(crate) fn point_tri_dist_sq(p: [f32; 3], tri: [[f32; 3]; 3]) -> f32 {
+    point_tri_closest(p, tri).1
+}
+
+pub(crate) fn point_tri_closest(p: [f32; 3], tri: [[f32; 3]; 3]) -> ([f32; 3], f32) {
     let [a, b, c] = tri;
     let ab = sub3(b, a);
     let ac = sub3(c, a);
@@ -1335,33 +1339,33 @@ fn point_tri_dist_sq(p: [f32; 3], tri: [[f32; 3]; 3]) -> f32 {
     let d1 = dot3(ab, ap);
     let d2 = dot3(ac, ap);
     if d1 <= 0.0 && d2 <= 0.0 {
-        return dot3(ap, ap);
+        return (a, dot3(ap, ap));
     }
     let bp = sub3(p, b);
     let d3 = dot3(ab, bp);
     let d4 = dot3(ac, bp);
     if d3 >= 0.0 && d4 <= d3 {
-        return dot3(bp, bp);
+        return (b, dot3(bp, bp));
     }
     let vc = d1 * d4 - d3 * d2;
     if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
         let v = d1 / (d1 - d3);
         let proj = [a[0] + v * ab[0], a[1] + v * ab[1], a[2] + v * ab[2]];
         let d = sub3(p, proj);
-        return dot3(d, d);
+        return (proj, dot3(d, d));
     }
     let cp = sub3(p, c);
     let d5 = dot3(ab, cp);
     let d6 = dot3(ac, cp);
     if d6 >= 0.0 && d5 <= d6 {
-        return dot3(cp, cp);
+        return (c, dot3(cp, cp));
     }
     let vb = d5 * d2 - d1 * d6;
     if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
         let w = d2 / (d2 - d6);
         let proj = [a[0] + w * ac[0], a[1] + w * ac[1], a[2] + w * ac[2]];
         let d = sub3(p, proj);
-        return dot3(d, d);
+        return (proj, dot3(d, d));
     }
     let va = d3 * d6 - d5 * d4;
     if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
@@ -1369,7 +1373,7 @@ fn point_tri_dist_sq(p: [f32; 3], tri: [[f32; 3]; 3]) -> f32 {
         let bc = sub3(c, b);
         let proj = [b[0] + w * bc[0], b[1] + w * bc[1], b[2] + w * bc[2]];
         let d = sub3(p, proj);
-        return dot3(d, d);
+        return (proj, dot3(d, d));
     }
     let denom = 1.0 / (va + vb + vc);
     let v = vb * denom;
@@ -1380,10 +1384,10 @@ fn point_tri_dist_sq(p: [f32; 3], tri: [[f32; 3]; 3]) -> f32 {
         a[2] + ab[2] * v + ac[2] * w,
     ];
     let d = sub3(p, proj);
-    dot3(d, d)
+    (proj, dot3(d, d))
 }
 
-fn seg_seg_dist_sq(p1: [f32; 3], q1: [f32; 3], p2: [f32; 3], q2: [f32; 3]) -> f32 {
+fn seg_seg_closest(p1: [f32; 3], q1: [f32; 3], p2: [f32; 3], q2: [f32; 3]) -> ([f32; 3], [f32; 3], f32) {
     let d1 = sub3(q1, p1);
     let d2 = sub3(q2, p2);
     let r = sub3(p1, p2);
@@ -1421,57 +1425,119 @@ fn seg_seg_dist_sq(p1: [f32; 3], q1: [f32; 3], p2: [f32; 3], q2: [f32; 3]) -> f3
     let c1 = [p1[0] + d1[0] * s, p1[1] + d1[1] * s, p1[2] + d1[2] * s];
     let c2 = [p2[0] + d2[0] * t, p2[1] + d2[1] * t, p2[2] + d2[2] * t];
     let diff = sub3(c1, c2);
-    dot3(diff, diff)
+    (c1, c2, dot3(diff, diff))
 }
 
-fn seg_intersects_tri(p0: [f32; 3], p1: [f32; 3], tri: [[f32; 3]; 3]) -> bool {
+pub(crate) fn seg_intersects_tri_point(p0: [f32; 3], p1: [f32; 3], tri: [[f32; 3]; 3]) -> Option<[f32; 3]> {
+    const EPS: f32 = 1e-5;
     let dir = sub3(p1, p0);
     let e1 = sub3(tri[1], tri[0]);
     let e2 = sub3(tri[2], tri[0]);
     let h = cross3(dir, e2);
     let a = dot3(e1, h);
     if a.abs() < 1e-8 {
-        return false;
+        return None;
     }
     let f = 1.0 / a;
     let s = sub3(p0, tri[0]);
     let u = f * dot3(s, h);
-    if !(0.0..=1.0).contains(&u) {
-        return false;
+    if !(-EPS..=1.0 + EPS).contains(&u) {
+        return None;
     }
     let q = cross3(s, e1);
     let v = f * dot3(dir, q);
-    if v < 0.0 || u + v > 1.0 {
-        return false;
+    if v < -EPS || u + v > 1.0 + EPS {
+        return None;
     }
     let t = f * dot3(e2, q);
-    (0.0..=1.0).contains(&t)
+    if (-EPS..=1.0 + EPS).contains(&t) {
+        let tc = t.clamp(0.0, 1.0);
+        Some([p0[0] + tc * dir[0], p0[1] + tc * dir[1], p0[2] + tc * dir[2]])
+    } else {
+        None
+    }
 }
 
-fn tri_tri_dist_sq(t1: [[f32; 3]; 3], t2: [[f32; 3]; 3]) -> f32 {
+pub(crate) fn tri_tri_closest_points(t1: [[f32; 3]; 3], t2: [[f32; 3]; 3]) -> ([f32; 3], [f32; 3], f32) {
     for i in 0..3 {
-        if seg_intersects_tri(t1[i], t1[(i + 1) % 3], t2)
-            || seg_intersects_tri(t2[i], t2[(i + 1) % 3], t1)
-        {
-            return 0.0;
+        if let Some(p) = seg_intersects_tri_point(t1[i], t1[(i + 1) % 3], t2) {
+            return (p, p, 0.0);
+        }
+        if let Some(p) = seg_intersects_tri_point(t2[i], t2[(i + 1) % 3], t1) {
+            return (p, p, 0.0);
         }
     }
-    let mut best = f32::INFINITY;
+    let mut best_p1 = t1[0];
+    let mut best_p2 = t2[0];
+    let mut best_d2 = f32::INFINITY;
     for &p in &t1 {
-        best = best.min(point_tri_dist_sq(p, t2));
+        let (q, d2) = point_tri_closest(p, t2);
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best_p1 = p;
+            best_p2 = q;
+        }
     }
-    for &p in &t2 {
-        best = best.min(point_tri_dist_sq(p, t1));
+    for &q in &t2 {
+        let (p, d2) = point_tri_closest(q, t1);
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best_p1 = p;
+            best_p2 = q;
+        }
     }
     for i in 0..3 {
         for j in 0..3 {
-            best = best.min(seg_seg_dist_sq(t1[i], t1[(i + 1) % 3], t2[j], t2[(j + 1) % 3]));
+            let (c1, c2, d2) = seg_seg_closest(t1[i], t1[(i + 1) % 3], t2[j], t2[(j + 1) % 3]);
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best_p1 = c1;
+                best_p2 = c2;
+            }
         }
     }
-    best
+    (best_p1, best_p2, best_d2)
 }
 
-fn point_inside_mesh_x_ray(p: [f32; 3], mesh: &TriMesh, tf: &Transform3x4) -> bool {
+pub(crate) fn tri_tri_intersect_segment(t1: [[f32; 3]; 3], t2: [[f32; 3]; 3]) -> Option<([f32; 3], [f32; 3])> {
+    let mut pts = [[0.0_f32; 3]; 2];
+    let mut count = 0usize;
+    let mut push_pt = |p: [f32; 3]| -> Option<([f32; 3], [f32; 3])> {
+        if count == 0 {
+            pts[0] = p;
+            count = 1;
+        } else if count == 1 {
+            let d = sub3(p, pts[0]);
+            if dot3(d, d) > 1e-6 {
+                pts[1] = p;
+                count = 2;
+                return Some((pts[0], pts[1]));
+            }
+        }
+        None
+    };
+    for i in 0..3 {
+        if let Some(p) = seg_intersects_tri_point(t1[i], t1[(i + 1) % 3], t2)
+            && let Some(seg) = push_pt(p)
+        {
+            return Some(seg);
+        }
+    }
+    for i in 0..3 {
+        if let Some(p) = seg_intersects_tri_point(t2[i], t2[(i + 1) % 3], t1)
+            && let Some(seg) = push_pt(p)
+        {
+            return Some(seg);
+        }
+    }
+    None
+}
+
+pub(crate) fn tri_tri_dist_sq(t1: [[f32; 3]; 3], t2: [[f32; 3]; 3]) -> f32 {
+    tri_tri_closest_points(t1, t2).2
+}
+
+pub(crate) fn point_inside_mesh_x_ray(p: [f32; 3], mesh: &TriMesh, tf: &Transform3x4) -> bool {
     let mut hits = 0usize;
     for tri in &mesh.indices {
         let a = transform_point(tf, mesh.positions[tri[0] as usize]);

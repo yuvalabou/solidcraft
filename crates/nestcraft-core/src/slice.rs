@@ -42,6 +42,15 @@ pub struct SliceDistribution {
 impl SliceDistribution {
     /// Compute the Z-slice cross-section area distribution for visible parts inside `job`'s machine.
     pub fn compute(job: &BuildJob, layer_step_mm: f32) -> Self {
+        Self::compute_with_progress(job, layer_step_mm, None)
+    }
+
+    /// Compute the Z-slice cross-section area distribution with optional `(done, total)` progress callback.
+    pub fn compute_with_progress(
+        job: &BuildJob,
+        layer_step_mm: f32,
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> Self {
         let step = layer_step_mm.clamp(0.1, 20.0);
         let [bed_x, bed_y, _] = job.machine.size_mm();
         let bed_area_mm2 = (f64::from(bed_x) * f64::from(bed_y)).max(1.0);
@@ -94,7 +103,15 @@ impl SliceDistribution {
         let mut layer_areas = vec![0.0_f64; count];
         let mut layer_parts = vec![0_usize; count];
 
-        for (positions, indices, tr, p_min_z, p_max_z) in active_parts {
+        let total_parts = active_parts.len().max(1);
+        if let Some(cb) = progress {
+            cb(0, total_parts);
+        }
+
+        for (part_idx, (positions, indices, tr, p_min_z, p_max_z)) in active_parts.into_iter().enumerate() {
+            if let Some(cb) = progress {
+                cb(part_idx + 1, total_parts);
+            }
             let world_verts: Vec<[f32; 3]> = positions.iter().map(|p| transform_pt(tr, *p)).collect();
             let mut per_part_signed = vec![0.0_f64; count];
             let mut per_part_hit = vec![false; count];

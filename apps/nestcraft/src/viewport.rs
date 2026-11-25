@@ -42,6 +42,7 @@ pub struct SceneCache {
     pub parts: HashMap<PartId, Arc<SharedTris>>,
     pub no_build_zone: Option<(Arc<TriMesh>, Arc<SharedTris>)>,
     pub thermal_colors: Option<HashMap<InstanceId, [u8; 4]>>,
+    pub collision_ids: HashSet<InstanceId>,
 }
 
 impl SceneCache {
@@ -180,7 +181,8 @@ pub fn build_gpu_scene_with_exclude(
         let wb = inst.world_bounds(proto.mesh.bounds);
         let above_floor = job.world_bounds_above_floor(wb);
         let in_nbz = job.instance_in_no_build_zone(inst);
-        let valid = above_floor && !in_nbz;
+        let in_collision = cache.collision_ids.contains(&inst.id);
+        let valid = above_floor && !in_nbz && !in_collision;
         let is_selected = selected.contains(&inst.id);
         let color = if let Some(t_rgba) = cache.thermal_colors.as_ref().and_then(|m| m.get(&inst.id)) {
             let mut rgba = *t_rgba;
@@ -687,6 +689,85 @@ pub fn build_face_highlight_scene(pick: &FacePick, tokens: &Tokens) -> GpuScene 
         scene.hover_face_tri(b, pick.world_normal, col);
         scene.hover_face_tri(c, pick.world_normal, col);
     }
+    scene
+}
+
+/// Build a depth-tested yellow [`GpuScene`] highlight showing exact collision volumes, intersection seams, and contacts.
+pub fn build_collision_highlight_scene(rep: &nestcraft_core::collision::CollisionReport) -> GpuScene {
+    let mut scene = GpuScene::with_palette(Palette::default());
+    if rep.colliding_ids.is_empty()
+        && rep.overlap_voxels.is_empty()
+        && rep.overlap_quads.is_empty()
+        && rep.intersection_segments.is_empty()
+        && rep.contacts.is_empty()
+    {
+        return scene;
+    }
+
+    let hard_fill = scene.color([255, 220, 0, 210]);
+    let clear_fill = scene.color([255, 160, 0, 175]);
+    for q in &rep.overlap_quads {
+        let col = if q.is_hard { hard_fill } else { clear_fill };
+        let [v0, v1, v2, v3] = q.verts;
+        for v in [v0, v1, v2, v0, v2, v3] {
+            scene.trans_tri(v, q.normal, col);
+        }
+    }
+
+    let seam_col = scene.color([255, 250, 110, 255]);
+    for &(p0, p1) in &rep.intersection_segments {
+        scene.lifted_line(p0, p1, seam_col, 3.0, [[0.0; 3]; 2]);
+    }
+
+    let contact_hard = scene.color([255, 245, 60, 255]);
+    let contact_clear = scene.color([255, 180, 0, 255]);
+    let draw_octa = rep.overlap_quads.is_empty() && rep.intersection_segments.is_empty();
+    for c in &rep.contacts {
+        let col = if c.is_hard { contact_hard } else { contact_clear };
+        let dx = c.point_b[0] - c.point_a[0];
+        let dy = c.point_b[1] - c.point_a[1];
+        let dz = c.point_b[2] - c.point_a[2];
+        if dx * dx + dy * dy + dz * dz > 1e-6 {
+            scene.lifted_line(c.point_a, c.point_b, col, 3.2, [[0.0; 3]; 2]);
+        }
+        let mid = [
+            (c.point_a[0] + c.point_b[0]) * 0.5,
+            (c.point_a[1] + c.point_b[1]) * 0.5,
+            (c.point_a[2] + c.point_b[2]) * 0.5,
+        ];
+        const ARM: f32 = 2.0;
+        scene.lifted_line([mid[0] - ARM, mid[1], mid[2]], [mid[0] + ARM, mid[1], mid[2]], col, 2.4, [[0.0; 3]; 2]);
+        scene.lifted_line([mid[0], mid[1] - ARM, mid[2]], [mid[0], mid[1] + ARM, mid[2]], col, 2.4, [[0.0; 3]; 2]);
+        scene.lifted_line([mid[0], mid[1], mid[2] - ARM], [mid[0], mid[1], mid[2] + ARM], col, 2.4, [[0.0; 3]; 2]);
+
+        if draw_octa {
+            let fill = if c.is_hard { hard_fill } else { clear_fill };
+            const R: f32 = 1.5;
+            let px = [mid[0] + R, mid[1], mid[2]];
+            let nx = [mid[0] - R, mid[1], mid[2]];
+            let py = [mid[0], mid[1] + R, mid[2]];
+            let ny = [mid[0], mid[1] - R, mid[2]];
+            let pz = [mid[0], mid[1], mid[2] + R];
+            let nz = [mid[0], mid[1], mid[2] - R];
+            let tris = [
+                (px, py, pz),
+                (py, nx, pz),
+                (nx, ny, pz),
+                (ny, px, pz),
+                (py, px, nz),
+                (nx, py, nz),
+                (ny, nx, nz),
+                (px, ny, nz),
+            ];
+            for (a, b, d) in tris {
+                let n = [0.0, 0.0, 1.0];
+                scene.trans_tri(a, n, fill);
+                scene.trans_tri(b, n, fill);
+                scene.trans_tri(d, n, fill);
+            }
+        }
+    }
+
     scene
 }
 
@@ -1288,5 +1369,61 @@ mod tests {
 
         assert!(selected_centerpoints(&job, &HashSet::new(), &cam, rect).is_empty());
         assert!(selected_rotation_handle(&job, &HashSet::new(), &cam, rect).is_none());
+    }
+
+    #[test]
+    fn collision_highlight_uses_depth_tested_yellow_geometry_without_xray() {
+        let cube = Arc::new(
+            TriMesh::from_indexed(
+                vec![
+                    [0.0, 0.0, 0.0],
+                    [20.0, 0.0, 0.0],
+                    [20.0, 20.0, 0.0],
+                    [0.0, 20.0, 0.0],
+                    [0.0, 0.0, 20.0],
+                    [20.0, 0.0, 20.0],
+                    [20.0, 20.0, 20.0],
+                    [0.0, 20.0, 20.0],
+                ],
+                vec![
+                    [0, 2, 1],
+                    [0, 3, 2],
+                    [4, 5, 6],
+                    [4, 6, 7],
+                    [0, 1, 5],
+                    [0, 5, 4],
+                    [1, 2, 6],
+                    [1, 6, 5],
+                    [2, 3, 7],
+                    [2, 7, 6],
+                    [3, 0, 4],
+                    [3, 4, 7],
+                ],
+            )
+            .expect("valid cube"),
+        );
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        let pid = job.add_part("cube", cube);
+        let _a = job.add_instance(pid, nestcraft_core::model::IDENTITY_TRANSFORM).expect("a");
+        let _b = job
+            .add_instance(pid, [[1.0, 0.0, 0.0, 10.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]])
+            .expect("b");
+
+        let rep = nestcraft_core::collision::detect_collisions(&job, None, 3.0);
+        let hl = build_collision_highlight_scene(&rep);
+        assert!(hl.xray.is_empty(), "collision highlight should not use xray");
+        assert!(hl.overlay.is_empty(), "collision highlight should not draw un-occluded overlay lines");
+        assert!(!hl.trans.is_empty(), "expected depth-tested translucent yellow overlap quads");
+        assert!(!hl.lines.is_empty(), "expected depth-tested seam/contact lines");
+
+        let mut cache = SceneCache {
+            collision_ids: rep.colliding_ids.clone(),
+            ..Default::default()
+        };
+        let scene = build_gpu_scene_with_exclude(&job, &HashSet::new(), &Tokens::get(), &mut cache, None);
+        assert!(
+            scene.instanced.iter().all(|m| m.look == InstanceLook::Opaque),
+            "colliding non-transparent parts should stay opaque"
+        );
     }
 }

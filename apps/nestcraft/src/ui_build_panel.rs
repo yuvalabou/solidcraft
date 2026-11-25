@@ -152,13 +152,19 @@ impl NestCraftApp {
                             }
                         });
                         row(ui, "Clearance", |ui| {
-                            ui.add(
-                                egui::DragValue::new(&mut self.job.clearance_mm)
-                                    .range(0.5..=25.0)
-                                    .speed(0.25)
-                                    .suffix(" mm"),
-                            )
-                            .backing_on_hover_text("Default part-to-part gap for placement & grid duplication");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.job.clearance_mm)
+                                        .range(0.5..=25.0)
+                                        .speed(0.25)
+                                        .suffix(" mm"),
+                                )
+                                .backing_on_hover_text("Default part-to-part gap for placement & grid duplication")
+                                .changed()
+                                && self.collision_check_active
+                            {
+                                self.refresh_collision_check();
+                            }
                         });
                         row(ui, "Material", |ui| {
                             let cur = nestcraft_core::report::material_by_id(&self.job.material_id);
@@ -172,6 +178,11 @@ impl NestCraftApp {
                                             .clicked()
                                         {
                                             self.job.material_id = mat.id.to_owned();
+                                            let slot = self.active_machine_slot.min(MACHINE_SLOT_COUNT - 1);
+                                            self.machine_presets[slot].material_id = mat.id.to_owned();
+                                            if let Some(dir) = nestcraft_data_dir() {
+                                                let _ = save_machine_presets_to_dir(&dir, &self.machine_presets);
+                                            }
                                             if self.report_dialog_open {
                                                 self.report_preview =
                                                     Some(nestcraft_core::report::BuildReport::generate(&self.job));
@@ -185,6 +196,10 @@ impl NestCraftApp {
 
                     ui.add_space(t.space_12);
                     section(ui, "nbz_sec", "No-Build Zone", false, |ui| {
+                        if !slot_supports_no_build_zone(self.active_machine_slot) {
+                            status_line(ui, "This machine (P100) has no No-Build Zone.", StatusTone::Dim);
+                            return;
+                        }
                         let mut pick_stl = false;
                         let mut clear_zone = false;
                         let mut zone_changed = false;
@@ -317,11 +332,8 @@ impl NestCraftApp {
         if !self.slice_dist_open {
             return;
         }
-        if self.slice_dist_cache.is_none() {
-            self.slice_dist_cache = Some(nestcraft_core::slice::SliceDistribution::compute(
-                &self.job,
-                self.slice_dist_step_mm,
-            ));
+        if (self.slice_dist_cache.is_none() || self.slice_dist_dirty) && self.calc_task.is_none() {
+            self.start_slice_distribution();
         }
 
         let side_c = Container::new(ctx, Surface::Panel);
@@ -503,10 +515,7 @@ impl NestCraftApp {
         if close_now {
             self.slice_dist_open = false;
         } else if recompute {
-            self.slice_dist_cache = Some(nestcraft_core::slice::SliceDistribution::compute(
-                &self.job,
-                self.slice_dist_step_mm,
-            ));
+            self.start_slice_distribution();
         }
     }
 
@@ -514,8 +523,8 @@ impl NestCraftApp {
         if !self.thermal_map_open {
             return;
         }
-        if self.thermal_report.is_none() {
-            self.refresh_thermal_map();
+        if self.thermal_report.is_none() && self.calc_task.is_none() {
+            self.start_thermal_map();
         }
 
         let side_c = Container::new(ctx, Surface::Panel);

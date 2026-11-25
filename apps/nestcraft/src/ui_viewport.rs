@@ -293,6 +293,9 @@ impl NestCraftApp {
                             self.euler_edit.remove(id);
                         }
                     }
+                    if d_angle.abs() > 1e-5 {
+                        self.update_live_drag_collision();
+                    }
                 } else if let Some(bs) = &mut self.box_select {
                     bs.current = pos;
                 } else if let Some(dz) = self.drag_zone {
@@ -349,11 +352,15 @@ impl NestCraftApp {
                                 ]);
                             }
                         }
+                        if resp.drag_delta().length_sq() > 0.01 {
+                            self.update_live_drag_collision();
+                        }
                     }
                 }
             }
 
             if resp.drag_stopped() {
+                let had_part_drag = self.drag_state.is_some() || self.rotate_drag.is_some();
                 if self.rotate_drag.take().is_some() {
                     self.mark_dirty();
                     self.status = "Rotated selected part(s)".to_owned();
@@ -388,8 +395,24 @@ impl NestCraftApp {
                     self.persist_no_build_zone();
                 }
                 self.drag_state = None;
-                if self.moving_target.take().is_some() {
+                let had_moving = self.moving_target.take().is_some();
+                if had_moving {
                     self.mark_dirty();
+                }
+                if had_part_drag {
+                    if self.collision_check_active {
+                        if self.collision_cache.is_initialized()
+                            && self.collision_cache.diff(&self.job, COLLISION_VOXEL_PITCH_MM)
+                                == nestcraft_core::collision::CollisionDiff::NoChange
+                        {
+                            let rep = self.collision_cache.report();
+                            self.apply_collision_report(&rep, true);
+                        } else if !had_moving {
+                            self.refresh_collision_check();
+                        }
+                    } else {
+                        self.clear_collision_highlight();
+                    }
                 }
             }
 

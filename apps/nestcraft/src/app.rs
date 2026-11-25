@@ -20,6 +20,8 @@ use solidcraft_ui_kit::view_compass::Drag as CompassDrag;
 use solidcraft_viewport::{Camera, StandardView};
 use solidcraft_viewport_gpu::view::{GpuScene, MovingLayer, SceneSlot, SharedTris};
 
+pub(crate) const COLLISION_VOXEL_PITCH_MM: f32 = 3.0;
+
 pub(crate) struct DragState {
     pub(crate) anchor_id: InstanceId,
     pub(crate) instances: Vec<(InstanceId, [f32; 3])>,
@@ -92,6 +94,43 @@ pub(crate) struct ActiveLoadTask {
     pub(crate) below_zero_instances: Vec<(InstanceId, f32)>,
     pub(crate) pushed_undo: bool,
     pub(crate) errors: Vec<String>,
+}
+
+pub(crate) enum CalcOutcome {
+    Collision {
+        report: nestcraft_core::collision::CollisionReport,
+        cache: Box<nestcraft_core::collision::CollisionCache>,
+    },
+    Nest2d {
+        job: Box<BuildJob>,
+        result: nestcraft_core::nest2d::Nest2dResult,
+    },
+    Nest2dFailed(String),
+    Thermal(nestcraft_core::thermal::ThermalMapReport),
+    Slice(nestcraft_core::slice::SliceDistribution),
+}
+
+pub(crate) struct BackgroundCalcTask {
+    pub(crate) title: String,
+    pub(crate) show_progress: bool,
+    pub(crate) completed: Arc<AtomicUsize>,
+    pub(crate) total: Arc<AtomicUsize>,
+    pub(crate) rx: Receiver<CalcOutcome>,
+}
+
+pub(crate) enum SaveOutcome {
+    Saved {
+        path_display: String,
+        file_name: String,
+    },
+    Failed(String),
+}
+
+pub(crate) struct ActiveSaveTask {
+    pub(crate) file_name: String,
+    pub(crate) progress_permille: Arc<AtomicUsize>,
+    pub(crate) stage: Arc<Mutex<String>>,
+    pub(crate) rx: Receiver<SaveOutcome>,
 }
 
 #[derive(Clone)]
@@ -242,8 +281,12 @@ pub(crate) struct NestCraftApp {
     pub(crate) slice_dist_step_mm: f32,
     pub(crate) slice_dist_bed_scale: bool,
     pub(crate) slice_dist_cache: Option<nestcraft_core::slice::SliceDistribution>,
+    pub(crate) slice_dist_dirty: bool,
     pub(crate) thermal_map_open: bool,
     pub(crate) thermal_report: Option<nestcraft_core::thermal::ThermalMapReport>,
+    pub(crate) collision_check_active: bool,
+    pub(crate) collision_cache: nestcraft_core::collision::CollisionCache,
+    pub(crate) collision_overlay_nonempty: bool,
     pub(crate) export_stl_selected_only: bool,
     pub(crate) export_stl_prefix: String,
     pub(crate) export_stl_suffix: String,
@@ -258,6 +301,9 @@ pub(crate) struct NestCraftApp {
     pub(crate) zoom_rect: Option<(egui::Pos2, egui::Pos2)>,
     pub(crate) viewport_aspect: f64,
     pub(crate) load_task: Option<ActiveLoadTask>,
+    pub(crate) save_task: Option<ActiveSaveTask>,
+    pub(crate) save_hint: Option<(String, bool, std::time::Instant)>,
+    pub(crate) calc_task: Option<BackgroundCalcTask>,
     pub(crate) below_zero_import_dialog: Vec<(InstanceId, f32)>,
     pub(crate) undo_stack: Vec<UndoSnapshot>,
     pub(crate) redo_stack: Vec<UndoSnapshot>,
@@ -268,7 +314,7 @@ pub(crate) struct NestCraftApp {
     pub(crate) part_thumbs: HashMap<PartId, egui::TextureHandle>,
     pub(crate) expanded_parts: HashSet<PartId>,
     pub(crate) active_machine_slot: usize,
-    pub(crate) machine_presets: [MachinePresetConfig; 3],
+    pub(crate) machine_presets: [MachinePresetConfig; MACHINE_SLOT_COUNT],
     pub(crate) custom_platform_open: bool,
     pub(crate) custom_name: String,
     pub(crate) custom_size_mm: [f32; 3],
@@ -276,6 +322,7 @@ pub(crate) struct NestCraftApp {
     pub(crate) custom_min_z: f32,
     pub(crate) custom_clearance: f32,
     pub(crate) custom_bed_origin: BedOrigin,
+    pub(crate) custom_material_id: String,
     pub(crate) orthographic_view: bool,
     pub(crate) new_group_name: String,
     pub(crate) view_bar_rect: Option<egui::Rect>,
@@ -337,6 +384,18 @@ impl From<BedOriginCfg> for BedOrigin {
     }
 }
 
+pub(crate) const MACHINE_SLOT_COUNT: usize = 6;
+pub(crate) const P100_MACHINE_SLOT: usize = 2;
+pub(crate) const CUSTOM_MACHINE_SLOT: usize = 5;
+
+pub(crate) fn slot_supports_no_build_zone(slot: usize) -> bool {
+    slot != P100_MACHINE_SLOT
+}
+
+fn default_preset_material_id() -> String {
+    "pa2200".to_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct MachinePresetConfig {
     pub(crate) name: String,
@@ -346,9 +405,11 @@ pub(crate) struct MachinePresetConfig {
     pub(crate) clearance_mm: f32,
     #[serde(default)]
     pub(crate) bed_origin: BedOriginCfg,
+    #[serde(default = "default_preset_material_id")]
+    pub(crate) material_id: String,
 }
 
-pub(crate) fn default_machine_presets() -> [MachinePresetConfig; 3] {
+pub(crate) fn default_machine_presets() -> [MachinePresetConfig; MACHINE_SLOT_COUNT] {
     [
         MachinePresetConfig {
             name: "EOS Formiga P110".to_owned(),
@@ -357,6 +418,25 @@ pub(crate) fn default_machine_presets() -> [MachinePresetConfig; 3] {
             min_z_mm: 0.0,
             clearance_mm: 2.5,
             bed_origin: BedOriginCfg::FrontLeft,
+            material_id: "pa2200".to_owned(),
+        },
+        MachinePresetConfig {
+            name: "EOS Formiga P110 Velocis".to_owned(),
+            size_mm: MachineProfile::FormigaP110.size_mm(),
+            wall_margin_mm: 5.0,
+            min_z_mm: 0.0,
+            clearance_mm: 2.5,
+            bed_origin: BedOriginCfg::FrontLeft,
+            material_id: "pa2200".to_owned(),
+        },
+        MachinePresetConfig {
+            name: "EOS Formiga P100".to_owned(),
+            size_mm: MachineProfile::FormigaP110.size_mm(),
+            wall_margin_mm: 5.0,
+            min_z_mm: 0.0,
+            clearance_mm: 2.5,
+            bed_origin: BedOriginCfg::FrontLeft,
+            material_id: "pa2200".to_owned(),
         },
         MachinePresetConfig {
             name: "Farsoon HT403P".to_owned(),
@@ -365,6 +445,16 @@ pub(crate) fn default_machine_presets() -> [MachinePresetConfig; 3] {
             min_z_mm: 0.0,
             clearance_mm: 2.5,
             bed_origin: BedOriginCfg::Center,
+            material_id: "pa2200".to_owned(),
+        },
+        MachinePresetConfig {
+            name: "Farsoon SS403P".to_owned(),
+            size_mm: MachineProfile::FarsoonHT403P.size_mm(),
+            wall_margin_mm: 5.0,
+            min_z_mm: 0.0,
+            clearance_mm: 2.5,
+            bed_origin: BedOriginCfg::Center,
+            material_id: "fs3300".to_owned(),
         },
         MachinePresetConfig {
             name: "Custom SLS".to_owned(),
@@ -373,6 +463,7 @@ pub(crate) fn default_machine_presets() -> [MachinePresetConfig; 3] {
             min_z_mm: 0.0,
             clearance_mm: 2.5,
             bed_origin: BedOriginCfg::FrontLeft,
+            material_id: "pa2200".to_owned(),
         },
     ]
 }
@@ -387,20 +478,84 @@ pub(crate) fn nestcraft_data_dir() -> Option<PathBuf> {
     base.map(|b| PathBuf::from(b).join("NestCraft"))
 }
 
-pub(crate) fn save_machine_presets_to_dir(dir: &Path, presets: &[MachinePresetConfig; 3]) -> Result<(), String> {
+pub(crate) fn save_machine_presets_to_dir(
+    dir: &Path,
+    presets: &[MachinePresetConfig; MACHINE_SLOT_COUNT],
+) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
     let json = serde_json::to_string_pretty(presets).map_err(|e| format!("Serialize error: {e}"))?;
     std::fs::write(dir.join("machines.json"), json)
         .map_err(|e| format!("Failed to write machines.json: {e}"))
 }
 
-pub(crate) fn load_machine_presets_from_dir(dir: &Path) -> Option<[MachinePresetConfig; 3]> {
+pub(crate) fn load_machine_presets_from_dir(
+    dir: &Path,
+) -> Option<[MachinePresetConfig; MACHINE_SLOT_COUNT]> {
     let bytes = std::fs::read(dir.join("machines.json")).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    if let Ok(presets) = serde_json::from_slice::<[MachinePresetConfig; MACHINE_SLOT_COUNT]>(&bytes) {
+        return Some(presets);
+    }
+    let legacy = serde_json::from_slice::<[MachinePresetConfig; 3]>(&bytes).ok()?;
+    let mut migrated = default_machine_presets();
+    let [old_p110, old_ht403, old_custom] = legacy;
+
+    migrated[0] = old_p110.clone();
+
+    migrated[1].size_mm = old_p110.size_mm;
+    migrated[1].wall_margin_mm = old_p110.wall_margin_mm;
+    migrated[1].min_z_mm = old_p110.min_z_mm;
+    migrated[1].clearance_mm = old_p110.clearance_mm;
+    migrated[1].bed_origin = old_p110.bed_origin;
+    migrated[1].material_id = old_p110.material_id.clone();
+
+    migrated[2].size_mm = old_p110.size_mm;
+    migrated[2].wall_margin_mm = old_p110.wall_margin_mm;
+    migrated[2].min_z_mm = old_p110.min_z_mm;
+    migrated[2].clearance_mm = old_p110.clearance_mm;
+    migrated[2].bed_origin = old_p110.bed_origin;
+    migrated[2].material_id = old_p110.material_id;
+
+    migrated[3] = old_ht403.clone();
+
+    migrated[4].size_mm = old_ht403.size_mm;
+    migrated[4].wall_margin_mm = old_ht403.wall_margin_mm;
+    migrated[4].min_z_mm = old_ht403.min_z_mm;
+    migrated[4].clearance_mm = old_ht403.clearance_mm;
+    migrated[4].bed_origin = old_ht403.bed_origin;
+
+    migrated[5] = old_custom;
+    Some(migrated)
 }
 
 pub(crate) fn no_build_zone_dir_for_slot(slot: usize) -> Option<PathBuf> {
-    nestcraft_data_dir().map(|d| d.join("no_build_zone").join(format!("slot_{}", slot.min(2))))
+    let subdir = match slot {
+        0 | 1 => "p110",
+        2 => return None,
+        3 => "ht403p",
+        4 => "ss403p",
+        _ => "custom",
+    };
+    nestcraft_data_dir().map(|d| d.join("no_build_zone").join(subdir))
+}
+
+pub(crate) fn load_no_build_zone_for_slot(slot: usize) -> Option<NoBuildZone> {
+    if !slot_supports_no_build_zone(slot) {
+        return None;
+    }
+    if let Some(dir) = no_build_zone_dir_for_slot(slot)
+        && let Some(zone) = load_no_build_zone_from_dir(&dir)
+    {
+        return Some(zone);
+    }
+    let legacy = match slot {
+        0 | 1 => Some("slot_0"),
+        3 => Some("slot_1"),
+        5 => Some("slot_2"),
+        _ => None,
+    };
+    legacy
+        .and_then(|name| nestcraft_data_dir().map(|d| d.join("no_build_zone").join(name)))
+        .and_then(|dir| load_no_build_zone_from_dir(&dir))
 }
 
 pub(crate) fn sanitize_ascii_filename_part(s: &str) -> String {
@@ -677,9 +832,8 @@ impl NestCraftApp {
         job.min_z_mm = p0.min_z_mm;
         job.clearance_mm = p0.clearance_mm;
         job.bed_origin = p0.bed_origin.into();
-        if let Some(dir) = no_build_zone_dir_for_slot(0) {
-            job.no_build_zone = load_no_build_zone_from_dir(&dir);
-        }
+        job.material_id = p0.material_id.clone();
+        job.no_build_zone = load_no_build_zone_for_slot(0);
         let camera = viewport::default_camera_with_origin(&job.machine, job.bed_origin);
         let custom_name = p0.name.clone();
         let custom_size_mm = job.machine.size_mm();
@@ -687,6 +841,7 @@ impl NestCraftApp {
         let custom_min_z = job.min_z_mm;
         let custom_clearance = job.clearance_mm;
         let custom_bed_origin = job.bed_origin;
+        let custom_material_id = job.material_id.clone();
         Self {
             job,
             selected: None,
@@ -762,8 +917,12 @@ impl NestCraftApp {
             slice_dist_step_mm: 1.0,
             slice_dist_bed_scale: false,
             slice_dist_cache: None,
+            slice_dist_dirty: false,
             thermal_map_open: false,
             thermal_report: None,
+            collision_check_active: false,
+            collision_cache: nestcraft_core::collision::CollisionCache::new(),
+            collision_overlay_nonempty: false,
             export_stl_selected_only: false,
             export_stl_prefix: String::new(),
             export_stl_suffix: String::new(),
@@ -778,6 +937,9 @@ impl NestCraftApp {
             zoom_rect: None,
             viewport_aspect: 16.0 / 9.0,
             load_task: None,
+            save_task: None,
+            save_hint: None,
+            calc_task: None,
             below_zero_import_dialog: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -796,6 +958,7 @@ impl NestCraftApp {
             custom_min_z,
             custom_clearance,
             custom_bed_origin,
+            custom_material_id,
             orthographic_view: false,
             new_group_name: String::new(),
             view_bar_rect: None,
@@ -826,7 +989,7 @@ impl NestCraftApp {
     }
 
     pub(crate) fn apply_machine_slot(&mut self, slot: usize) {
-        let idx = slot.min(2);
+        let idx = slot.min(MACHINE_SLOT_COUNT - 1);
         self.active_machine_slot = idx;
         let p = &self.machine_presets[idx];
         self.job.machine = MachineProfile::custom(&p.name, p.size_mm);
@@ -834,7 +997,8 @@ impl NestCraftApp {
         self.job.min_z_mm = p.min_z_mm;
         self.job.clearance_mm = p.clearance_mm;
         self.job.bed_origin = p.bed_origin.into();
-        self.job.no_build_zone = no_build_zone_dir_for_slot(idx).and_then(|d| load_no_build_zone_from_dir(&d));
+        self.job.material_id = p.material_id.clone();
+        self.job.no_build_zone = load_no_build_zone_for_slot(idx);
         self.camera = self.default_camera_for_job();
         self.mark_dirty();
         self.status = format!("Active machine: {}", self.job.machine.name());
@@ -861,13 +1025,14 @@ impl NestCraftApp {
     }
 
     pub(crate) fn open_custom_platform_dialog(&mut self) {
-        let p = &self.machine_presets[self.active_machine_slot.min(2)];
+        let p = &self.machine_presets[self.active_machine_slot.min(MACHINE_SLOT_COUNT - 1)];
         self.custom_name = p.name.clone();
         self.custom_size_mm = self.job.machine.size_mm();
         self.custom_wall_margin = self.job.wall_margin_mm;
         self.custom_min_z = self.job.min_z_mm;
         self.custom_clearance = self.job.clearance_mm;
         self.custom_bed_origin = self.job.bed_origin;
+        self.custom_material_id = p.material_id.clone();
         self.custom_platform_open = true;
     }
 
@@ -1507,6 +1672,7 @@ impl NestCraftApp {
     pub(crate) fn clear_align_face_mode(&mut self) {
         self.align_face_target = None;
         self.hovered_face = None;
+        self.collision_overlay_nonempty = false;
         if let Ok(mut guard) = self.hl_slot.lock() {
             *guard = Some(GpuScene::default());
         }
@@ -1789,17 +1955,22 @@ impl NestCraftApp {
                 return;
             }
             if cmd && shift && i.key_pressed(egui::Key::S) {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("NestCraft Bed", &["nestc"])
-                    .set_file_name("bed.nestc")
-                    .save_file()
+                if self.save_task.is_none()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("NestCraft Bed", &["nestc"])
+                        .set_file_name(self.default_save_filename("nestc"))
+                        .save_file()
                 {
-                    self.save_bed_file(&path);
+                    self.start_save_bed(path, ctx);
                 }
                 return;
             }
             if cmd && !shift && i.key_pressed(egui::Key::S) {
                 self.open_scale_dialog();
+                return;
+            }
+            if cmd && i.key_pressed(egui::Key::K) {
+                self.toggle_collision_check();
                 return;
             }
             if cmd && i.key_pressed(egui::Key::D) {
@@ -1931,37 +2102,328 @@ impl NestCraftApp {
     pub(crate) fn mark_dirty(&mut self) {
         self.scene_dirty = true;
         if self.slice_dist_open {
-            self.slice_dist_cache = None;
+            self.slice_dist_dirty = true;
         }
         if self.thermal_map_open {
             self.refresh_thermal_map();
         }
+        if self.collision_check_active {
+            self.refresh_collision_check();
+        }
+    }
+
+    pub(crate) fn apply_collision_overlay(&mut self, rep: &nestcraft_core::collision::CollisionReport) {
+        let is_empty = rep.colliding_ids.is_empty()
+            && rep.overlap_voxels.is_empty()
+            && rep.overlap_quads.is_empty()
+            && rep.intersection_segments.is_empty()
+            && rep.contacts.is_empty();
+        if is_empty && !self.collision_overlay_nonempty {
+            return;
+        }
+        let hl = viewport::build_collision_highlight_scene(rep);
+        if let Ok(mut guard) = self.hl_slot.lock() {
+            *guard = Some(hl);
+        }
+        self.hl_key = self.hl_key.wrapping_add(1).max(1);
+        self.collision_overlay_nonempty = !is_empty;
+    }
+
+    pub(crate) fn apply_collision_report(
+        &mut self,
+        rep: &nestcraft_core::collision::CollisionReport,
+        update_status: bool,
+    ) {
+        if self.scene_cache.collision_ids != rep.colliding_ids {
+            self.scene_cache.collision_ids = rep.colliding_ids.clone();
+            self.scene_dirty = true;
+        }
+        self.apply_collision_overlay(rep);
+        if update_status {
+            self.status = if rep.pairs.is_empty() {
+                format!("Collision Check: No collisions ({:.1} mm clearance)", rep.clearance_mm)
+            } else {
+                format!(
+                    "Collision Check: {} colliding pair(s), {} overlap voxel(s)",
+                    rep.pairs.len(),
+                    rep.overlap_voxels.len()
+                )
+            };
+        }
+    }
+
+    pub(crate) fn clear_collision_highlight(&mut self) {
+        if !self.scene_cache.collision_ids.is_empty() {
+            self.scene_cache.collision_ids.clear();
+            self.scene_dirty = true;
+        }
+        self.collision_overlay_nonempty = false;
+        if let Ok(mut guard) = self.hl_slot.lock() {
+            *guard = Some(GpuScene::default());
+        }
+        self.hl_key = self.hl_key.wrapping_add(1).max(1);
+    }
+
+    pub(crate) fn refresh_collision_check(&mut self) {
+        self.start_collision_check(false);
+    }
+
+    pub(crate) fn toggle_collision_check(&mut self) {
+        if self.calc_task.as_ref().is_some_and(|t| t.title == "Collision Check") {
+            self.calc_task = None;
+        }
+        self.collision_check_active = !self.collision_check_active;
+        if self.collision_check_active {
+            self.collision_cache.clear();
+            self.start_collision_check(true);
+        } else {
+            self.collision_cache.clear();
+            self.clear_collision_highlight();
+            self.status = "Collision Check disabled".to_owned();
+            self.scene_dirty = true;
+        }
+    }
+
+    pub(crate) fn spawn_calc_task(
+        &mut self,
+        title: &str,
+        show_progress: bool,
+        work: impl FnOnce(Arc<AtomicUsize>, Arc<AtomicUsize>) -> CalcOutcome + Send + 'static,
+    ) {
+        let completed = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(1));
+        let c = completed.clone();
+        let t = total.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let out = work(c, t);
+            let _ = tx.send(out);
+        });
+        self.calc_task = Some(BackgroundCalcTask {
+            title: title.to_owned(),
+            show_progress,
+            completed,
+            total,
+            rx,
+        });
+    }
+
+    pub(crate) fn start_collision_check(&mut self, show_progress: bool) {
+        use nestcraft_core::collision::CollisionDiff;
+        match self.collision_cache.diff(&self.job, COLLISION_VOXEL_PITCH_MM) {
+            CollisionDiff::NoChange => return,
+            CollisionDiff::RemovalsOnly { .. } => {
+                let rep = self.collision_cache.sync(&self.job, COLLISION_VOXEL_PITCH_MM);
+                self.apply_collision_report(&rep, true);
+                return;
+            }
+            CollisionDiff::Incremental { ref dirty_ids, .. }
+                if self.collision_cache.count_candidate_pairs(&self.job, dirty_ids) == 0 =>
+            {
+                let rep = self.collision_cache.sync(&self.job, COLLISION_VOXEL_PITCH_MM);
+                self.apply_collision_report(&rep, true);
+                return;
+            }
+            CollisionDiff::FullRebuild
+                if !show_progress
+                    && !self.collision_cache.is_initialized()
+                    && self
+                        .calc_task
+                        .as_ref()
+                        .is_some_and(|t| t.title == "Collision Check") =>
+            {
+                return;
+            }
+            CollisionDiff::Incremental { .. } | CollisionDiff::FullRebuild => {}
+        }
+
+        let job = self.job.clone();
+        let mut cache = self.collision_cache.clone();
+        self.spawn_calc_task("Collision Check", show_progress, move |c, t| {
+            let rep = cache.sync_with_progress(
+                &job,
+                COLLISION_VOXEL_PITCH_MM,
+                Some(&|done, tot| {
+                    c.store(done, Ordering::Relaxed);
+                    t.store(tot.max(1), Ordering::Relaxed);
+                }),
+            );
+            CalcOutcome::Collision {
+                report: rep,
+                cache: Box::new(cache),
+            }
+        });
+    }
+
+    pub(crate) fn start_nest2d(&mut self) {
+        let mut job = self.job.clone();
+        let cfg = self.nest2d_config.clone();
+        let sel = self.selected_set.clone();
+        self.spawn_calc_task("2D Auto-Nest", true, move |c, t| {
+            match nestcraft_core::nest2d::nest_2d_with_progress(
+                &mut job,
+                &cfg,
+                Some(&sel),
+                Some(&|done, tot| {
+                    c.store(done, Ordering::Relaxed);
+                    t.store(tot.max(1), Ordering::Relaxed);
+                }),
+            ) {
+                Ok(result) => CalcOutcome::Nest2d {
+                    job: Box::new(job),
+                    result,
+                },
+                Err(e) => CalcOutcome::Nest2dFailed(e.to_string()),
+            }
+        });
+    }
+
+    pub(crate) fn start_thermal_map(&mut self) {
+        let show_progress = self.thermal_report.is_none();
+        let job = self.job.clone();
+        self.spawn_calc_task("Thermal Map", show_progress, move |c, t| {
+            let rep = nestcraft_core::thermal::ThermalMapReport::compute_with_progress(
+                &job,
+                Some(&|done, tot| {
+                    c.store(done, Ordering::Relaxed);
+                    t.store(tot.max(1), Ordering::Relaxed);
+                }),
+            );
+            CalcOutcome::Thermal(rep)
+        });
+    }
+
+    pub(crate) fn start_slice_distribution(&mut self) {
+        let show_progress = self.slice_dist_cache.is_none();
+        self.slice_dist_dirty = false;
+        let job = self.job.clone();
+        let step = self.slice_dist_step_mm;
+        self.spawn_calc_task("Slice Distribution", show_progress, move |c, t| {
+            let dist = nestcraft_core::slice::SliceDistribution::compute_with_progress(
+                &job,
+                step,
+                Some(&|done, tot| {
+                    c.store(done, Ordering::Relaxed);
+                    t.store(tot.max(1), Ordering::Relaxed);
+                }),
+            );
+            CalcOutcome::Slice(dist)
+        });
+    }
+
+    pub(crate) fn poll_calc_task(&mut self, ctx: &egui::Context) {
+        let Some(task) = &self.calc_task else {
+            return;
+        };
+        ctx.request_repaint();
+        match task.rx.try_recv() {
+            Ok(outcome) => {
+                self.calc_task = None;
+                match outcome {
+                    CalcOutcome::Collision { report, cache } => {
+                        if self.collision_check_active {
+                            self.collision_cache = *cache;
+                            self.apply_collision_report(&report, true);
+                            if self.collision_cache.diff(&self.job, COLLISION_VOXEL_PITCH_MM)
+                                != nestcraft_core::collision::CollisionDiff::NoChange
+                            {
+                                self.start_collision_check(false);
+                            }
+                        }
+                    }
+                    CalcOutcome::Nest2d { job, result } => {
+                        self.push_undo();
+                        self.job = *job;
+                        self.euler_edit.clear();
+                        self.mark_dirty();
+                        self.status = format!(
+                            "2D Nest: {} placed, {} overflow ({:.1}% fill, {} ms)",
+                            result.placed_count, result.overflow_count, result.used_area_pct, result.elapsed_ms
+                        );
+                        self.nest2d_last_result = Some(result);
+                    }
+                    CalcOutcome::Nest2dFailed(e) => {
+                        self.status = format!("2D Nest error: {e}");
+                    }
+                    CalcOutcome::Thermal(rep) => {
+                        let mut colors = HashMap::with_capacity(rep.parts.len());
+                        for p in &rep.parts {
+                            colors.insert(p.instance_id, nestcraft_core::thermal::thermal_rgba(p.peak_density_pct));
+                        }
+                        self.scene_cache.thermal_colors = Some(colors);
+                        self.thermal_report = Some(rep);
+                        self.scene_dirty = true;
+                        self.status = "Thermal Map updated (20×20×20 mm local sintered density)".to_owned();
+                    }
+                    CalcOutcome::Slice(dist) => {
+                        self.slice_dist_cache = Some(dist);
+                        self.slice_dist_dirty = false;
+                        self.status = "Slice Distribution updated".to_owned();
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.calc_task = None;
+            }
+        }
+    }
+
+    pub(crate) fn update_live_drag_collision(&mut self) {
+        let mut active = HashSet::new();
+        if let Some(ds) = &self.drag_state {
+            for (id, _) in &ds.instances {
+                active.insert(*id);
+            }
+        }
+        if let Some(rd) = &self.rotate_drag {
+            for (id, _) in &rd.instances {
+                active.insert(*id);
+            }
+        }
+        if active.is_empty() {
+            return;
+        }
+        if self.collision_check_active
+            && self.collision_cache.is_initialized()
+            && !matches!(
+                self.collision_cache.diff(&self.job, COLLISION_VOXEL_PITCH_MM),
+                nestcraft_core::collision::CollisionDiff::FullRebuild
+            )
+        {
+            let rep = self.collision_cache.sync(&self.job, COLLISION_VOXEL_PITCH_MM);
+            self.apply_collision_report(&rep, false);
+        } else {
+            let rep = nestcraft_core::collision::detect_collisions(
+                &self.job,
+                Some(&active),
+                COLLISION_VOXEL_PITCH_MM,
+            );
+            self.apply_collision_overlay(&rep);
+        }
     }
 
     pub(crate) fn refresh_thermal_map(&mut self) {
-        let rep = nestcraft_core::thermal::ThermalMapReport::compute(&self.job);
-        let mut colors = HashMap::with_capacity(rep.parts.len());
-        for p in &rep.parts {
-            colors.insert(p.instance_id, nestcraft_core::thermal::thermal_rgba(p.peak_density_pct));
-        }
-        self.scene_cache.thermal_colors = Some(colors);
-        self.thermal_report = Some(rep);
+        self.start_thermal_map();
     }
 
     pub(crate) fn toggle_thermal_map(&mut self) {
         self.thermal_map_open = !self.thermal_map_open;
         if self.thermal_map_open {
-            self.refresh_thermal_map();
-            self.status = "Thermal Map enabled (20×20×20 mm local sintered density)".to_owned();
+            self.start_thermal_map();
         } else {
             self.scene_cache.thermal_colors = None;
             self.thermal_report = None;
             self.status = "Thermal Map disabled".to_owned();
+            self.scene_dirty = true;
         }
-        self.scene_dirty = true;
     }
 
     pub(crate) fn import_no_build_zone_stl(&mut self, path: &Path) {
+        if !slot_supports_no_build_zone(self.active_machine_slot) {
+            self.status = "Selected machine does not use a No-Build Zone".to_owned();
+            return;
+        }
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
@@ -2009,6 +2471,7 @@ impl NestCraftApp {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn save_bed_file(&mut self, path: &Path) {
         match nestc::write_nestc(&self.job) {
             Ok(bytes) => {
@@ -2022,6 +2485,112 @@ impl NestCraftApp {
                 self.status = format!("Save bed error: {e}");
             }
         }
+    }
+
+    pub(crate) fn start_save_bed(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if self.save_task.is_some() {
+            return;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("bed.nestc")
+            .to_owned();
+        let path_display = path.display().to_string();
+        let job = self.job.clone();
+        let progress_permille = Arc::new(AtomicUsize::new(0));
+        let stage = Arc::new(Mutex::new("Preparing parts...".to_owned()));
+        let (tx, rx) = mpsc::channel();
+
+        let p_bg = Arc::clone(&progress_permille);
+        let s_bg = Arc::clone(&stage);
+        let ctx_bg = ctx.clone();
+        let fname_bg = file_name.clone();
+        std::thread::spawn(move || {
+            let res = nestc::write_nestc_with_progress(
+                &job,
+                Some(&|done, total, label| {
+                    let permille = ((done.saturating_mul(950)) / total.max(1)).min(950);
+                    p_bg.store(permille, Ordering::Relaxed);
+                    if let Ok(mut guard) = s_bg.lock() {
+                        *guard = label.to_owned();
+                    }
+                    ctx_bg.request_repaint();
+                }),
+            );
+            let outcome = match res {
+                Ok(bytes) => {
+                    if let Ok(mut guard) = s_bg.lock() {
+                        *guard = "Writing file...".to_owned();
+                    }
+                    p_bg.store(960, Ordering::Relaxed);
+                    ctx_bg.request_repaint();
+                    match std::fs::write(&path, bytes) {
+                        Ok(()) => {
+                            p_bg.store(1000, Ordering::Relaxed);
+                            SaveOutcome::Saved {
+                                path_display,
+                                file_name: fname_bg,
+                            }
+                        }
+                        Err(e) => SaveOutcome::Failed(format!("Save bed failed: {e}")),
+                    }
+                }
+                Err(e) => SaveOutcome::Failed(format!("Save bed error: {e}")),
+            };
+            let _ = tx.send(outcome);
+            ctx_bg.request_repaint();
+        });
+
+        self.save_hint = None;
+        self.status = format!("Saving {file_name}...");
+        self.save_task = Some(ActiveSaveTask {
+            file_name,
+            progress_permille,
+            stage,
+            rx,
+        });
+    }
+
+    pub(crate) fn poll_save_task(&mut self, ctx: &egui::Context) {
+        if let Some((_, _, at)) = &self.save_hint
+            && at.elapsed() >= std::time::Duration::from_millis(2500)
+        {
+            self.save_hint = None;
+        }
+        let Some(task) = &self.save_task else {
+            return;
+        };
+        ctx.request_repaint();
+        match task.rx.try_recv() {
+            Ok(SaveOutcome::Saved {
+                path_display,
+                file_name,
+            }) => {
+                self.save_task = None;
+                self.status = format!("Saved bed to {path_display}");
+                self.save_hint = Some((format!("Saved {file_name}"), false, std::time::Instant::now()));
+            }
+            Ok(SaveOutcome::Failed(msg)) => {
+                self.save_task = None;
+                self.status = msg.clone();
+                self.save_hint = Some((msg, true, std::time::Instant::now()));
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.save_task = None;
+            }
+        }
+    }
+
+    pub(crate) fn default_save_filename(&self, ext: &str) -> String {
+        format_job_save_filename(
+            &today_yyyymmdd(),
+            self.job.machine.name(),
+            &self.job.material_id,
+            ext,
+        )
     }
 
     pub(crate) fn apply_loaded_bed(&mut self, job: BuildJob, path_display: &str) {
@@ -2040,6 +2609,10 @@ impl NestCraftApp {
         self.manifold_cache.clear();
         self.part_thumbs.clear();
         self.expanded_parts.clear();
+        self.collision_cache.clear();
+        self.slice_dist_cache = None;
+        self.slice_dist_dirty = false;
+        self.thermal_report = None;
         self.camera = self.default_camera_for_job();
         self.mark_dirty();
         self.status = format!("Opened bed {path_display}");
@@ -2511,6 +3084,91 @@ impl NestCraftApp {
         }
     }
 
+}
+
+pub(crate) fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(m <= 2);
+    (year, m as u32, d as u32)
+}
+
+pub(crate) fn today_yyyymmdd() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let days = (secs / 86_400) as i64;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}{month:02}{day:02}")
+}
+
+fn sanitize_slug(s: &str, fallback: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_underscore = false;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_underscore = false;
+        } else if !out.is_empty() && !prev_underscore {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        fallback.to_owned()
+    } else {
+        out
+    }
+}
+
+fn short_bed_slug(machine_name: &str) -> String {
+    let lower = machine_name.to_ascii_lowercase();
+    if lower.contains("ht403") {
+        "ht403".to_owned()
+    } else if lower.contains("ss403") {
+        "ss403".to_owned()
+    } else if lower.contains("velocis") {
+        "p110v".to_owned()
+    } else if lower.contains("p100") {
+        "p100".to_owned()
+    } else if lower.contains("p110") || lower.contains("formiga") {
+        "p110".to_owned()
+    } else {
+        sanitize_slug(machine_name, "bed")
+    }
+}
+
+fn short_material_slug(material_id: &str) -> String {
+    match material_id.trim().to_ascii_lowercase().as_str() {
+        "pa2200" => "2200".to_owned(),
+        "fs3300" => "3300".to_owned(),
+        "pa2210fr" => "2210fr".to_owned(),
+        "fs3401gb" => "3401gb".to_owned(),
+        "pbt01" => "pbt01".to_owned(),
+        "pa3200gb" => "3200gb".to_owned(),
+        _ => sanitize_slug(material_id, "mat"),
+    }
+}
+
+pub(crate) fn format_job_save_filename(
+    date_yyyymmdd: &str,
+    machine_name: &str,
+    material_id: &str,
+    ext: &str,
+) -> String {
+    let bed = short_bed_slug(machine_name);
+    let mat = short_material_slug(material_id);
+    format!("{date_yyyymmdd}_{bed}_{mat}.{ext}")
 }
 
 pub(crate) fn world_axis(axis: usize) -> [f32; 3] {

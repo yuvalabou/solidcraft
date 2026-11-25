@@ -59,6 +59,11 @@ pub fn thermal_rgba(density_pct: f32) -> [u8; 4] {
 impl ThermalMapReport {
     /// Compute a 20×20×20 mm sliding-box thermal density map for visible parts inside the machine.
     pub fn compute(job: &BuildJob) -> Self {
+        Self::compute_with_progress(job, None)
+    }
+
+    /// Compute a 20×20×20 mm sliding-box thermal density map with optional `(done, total)` progress callback.
+    pub fn compute_with_progress(job: &BuildJob, progress: Option<&dyn Fn(usize, usize)>) -> Self {
         const KERNEL_MM: f32 = 20.0;
         let ([min_x, min_y], [max_x, max_y]) = job.bed_xy_bounds();
         let min_z = job.min_z_mm;
@@ -89,8 +94,15 @@ impl ThermalMapReport {
         }
 
         let mut included: Vec<IncludedPart> = Vec::new();
+        let total_insts = job.instances.len().max(1);
+        if let Some(cb) = progress {
+            cb(0, total_insts);
+        }
 
-        for inst in &job.instances {
+        for (step_idx, inst) in job.instances.iter().enumerate() {
+            if let Some(cb) = progress {
+                cb(step_idx + 1, total_insts);
+            }
             if !job.is_instance_visible(inst) {
                 continue;
             }

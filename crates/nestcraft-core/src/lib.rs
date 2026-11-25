@@ -9,6 +9,7 @@
     clippy::unreachable
 )]
 
+pub mod collision;
 pub mod io;
 pub mod manifold;
 pub mod model;

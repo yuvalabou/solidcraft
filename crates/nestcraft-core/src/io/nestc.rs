@@ -117,6 +117,19 @@ fn from_nestc_constraint(c: NestcRotationConstraint) -> RotationConstraint {
 
 /// Serialize a [`BuildJob`] into a compressed `.nestc` project archive.
 pub fn write_nestc(job: &BuildJob) -> Result<Vec<u8>> {
+    write_nestc_with_progress(job, None)
+}
+
+/// Serialize a [`BuildJob`] into a compressed `.nestc` project archive, reporting `(done, total, stage)`.
+pub fn write_nestc_with_progress(
+    job: &BuildJob,
+    progress: Option<&dyn Fn(usize, usize, &str)>,
+) -> Result<Vec<u8>> {
+    const TOTAL: usize = 1000;
+    if let Some(cb) = progress {
+        cb(0, TOTAL, "Preparing parts...");
+    }
+
     let machine = match &job.machine {
         MachineProfile::FormigaP110 => NestcMachine::FormigaP110,
         MachineProfile::FarsoonHT403P => NestcMachine::FarsoonHT403P,
@@ -129,17 +142,20 @@ pub fn write_nestc(job: &BuildJob) -> Result<Vec<u8>> {
         BedOrigin::FrontLeft => NestcBedOrigin::FrontLeft,
         BedOrigin::Center => NestcBedOrigin::Center,
     };
-    let parts = job
-        .parts
-        .iter()
-        .map(|p| NestcPart {
+    let part_count = job.parts.len().max(1);
+    let mut parts = Vec::with_capacity(job.parts.len());
+    for (idx, p) in job.parts.iter().enumerate() {
+        parts.push(NestcPart {
             id: p.id.0,
             name: p.name.clone(),
             positions: p.mesh.positions.clone(),
             indices: p.mesh.indices.clone(),
             default_constraint: to_nestc_constraint(p.default_constraint),
-        })
-        .collect();
+        });
+        if let Some(cb) = progress {
+            cb((150 * (idx + 1)) / part_count, TOTAL, "Preparing parts...");
+        }
+    }
     let groups = job
         .groups
         .iter()
@@ -190,19 +206,39 @@ pub fn write_nestc(job: &BuildJob) -> Result<Vec<u8>> {
         no_build_zone,
     };
 
+    if let Some(cb) = progress {
+        cb(150, TOTAL, "Serializing project...");
+    }
     let json = serde_json::to_vec(&project)
         .map_err(|e| NestCraftError::InvalidInput(format!("failed to serialize .nestc project: {e}")))?;
 
+    if let Some(cb) = progress {
+        cb(450, TOTAL, "Compressing archive...");
+    }
     let mut out = Cursor::new(Vec::new());
     {
         let mut zip = ZipWriter::new(&mut out);
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         zip.start_file(PROJECT_ENTRY, opts)
             .map_err(|e| NestCraftError::InvalidInput(format!("failed to write .nestc archive: {e}")))?;
-        zip.write_all(&json)
-            .map_err(|e| NestCraftError::InvalidInput(format!("failed to write .nestc payload: {e}")))?;
+
+        let total_bytes = json.len().max(1);
+        let mut written = 0usize;
+        for chunk in json.chunks(64 * 1024) {
+            zip.write_all(chunk)
+                .map_err(|e| NestCraftError::InvalidInput(format!("failed to write .nestc payload: {e}")))?;
+            written += chunk.len();
+            if let Some(cb) = progress {
+                let pct = 450 + ((written * 500) / total_bytes).min(500);
+                cb(pct, TOTAL, "Compressing archive...");
+            }
+        }
+
         zip.finish()
             .map_err(|e| NestCraftError::InvalidInput(format!("failed to finalize .nestc archive: {e}")))?;
+    }
+    if let Some(cb) = progress {
+        cb(950, TOTAL, "Finalizing archive...");
     }
     Ok(out.into_inner())
 }
@@ -329,5 +365,38 @@ mod tests {
         assert_eq!(loaded.instances.len(), 1);
         assert_eq!(loaded.instances[0].group_id, Some(gid));
         assert!(loaded.no_build_zone.is_some());
+    }
+
+    #[test]
+    fn write_nestc_with_progress_reports_stages_and_roundtrips() {
+        let mesh = Arc::new(
+            TriMesh::from_indexed(
+                vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]],
+                vec![[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]],
+            )
+            .expect("valid tet"),
+        );
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        let pid = job.add_part("tet", mesh);
+        let _ = job.add_instance_centered_on_floor(pid).expect("placed");
+
+        let updates = std::cell::RefCell::new(Vec::<(usize, usize, String)>::new());
+        let bytes = write_nestc_with_progress(
+            &job,
+            Some(&|done, total, stage| {
+                updates.borrow_mut().push((done, total, stage.to_owned()));
+            }),
+        )
+        .expect("write nestc with progress");
+
+        let updates = updates.into_inner();
+        assert!(updates.len() >= 4, "expected multiple stage updates");
+        assert!(updates.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert!(updates.iter().all(|u| u.1 == 1000 && !u.2.is_empty()));
+        assert_eq!(updates.last().map(|u| u.0), Some(950));
+
+        let loaded = read_nestc(&bytes).expect("read nestc");
+        assert_eq!(loaded.parts.len(), 1);
+        assert_eq!(loaded.instances.len(), 1);
     }
 }
