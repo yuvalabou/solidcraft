@@ -742,6 +742,7 @@ impl NestCraftApp {
                 sketch_slot: self.empty_slot.clone(),
                 hl_key: self.hl_key,
                 hl_slot: self.hl_slot.clone(),
+                hover_body: None,
                 pv_key: 0,
                 pv_slot: self.empty_slot.clone(),
                 pv_hide: true,
@@ -752,6 +753,7 @@ impl NestCraftApp {
                 size_px,
                 clip: Default::default(),
                 clip_hatch: Default::default(),
+                selection_all: false,
                 cap: [0.0; 4],
                 images: Vec::new(),
                 clouds: Vec::new(),
@@ -763,6 +765,7 @@ impl NestCraftApp {
                 ao_radius: 0.0,
                 ao_samples: 0,
                 edge_px: 0.0,
+                occlusion: false,
                 ssaa: 1.0,
                 hover_tint: [0.08, 0.08, 0.08],
                 selection_tint: [0.93, 0.70, 0.22],
@@ -900,6 +903,7 @@ impl NestCraftApp {
                     orbiting: nav.orbiting,
                     snap_hint: false,
                     home_label: "Reset isometric view".to_owned(),
+                    turn_around_label: None,
                 };
                 match view_compass::show(ui, &compass) {
                     Some(ViewAction::Snap { direction, .. }) => {
@@ -913,7 +917,7 @@ impl NestCraftApp {
                     Some(ViewAction::Home) => {
                         self.camera = self.default_camera_for_job();
                     }
-                    None => {}
+                    Some(ViewAction::TurnAround) | None => {}
                 }
             }
 

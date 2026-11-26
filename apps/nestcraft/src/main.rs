@@ -22,6 +22,8 @@ mod ui_parts_panel;
 mod ui_viewport;
 mod viewport;
 
+use std::io::Write as _;
+
 use app::NestCraftApp;
 use solidcraft_theme::Tokens;
 use solidcraft_viewport_gpu::view::GpuTarget;
@@ -59,7 +61,7 @@ fn main() -> eframe::Result<()> {
                     ..window
                 };
                 let _ = solidcraft_viewport_egui::install(rs, scene, window, false, false, |err| {
-                    eprintln!("nestcraft wgpu error: {err}");
+                    let _ = writeln!(std::io::stderr(), "nestcraft wgpu error: {err}");
                 });
             }
             Ok(Box::new(NestCraftApp::new()))
