@@ -79,6 +79,7 @@ impl eframe::App for NestCraftApp {
         self.poll_load_task(&ctx);
         self.poll_save_task(&ctx);
         self.poll_calc_task(&ctx);
+        self.poll_nest3d_task(&ctx);
         self.handle_shortcuts(&ctx);
         self.handle_dropped_files(&ctx);
         self.draw_top_bar(ui, &ctx, &t);
@@ -87,6 +88,7 @@ impl eframe::App for NestCraftApp {
         self.draw_analyze_bar(ui, &ctx, &t);
         self.draw_view_bar(ui, &ctx, &t);
         self.draw_bottom_bar(ui, &ctx, &t);
+        self.draw_nest3d_progress_bar(ui, &ctx, &t);
         self.draw_parts_browser(ui, &ctx, &t);
         self.draw_inspector(ui, &ctx, &t);
         self.draw_thermal_map_panel(ui, &ctx, &t);
@@ -102,6 +104,8 @@ impl eframe::App for NestCraftApp {
         self.draw_report_modal(&ctx);
         self.draw_failed_print_modal(&ctx);
         self.draw_nest2d_modal(&ctx);
+        self.draw_nest3d_modal(&ctx);
+        self.draw_gravity_settle_modal(&ctx);
         self.draw_below_zero_import_modal(&ctx);
         self.draw_keep_delete_modal(&ctx);
         self.draw_load_progress_modal(&ctx);

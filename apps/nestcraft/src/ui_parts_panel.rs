@@ -924,7 +924,10 @@ impl NestCraftApp {
                     .id_salt("sls_part_details_scroll")
                     .max_height(details_h)
                     .show(ui, |ui| {
-                        self.draw_selected_part_section(ui, t);
+                        let unlocked = !self.is_nest3d_running();
+                        ui.add_enabled_ui(unlocked, |ui| {
+                            self.draw_selected_part_section(ui, t);
+                        });
                     });
                 ui.add_space(t.space_4);
 

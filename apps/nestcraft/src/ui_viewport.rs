@@ -24,13 +24,18 @@ impl NestCraftApp {
         pos: egui::Pos2,
         anchor_pos: [f32; 3],
     ) {
-        let drag_instances: Vec<(InstanceId, [f32; 3])> = self
-            .job
-            .instances
-            .iter()
-            .filter(|i| self.selected_set.contains(&i.id) && !i.locked)
-            .map(|i| (i.id, i.translation()))
-            .collect();
+        let floor_z = self.job.min_z_mm.max(0.0);
+        let mut min_allowed_dz = f32::NEG_INFINITY;
+        let mut drag_instances = Vec::new();
+        for i in &self.job.instances {
+            if self.selected_set.contains(&i.id) && !i.locked {
+                drag_instances.push((i.id, i.translation()));
+                if let Some(proto) = self.job.part(i.part_id) {
+                    let cur_min_z = i.world_bounds(proto.mesh.bounds)[0][2];
+                    min_allowed_dz = min_allowed_dz.max(floor_z - cur_min_z);
+                }
+            }
+        }
         if !drag_instances.is_empty()
             && let Some(hit_pt) = viewport::intersect_camera_plane(&self.camera, rect, pos, anchor_pos)
         {
@@ -41,6 +46,7 @@ impl NestCraftApp {
                 instances: drag_instances,
                 start_hit: hit_pt,
                 plane_z: anchor_pos[2],
+                min_allowed_dz,
             });
             self.start_moving_layer(viewport::DragExclude::Instances(drag_ids));
         }
@@ -157,7 +163,9 @@ impl NestCraftApp {
                 }
             }
 
-            if !over_compass
+            let editing_locked = self.is_nest3d_running();
+            if !editing_locked
+                && !over_compass
                 && !over_view_bar
                 && self.compass_drag.at.is_none()
                 && resp.drag_started_by(egui::PointerButton::Primary)
@@ -287,13 +295,24 @@ impl NestCraftApp {
                     rd.angle_rad += d_angle;
                     let pivot = rd.pivot;
                     let angle_rad = rd.angle_rad;
-                    for (id, orig) in &rd.instances {
-                        if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == *id) {
-                            inst.transform = rotate_transform_around_pivot(*orig, pivot, w_axis, angle_rad);
-                            self.euler_edit.remove(id);
+                    if rd.instances.len() > 8 {
+                        let by_id: std::collections::HashMap<InstanceId, [[f32; 4]; 3]> =
+                            rd.instances.iter().copied().collect();
+                        for inst in &mut self.job.instances {
+                            if let Some(orig) = by_id.get(&inst.id) {
+                                inst.transform = rotate_transform_around_pivot(*orig, pivot, w_axis, angle_rad);
+                                self.euler_edit.remove(&inst.id);
+                            }
+                        }
+                    } else {
+                        for (id, orig) in &rd.instances {
+                            if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == *id) {
+                                inst.transform = rotate_transform_around_pivot(*orig, pivot, w_axis, angle_rad);
+                                self.euler_edit.remove(id);
+                            }
                         }
                     }
-                    if d_angle.abs() > 1e-5 {
+                    if self.collision_check_active && d_angle.abs() > 1e-5 {
                         self.update_live_drag_collision();
                     }
                 } else if let Some(bs) = &mut self.box_select {
@@ -328,31 +347,33 @@ impl NestCraftApp {
                         })
                     };
                     if let Some(mut delta) = raw_delta {
-                        let floor_z = self.job.min_z_mm.max(0.0);
-                        let mut min_allowed_dz = f32::NEG_INFINITY;
-                        for (id, start_tr) in &ds.instances {
-                            if let Some(inst) = self.job.instances.iter().find(|i| i.id == *id)
-                                && let Some(proto) = self.job.part(inst.part_id)
-                            {
-                                let cur_tr = inst.translation();
-                                let cur_min_z = inst.world_bounds(proto.mesh.bounds)[0][2];
-                                let start_min_z = cur_min_z - cur_tr[2] + start_tr[2];
-                                min_allowed_dz = min_allowed_dz.max(floor_z - start_min_z);
+                        if ds.min_allowed_dz.is_finite() {
+                            delta[2] = delta[2].max(ds.min_allowed_dz);
+                        }
+                        if ds.instances.len() > 8 {
+                            let by_id: std::collections::HashMap<InstanceId, [f32; 3]> =
+                                ds.instances.iter().copied().collect();
+                            for inst in &mut self.job.instances {
+                                if let Some(start_tr) = by_id.get(&inst.id) {
+                                    inst.set_translation([
+                                        start_tr[0] + delta[0],
+                                        start_tr[1] + delta[1],
+                                        start_tr[2] + delta[2],
+                                    ]);
+                                }
+                            }
+                        } else {
+                            for (id, start_tr) in &ds.instances {
+                                if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == *id) {
+                                    inst.set_translation([
+                                        start_tr[0] + delta[0],
+                                        start_tr[1] + delta[1],
+                                        start_tr[2] + delta[2],
+                                    ]);
+                                }
                             }
                         }
-                        if min_allowed_dz.is_finite() {
-                            delta[2] = delta[2].max(min_allowed_dz);
-                        }
-                        for (id, start_tr) in &ds.instances {
-                            if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == *id) {
-                                inst.set_translation([
-                                    start_tr[0] + delta[0],
-                                    start_tr[1] + delta[1],
-                                    start_tr[2] + delta[2],
-                                ]);
-                            }
-                        }
-                        if resp.drag_delta().length_sq() > 0.01 {
+                        if self.collision_check_active && resp.drag_delta().length_sq() > 0.01 {
                             self.update_live_drag_collision();
                         }
                     }
@@ -440,7 +461,8 @@ impl NestCraftApp {
                 }
             }
 
-            if !over_compass
+            if !editing_locked
+                && !over_compass
                 && !over_view_bar
                 && self.compass_drag.at.is_none()
                 && resp.clicked_by(egui::PointerButton::Primary)
@@ -476,7 +498,8 @@ impl NestCraftApp {
                 }
             }
 
-            if !over_compass
+            if !editing_locked
+                && !over_compass
                 && !over_view_bar
                 && self.compass_drag.at.is_none()
                 && resp.secondary_clicked()

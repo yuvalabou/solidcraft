@@ -69,6 +69,7 @@ use solidcraft_viewport::StandardView;
             instances: vec![(iid, start)],
             start_hit: start,
             plane_z: start[2],
+            min_allowed_dz: f32::NEG_INFINITY,
         });
         app.start_moving_layer(viewport::DragExclude::Instances(vec![iid]));
         app.sync_scene_if_dirty();
@@ -854,6 +855,7 @@ use solidcraft_viewport::StandardView;
             instances: vec![(i3, i3_start)],
             start_hit: i3_start,
             plane_z: i3_start[2],
+            min_allowed_dz: f32::NEG_INFINITY,
         });
         app.job.instances[2].set_translation([15.0, 0.0, 0.0]);
         app.update_live_drag_collision();
@@ -1220,4 +1222,174 @@ use solidcraft_viewport::StandardView;
         assert_eq!(app2.quick_save_target(), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nest3d_dialog_memory_autofit_cancel_and_undo_behave_cleanly() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        app.add_sample_part();
+        assert_eq!(app.job.instances.len(), 2);
+
+        app.open_nest3d_dialog();
+        assert!(app.nest3d_dialog_open);
+        assert!(app.nest3d_sys_avail_ram_bytes > 0);
+
+        // Tight RAM cap triggers auto-fit coarsening without panicking.
+        let fitted = nestcraft_core::nest3d::auto_fit_nest3d_resolution(
+            &app.job,
+            &app.nest3d_config,
+            Some(&app.selected_set),
+            4 * 1024 * 1024,
+        );
+        assert!((0.5..=4.0).contains(&fitted));
+
+        // Starting and polling a 3D nest pushes a single undo snapshot when finished.
+        let orig_tfs: Vec<_> = app.job.instances.iter().map(|i| i.transform).collect();
+        app.nest3d_config.resolution_mm = 2.0;
+        let ctx = egui::Context::default();
+        app.start_nest3d(&ctx);
+        assert!(app.is_nest3d_running());
+        assert!(!app.nest3d_dialog_open);
+
+        for _ in 0..200 {
+            app.poll_nest3d_task(&ctx);
+            if !app.is_nest3d_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!app.is_nest3d_running());
+        assert!(app.nest3d_last_result.is_some());
+        assert!(!app.undo_stack.is_empty());
+
+        // Undo restores the pre-nest transforms cleanly.
+        assert!(app.undo());
+        let restored_tfs: Vec<_> = app.job.instances.iter().map(|i| i.transform).collect();
+        assert_eq!(restored_tfs, orig_tfs);
+
+        // Starting again and cancelling immediately restores original bed without adding undo entries.
+        let undo_len_before_cancel = app.undo_stack.len();
+        app.start_nest3d(&ctx);
+        app.request_nest3d_cancel();
+        for _ in 0..200 {
+            app.poll_nest3d_task(&ctx);
+            if !app.is_nest3d_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!app.is_nest3d_running());
+        assert_eq!(app.undo_stack.len(), undo_len_before_cancel);
+        let after_cancel_tfs: Vec<_> = app.job.instances.iter().map(|i| i.transform).collect();
+        assert_eq!(after_cancel_tfs, orig_tfs);
+    }
+
+    #[test]
+    fn dragging_130_parts_skips_sync_collision_when_inactive_or_multi_select() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        let pid = app.job.parts[0].id;
+        for _ in 1..130 {
+            let _ = app.job.add_instance(pid, IDENTITY_TRANSFORM).expect("add 130th");
+        }
+        assert_eq!(app.job.instances.len(), 130);
+
+        let all_ids: Vec<nestcraft_core::model::InstanceId> =
+            app.job.instances.iter().map(|i| i.id).collect();
+        app.selected_set = all_ids.iter().copied().collect();
+        app.selected = all_ids.first().copied();
+        let drag_instances: Vec<(nestcraft_core::model::InstanceId, [f32; 3])> = app
+            .job
+            .instances
+            .iter()
+            .map(|i| (i.id, i.translation()))
+            .collect();
+        app.drag_state = Some(DragState {
+            anchor_id: all_ids[0],
+            instances: drag_instances,
+            start_hit: [0.0, 0.0, 0.0],
+            plane_z: 0.0,
+            min_allowed_dz: 0.0,
+        });
+
+        // 1. With collision_check_active == false, dragging 130 overlapping parts must not run
+        // collision detection or populate hl_slot.
+        app.start_moving_layer(viewport::DragExclude::Instances(all_ids));
+        assert!(app.calc_task.is_none());
+        app.update_live_drag_collision();
+        assert!(!app.collision_overlay_nonempty);
+        assert!(app.hl_slot.lock().is_ok_and(|g| g.is_none()));
+
+        // 2. Even with collision_check_active == true, multi-part drag (>1 part) skips synchronous
+        // UI-thread collision_cache.sync and defers refresh to drag release.
+        app.collision_check_active = true;
+        let _ = app.collision_cache.sync(&app.job, COLLISION_VOXEL_PITCH_MM);
+        for inst in &mut app.job.instances {
+            inst.set_translation([12.0, 4.0, 0.0]);
+        }
+        app.update_live_drag_collision();
+        assert!(app.calc_task.is_none());
+        assert_ne!(
+            app.collision_cache.diff(&app.job, COLLISION_VOXEL_PITCH_MM),
+            nestcraft_core::collision::CollisionDiff::NoChange
+        );
+    }
+
+    #[test]
+    fn gravity_settle_dialog_runs_compacts_and_supports_undo_and_cancel() {
+        let mut app = NestCraftApp::new();
+        app.job.no_build_zone = None;
+        app.job.wall_margin_mm = 5.0;
+        app.job.min_z_mm = 0.0;
+        app.job.clearance_mm = 2.0;
+        app.add_sample_part();
+        app.add_sample_part();
+        assert_eq!(app.job.instances.len(), 2);
+
+        let [cx, cy] = app.job.bed_center_xy();
+        app.job.instances[0].set_translation([cx - 15.0, cy - 10.0, 25.0]);
+        app.job.instances[1].set_translation([cx - 15.0, cy - 10.0, 65.0]);
+
+        app.open_gravity_settle_dialog();
+        assert!(app.gravity_settle_dialog_open);
+
+        let orig_tfs: Vec<_> = app.job.instances.iter().map(|i| i.transform).collect();
+        let ctx = egui::Context::default();
+        app.start_gravity_settle(&ctx);
+        assert!(app.is_nest3d_running());
+        assert!(!app.gravity_settle_dialog_open);
+
+        for _ in 0..200 {
+            app.poll_nest3d_task(&ctx);
+            if !app.is_nest3d_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!app.is_nest3d_running());
+        let res = app.gravity_settle_last_result.as_ref().expect("settle result");
+        assert!(res.z_reduction_mm > 0.0, "expected Z compaction: {res:?}");
+        assert!(!app.undo_stack.is_empty());
+
+        // Single Ctrl+Z undo restores original transforms cleanly.
+        assert!(app.undo());
+        let restored_tfs: Vec<_> = app.job.instances.iter().map(|i| i.transform).collect();
+        assert_eq!(restored_tfs, orig_tfs);
+
+        // Cancel mid-flight restores original bed without pushing an undo entry.
+        let undo_len_before_cancel = app.undo_stack.len();
+        app.start_gravity_settle(&ctx);
+        app.request_nest3d_cancel();
+        for _ in 0..200 {
+            app.poll_nest3d_task(&ctx);
+            if !app.is_nest3d_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!app.is_nest3d_running());
+        assert_eq!(app.undo_stack.len(), undo_len_before_cancel);
+        let after_cancel_tfs: Vec<_> = app.job.instances.iter().map(|i| i.transform).collect();
+        assert_eq!(after_cancel_tfs, orig_tfs);
     }

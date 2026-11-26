@@ -10,15 +10,19 @@
 )]
 
 pub mod collision;
+pub mod compact;
+pub mod interlock;
 pub mod io;
 pub mod manifold;
 pub mod model;
 pub mod nest2d;
+pub mod nest3d;
 pub mod recovery;
 pub mod report;
 pub mod sinterbox;
 pub mod slice;
 pub mod thermal;
+pub mod voxel;
 
 use thiserror::Error;
 

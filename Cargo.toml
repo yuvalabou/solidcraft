@@ -115,6 +115,8 @@ url = "2.5"
 # constrained Delaunay + Ruppert refinement for trimmed faces (MIT OR Apache-2.0).
 spade = { version = "2.15", default-features = false, features = ["std"] }
 rayon = "1.12"
+# 3D rigid-body physics compaction + V-HACD convex decomposition (Apache-2.0, pure Rust, WASM-ready).
+rapier3d = { version = "0.32", default-features = false, features = ["dim3", "f32"] }
 # Native render-memory admission; RAM-only queries through a safe MIT-licensed API.
 sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
 

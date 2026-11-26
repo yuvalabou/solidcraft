@@ -7,7 +7,7 @@ use nestcraft_core::model::{
 };
 use nestcraft_core::sinterbox::{self};
 use solidcraft_theme::Tokens;
-use solidcraft_ui_kit::container::BackingTooltipExt as _;
+use solidcraft_ui_kit::container::{BackingTooltipExt as _, Container, Surface};
 use solidcraft_ui_kit::{
     Button, Segments, StatusTone, button, checkbox_row, row, segmented, status_line,
 };
@@ -1943,6 +1943,811 @@ impl NestCraftApp {
         }
         if close_now || !open {
             self.nest2d_dialog_open = false;
+        }
+    }
+
+    pub(crate) fn draw_nest3d_modal(&mut self, ctx: &egui::Context) {
+        if !self.nest3d_dialog_open {
+            return;
+        }
+        use nestcraft_core::nest3d::{
+            ClearanceMode, Nest3dOptimizerMode, Nest3dPreset, OrientationFreedom,
+            auto_fit_nest3d_resolution, estimate_nest3d_memory,
+        };
+        use nestcraft_core::voxel::{CpuBudget, FreeAngleSet, ZOnlyStep};
+
+        let mut open = self.nest3d_dialog_open;
+        let mut run_now = false;
+        let mut close_now = false;
+        let t = Tokens::get();
+
+        let [_, _, machine_z] = self.job.machine.size_mm();
+        let min_z_floor = self.nest3d_config.min_z_mm.max(0.0);
+        let max_z_ceiling = (machine_z - self.nest3d_config.wall_margin_mm.max(0.0)).max(min_z_floor + 1.0);
+        let has_selection = !self.selected_set.is_empty();
+
+        Container::new(ctx, Surface::Window)
+            .window("3D Auto-Nest Configuration")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                // Primary controls (compact tier)
+                row(ui, "Preset", |ui| {
+                    let mut p_idx = match self.nest3d_config.preset {
+                        Nest3dPreset::Fast => 0,
+                        Nest3dPreset::Balanced => 1,
+                        Nest3dPreset::Refined => 2,
+                        Nest3dPreset::Custom => 3,
+                    };
+                    if ui
+                        .push_id("nest3d_preset_seg", |ui| {
+                            segmented(
+                                ui,
+                                &mut p_idx,
+                                &["Fast", "Balanced", "Refined", "Custom"],
+                                Segments {
+                                    dense: true,
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .inner
+                    {
+                        let preset = match p_idx {
+                            0 => Nest3dPreset::Fast,
+                            1 => Nest3dPreset::Balanced,
+                            2 => Nest3dPreset::Refined,
+                            _ => Nest3dPreset::Custom,
+                        };
+                        self.nest3d_config.apply_preset(preset);
+                    }
+                });
+
+                row(ui, "Scope", |ui| {
+                    ui.vertical(|ui| {
+                        ui.add_enabled_ui(has_selection, |ui| {
+                            if ui
+                                .checkbox(
+                                    &mut self.nest3d_config.selected_only,
+                                    if has_selection {
+                                        "Pack Selected Only"
+                                    } else {
+                                        "Pack Selected Only (no selection)"
+                                    },
+                                )
+                                .changed()
+                                && !has_selection
+                            {
+                                self.nest3d_config.selected_only = false;
+                            }
+                        });
+                        ui.checkbox(
+                            &mut self.nest3d_config.keep_in_bounds_fixed,
+                            "Keep Parts Inside Build Volume Fixed",
+                        )
+                        .backing_on_hover_text(
+                            "Never move, rotate, or re-pack parts already inside the raw machine build envelope",
+                        );
+                    });
+                });
+
+                row(ui, "Min Distance", |ui| {
+                    ui.horizontal(|ui| {
+                        let min_drag = ui.add(
+                            egui::DragValue::new(&mut self.nest3d_config.min_distance_mm)
+                                .range(0.0..=25.0)
+                                .speed(0.25)
+                                .suffix(" mm"),
+                        );
+                        if min_drag.changed() {
+                            self.nest3d_config.preset = Nest3dPreset::Custom;
+                            if self.nest3d_config.adaptive_max_distance_mm < self.nest3d_config.min_distance_mm {
+                                self.nest3d_config.adaptive_max_distance_mm = self.nest3d_config.min_distance_mm;
+                            }
+                        }
+                        if self.nest3d_config.clearance_mode == ClearanceMode::AdaptiveByPartMass {
+                            ui.label("↔ Max");
+                            let min_d = self.nest3d_config.min_distance_mm;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.nest3d_config.adaptive_max_distance_mm)
+                                        .range(min_d..=25.0)
+                                        .speed(0.25)
+                                        .suffix(" mm"),
+                                )
+                                .changed()
+                            {
+                                self.nest3d_config.preset = Nest3dPreset::Custom;
+                            }
+                        }
+                    });
+                });
+
+                row(ui, "Resolution", |ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Fine").small().color(t.text_dim));
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut self.nest3d_config.resolution_mm, 0.5..=2.0)
+                                        .step_by(0.1)
+                                        .suffix(" mm"),
+                                )
+                                .changed()
+                            {
+                                self.nest3d_config.preset = Nest3dPreset::Custom;
+                            }
+                            ui.label(egui::RichText::new("Fast").small().color(t.text_dim));
+                        });
+                        ui.horizontal(|ui| {
+                            for (lbl, val) in [("Fine 0.5", 0.5_f32), ("Balanced 1.0", 1.0), ("Fast 2.0", 2.0)] {
+                                if ui
+                                    .selectable_label((self.nest3d_config.resolution_mm - val).abs() < 0.05, lbl)
+                                    .clicked()
+                                {
+                                    self.nest3d_config.resolution_mm = val;
+                                    self.nest3d_config.preset = Nest3dPreset::Custom;
+                                }
+                            }
+                        });
+                    });
+                });
+
+                row(ui, "Z Ceiling", |ui| {
+                    ui.horizontal(|ui| {
+                        let mut has_cap = self.nest3d_config.max_z_limit_mm.is_some();
+                        if ui.checkbox(&mut has_cap, "Limit Max Z").changed() {
+                            self.nest3d_config.max_z_limit_mm = if has_cap {
+                                Some(max_z_ceiling)
+                            } else {
+                                None
+                            };
+                            self.sync_nest3d_ceiling_overlay();
+                        }
+                        if let Some(ref mut cap) = self.nest3d_config.max_z_limit_mm
+                            && ui
+                                .add(
+                                    egui::DragValue::new(cap)
+                                        .range((min_z_floor + 1.0)..=max_z_ceiling)
+                                        .speed(1.0)
+                                        .suffix(" mm"),
+                                )
+                                .changed()
+                        {
+                            self.sync_nest3d_ceiling_overlay();
+                        }
+                    });
+                });
+
+                if checkbox_row(
+                    ui,
+                    "nest3d_prevent_interlock",
+                    "Prevent Interlocking (allow open cavities, verify escape path)",
+                    self.nest3d_config.prevent_interlocking,
+                ) {
+                    self.nest3d_config.prevent_interlocking = !self.nest3d_config.prevent_interlocking;
+                }
+
+                // Live memory estimate + sysinfo guardrail
+                let est = estimate_nest3d_memory(&self.job, &self.nest3d_config, Some(&self.selected_set));
+                let half_avail = (self.nest3d_sys_avail_ram_bytes / 2).max(256 * 1024 * 1024) as usize;
+                let soft_cap = self
+                    .nest3d_config
+                    .max_memory_bytes
+                    .map_or(half_avail, |u| u.min(half_avail));
+                let est_mb = est.total_bytes as f64 / (1024.0 * 1024.0);
+                let cap_mb = soft_cap as f64 / (1024.0 * 1024.0);
+                let ram_warn = est.total_bytes > soft_cap;
+                row(ui, "Est. RAM", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("~{est_mb:.1} MB (budget {cap_mb:.0} MB)"))
+                                .small()
+                                .color(if ram_warn { t.error } else { t.text_dim }),
+                        );
+                        if ram_warn
+                            && button(ui, "Auto-Fit Resolution", Button::Small)
+                                .backing_on_hover_text("Coarsen voxel resolution to stay within safe RAM budget")
+                                .clicked()
+                        {
+                            self.nest3d_config.resolution_mm = auto_fit_nest3d_resolution(
+                                &self.job,
+                                &self.nest3d_config,
+                                Some(&self.selected_set),
+                                soft_cap,
+                            );
+                            self.nest3d_config.preset = Nest3dPreset::Custom;
+                        }
+                    });
+                });
+
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new("Advanced Options")
+                    .default_open(self.nest3d_advanced_open)
+                    .show(ui, |ui| {
+                        self.nest3d_advanced_open = true;
+                        egui::ScrollArea::vertical()
+                            .id_salt("nest3d_adv_scroll")
+                            .max_height(260.0)
+                            .show(ui, |ui| {
+                                row(ui, "Optimizer", |ui| {
+                                    let mut opt_idx = match self.nest3d_config.optimizer_mode {
+                                        Nest3dOptimizerMode::ConstructiveOnly => 0,
+                                        Nest3dOptimizerMode::RuinAndRecreate => 1,
+                                        Nest3dOptimizerMode::Genetic => 2,
+                                        Nest3dOptimizerMode::HybridGaRuin => 3,
+                                    };
+                                    if ui
+                                        .push_id("nest3d_opt_seg", |ui| {
+                                            segmented(
+                                                ui,
+                                                &mut opt_idx,
+                                                &["BLBF Only", "Ruin", "GA", "Hybrid"],
+                                                Segments {
+                                                    dense: true,
+                                                    ..Default::default()
+                                                },
+                                            )
+                                        })
+                                        .inner
+                                    {
+                                        self.nest3d_config.optimizer_mode = match opt_idx {
+                                            0 => Nest3dOptimizerMode::ConstructiveOnly,
+                                            1 => Nest3dOptimizerMode::RuinAndRecreate,
+                                            2 => Nest3dOptimizerMode::Genetic,
+                                            _ => Nest3dOptimizerMode::HybridGaRuin,
+                                        };
+                                        self.nest3d_config.preset = Nest3dPreset::Custom;
+                                    }
+                                });
+
+                                row(ui, "Clearance Mode", |ui| {
+                                    let mut c_idx = match self.nest3d_config.clearance_mode {
+                                        ClearanceMode::Fixed => 0,
+                                        ClearanceMode::AdaptiveByPartMass => 1,
+                                    };
+                                    if ui
+                                        .push_id("nest3d_cl_mode", |ui| {
+                                            segmented(
+                                                ui,
+                                                &mut c_idx,
+                                                &["Fixed", "Adaptive (Mass)"],
+                                                Segments {
+                                                    dense: true,
+                                                    ..Default::default()
+                                                },
+                                            )
+                                        })
+                                        .inner
+                                    {
+                                        self.nest3d_config.clearance_mode = if c_idx == 1 {
+                                            ClearanceMode::AdaptiveByPartMass
+                                        } else {
+                                            ClearanceMode::Fixed
+                                        };
+                                    }
+                                });
+
+                                row(ui, "Separate Z Gap", |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.checkbox(&mut self.nest3d_config.separate_z_distance, "Enable");
+                                        if self.nest3d_config.separate_z_distance {
+                                            ui.add(
+                                                egui::DragValue::new(&mut self.nest3d_config.min_z_distance_mm)
+                                                    .range(0.0..=25.0)
+                                                    .speed(0.25)
+                                                    .suffix(" mm"),
+                                            );
+                                        }
+                                    });
+                                });
+
+                                row(ui, "Margins", |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Wall");
+                                        ui.add(
+                                            egui::DragValue::new(&mut self.nest3d_config.wall_margin_mm)
+                                                .range(0.0..=50.0)
+                                                .speed(0.5)
+                                                .suffix(" mm"),
+                                        );
+                                        ui.label("Min Z");
+                                        ui.add(
+                                            egui::DragValue::new(&mut self.nest3d_config.min_z_mm)
+                                                .range(0.0..=100.0)
+                                                .speed(0.5)
+                                                .suffix(" mm"),
+                                        );
+                                    });
+                                });
+
+                                row(ui, "Orientation", |ui| {
+                                    let mut f_idx = match self.nest3d_config.orientation_freedom {
+                                        OrientationFreedom::RespectPartConstraints => 0,
+                                        OrientationFreedom::ForceFixed => 1,
+                                        OrientationFreedom::ForceZOnly => 2,
+                                        OrientationFreedom::ForceFree => 3,
+                                    };
+                                    if ui
+                                        .push_id("nest3d_orient_free", |ui| {
+                                            segmented(
+                                                ui,
+                                                &mut f_idx,
+                                                &["Per-Part", "Fixed", "Z-Only", "Free"],
+                                                Segments {
+                                                    dense: true,
+                                                    ..Default::default()
+                                                },
+                                            )
+                                        })
+                                        .inner
+                                    {
+                                        self.nest3d_config.orientation_freedom = match f_idx {
+                                            1 => OrientationFreedom::ForceFixed,
+                                            2 => OrientationFreedom::ForceZOnly,
+                                            3 => OrientationFreedom::ForceFree,
+                                            _ => OrientationFreedom::RespectPartConstraints,
+                                        };
+                                    }
+                                });
+
+                                row(ui, "Free Angle Set", |ui| {
+                                    ui.horizontal(|ui| {
+                                        let mut a_idx = match self.nest3d_config.free_angle_set {
+                                            FreeAngleSet::Octahedral24 => 0,
+                                            FreeAngleSet::Tilted48 => 1,
+                                            FreeAngleSet::Dense64 => 2,
+                                        };
+                                        if ui
+                                            .push_id("nest3d_angles_seg", |ui| {
+                                                segmented(
+                                                    ui,
+                                                    &mut a_idx,
+                                                    &["24 (90°)", "48 (45°)", "64"],
+                                                    Segments {
+                                                        dense: true,
+                                                        ..Default::default()
+                                                    },
+                                                )
+                                            })
+                                            .inner
+                                        {
+                                            self.nest3d_config.free_angle_set = match a_idx {
+                                                1 => FreeAngleSet::Tilted48,
+                                                2 => FreeAngleSet::Dense64,
+                                                _ => FreeAngleSet::Octahedral24,
+                                            };
+                                        }
+                                        ui.checkbox(&mut self.nest3d_config.use_pca_prealign, "PCA Align");
+                                    });
+                                });
+
+                                row(ui, "Z-Only Step", |ui| {
+                                    let mut z_idx = match self.nest3d_config.z_only_step {
+                                        ZOnlyStep::Deg90 => 0,
+                                        ZOnlyStep::Deg45 => 1,
+                                        ZOnlyStep::Deg30 => 2,
+                                    };
+                                    if ui
+                                        .push_id("nest3d_zstep_seg", |ui| {
+                                            segmented(
+                                                ui,
+                                                &mut z_idx,
+                                                &["90° (4)", "45° (8)", "30° (12)"],
+                                                Segments {
+                                                    dense: true,
+                                                    ..Default::default()
+                                                },
+                                            )
+                                        })
+                                        .inner
+                                    {
+                                        self.nest3d_config.z_only_step = match z_idx {
+                                            0 => ZOnlyStep::Deg90,
+                                            2 => ZOnlyStep::Deg30,
+                                            _ => ZOnlyStep::Deg45,
+                                        };
+                                    }
+                                });
+
+                                if checkbox_row(
+                                    ui,
+                                    "nest3d_open_cavities",
+                                    "Allow Open-Cavity Nesting",
+                                    self.nest3d_config.allow_open_cavities,
+                                ) {
+                                    self.nest3d_config.allow_open_cavities = !self.nest3d_config.allow_open_cavities;
+                                }
+                                if checkbox_row(
+                                    ui,
+                                    "nest3d_avoid_nbz",
+                                    "Avoid enabled No-Build Zone",
+                                    self.nest3d_config.avoid_no_build_zone,
+                                ) {
+                                    self.nest3d_config.avoid_no_build_zone = !self.nest3d_config.avoid_no_build_zone;
+                                }
+
+                                row(ui, "Thermal / Slice", |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::Slider::new(&mut self.nest3d_config.thermal_weight, 0.0..=1.0)
+                                                .text("Thermal"),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.nest3d_config.slice_smoothness_weight,
+                                                0.0..=1.0,
+                                            )
+                                            .text("Slice"),
+                                        );
+                                    })
+                                    .response
+                                })
+                                .backing_on_hover_text("Applied in Stage 2 refined optimization");
+
+                                row(ui, "Physics Polish", |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.checkbox(&mut self.nest3d_config.gravity_settle_after, "Gravity Settle");
+                                        ui.checkbox(&mut self.nest3d_config.allow_micro_rotations, "Micro-Tilt");
+                                        if self.nest3d_config.allow_micro_rotations {
+                                            ui.add(
+                                                egui::DragValue::new(&mut self.nest3d_config.max_tilt_deg)
+                                                    .range(0.0..=15.0)
+                                                    .speed(0.5)
+                                                    .suffix("°"),
+                                            );
+                                        }
+                                    });
+                                });
+
+                                row(ui, "CPU Threads", |ui| {
+                                    let mut cpu_idx = match self.nest3d_config.cpu_budget {
+                                        CpuBudget::Quiet => 0,
+                                        CpuBudget::Balanced => 1,
+                                        CpuBudget::Max => 2,
+                                        CpuBudget::Custom(_) => 3,
+                                    };
+                                    if ui
+                                        .push_id("nest3d_cpu_seg", |ui| {
+                                            segmented(
+                                                ui,
+                                                &mut cpu_idx,
+                                                &["Quiet 50%", "Balanced 75%", "Max All-1"],
+                                                Segments {
+                                                    dense: true,
+                                                    ..Default::default()
+                                                },
+                                            )
+                                        })
+                                        .inner
+                                    {
+                                        self.nest3d_config.cpu_budget = match cpu_idx {
+                                            0 => CpuBudget::Quiet,
+                                            2 => CpuBudget::Max,
+                                            _ => CpuBudget::Balanced,
+                                        };
+                                    }
+                                });
+                            });
+                    });
+
+                if let Some(res) = &self.nest3d_last_result {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Last run: {} placed, {} overflow | Max Z {:.1} mm | {:.2}% density ({} ms)",
+                            res.placed_count,
+                            res.overflow_count,
+                            res.max_z_mm,
+                            res.packing_density_pct,
+                            res.elapsed_ms
+                        ))
+                        .small()
+                        .color(if res.overflow_count > 0 { t.error } else { t.accent }),
+                    );
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if !self.is_nest3d_running()
+                        && self.calc_task.is_none()
+                        && button(ui, "Run 3D Nest", Button::Primary).clicked()
+                    {
+                        run_now = true;
+                    }
+                    if button(ui, "Close", Button::Small).clicked() {
+                        close_now = true;
+                    }
+                });
+            });
+
+        if run_now {
+            self.start_nest3d(ctx);
+        } else if close_now || !open {
+            self.nest3d_dialog_open = false;
+            self.sync_nest3d_ceiling_overlay();
+        }
+    }
+
+    pub(crate) fn draw_gravity_settle_modal(&mut self, ctx: &egui::Context) {
+        if !self.gravity_settle_dialog_open {
+            return;
+        }
+        use nestcraft_core::compact::SettleDirection;
+        use nestcraft_core::nest3d::ClearanceMode;
+
+        let mut open = self.gravity_settle_dialog_open;
+        let mut run_now = false;
+        let mut close_now = false;
+        let t = Tokens::get();
+
+        let [_, _, machine_z] = self.job.machine.size_mm();
+        let min_z_floor = self.gravity_settle_config.min_z_mm.max(0.0);
+        let max_z_ceiling = (machine_z - self.gravity_settle_config.wall_margin_mm.max(0.0)).max(min_z_floor + 1.0);
+        let has_selection = !self.selected_set.is_empty();
+
+        Container::new(ctx, Surface::Window)
+            .window("Gravity Settle / Compact")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .movable(true)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+
+                row(ui, "Direction", |ui| {
+                    let mut dir_idx = match self.gravity_settle_config.direction {
+                        SettleDirection::DownZ => 0,
+                        SettleDirection::DownZPlusInwardXY => 1,
+                    };
+                    if ui
+                        .push_id("gravity_settle_dir_seg", |ui| {
+                            segmented(
+                                ui,
+                                &mut dir_idx,
+                                &["Down -Z", "Down -Z + Inward XY"],
+                                Segments {
+                                    dense: true,
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .inner
+                    {
+                        self.gravity_settle_config.direction = if dir_idx == 1 {
+                            SettleDirection::DownZPlusInwardXY
+                        } else {
+                            SettleDirection::DownZ
+                        };
+                    }
+                });
+
+                row(ui, "Scope", |ui| {
+                    ui.vertical(|ui| {
+                        ui.add_enabled_ui(has_selection, |ui| {
+                            if ui
+                                .checkbox(
+                                    &mut self.gravity_settle_config.selected_only,
+                                    if has_selection {
+                                        "Compact Selected Only"
+                                    } else {
+                                        "Compact Selected Only (no selection)"
+                                    },
+                                )
+                                .changed()
+                                && !has_selection
+                            {
+                                self.gravity_settle_config.selected_only = false;
+                            }
+                        });
+                        ui.checkbox(
+                            &mut self.gravity_settle_config.keep_in_bounds_fixed,
+                            "Keep Parts Inside Build Volume Fixed",
+                        )
+                        .backing_on_hover_text(
+                            "Never move or rotate parts already inside the raw machine build envelope",
+                        );
+                    });
+                });
+
+                row(ui, "Clearance Mode", |ui| {
+                    let mut cm_idx = match self.gravity_settle_config.clearance_mode {
+                        ClearanceMode::Fixed => 0,
+                        ClearanceMode::AdaptiveByPartMass => 1,
+                    };
+                    if ui
+                        .push_id("gravity_settle_cm_seg", |ui| {
+                            segmented(
+                                ui,
+                                &mut cm_idx,
+                                &["Fixed", "Adaptive by Part Mass"],
+                                Segments {
+                                    dense: true,
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .inner
+                    {
+                        self.gravity_settle_config.clearance_mode = if cm_idx == 1 {
+                            ClearanceMode::AdaptiveByPartMass
+                        } else {
+                            ClearanceMode::Fixed
+                        };
+                    }
+                });
+
+                row(ui, "Min Distance", |ui| {
+                    ui.horizontal(|ui| {
+                        let min_drag = ui.add(
+                            egui::DragValue::new(&mut self.gravity_settle_config.min_distance_mm)
+                                .range(0.0..=25.0)
+                                .speed(0.25)
+                                .suffix(" mm"),
+                        );
+                        if min_drag.changed()
+                            && self.gravity_settle_config.adaptive_max_distance_mm
+                                < self.gravity_settle_config.min_distance_mm
+                        {
+                            self.gravity_settle_config.adaptive_max_distance_mm =
+                                self.gravity_settle_config.min_distance_mm;
+                        }
+                        if self.gravity_settle_config.clearance_mode == ClearanceMode::AdaptiveByPartMass {
+                            ui.label("↔ Max");
+                            let min_d = self.gravity_settle_config.min_distance_mm;
+                            ui.add(
+                                egui::DragValue::new(&mut self.gravity_settle_config.adaptive_max_distance_mm)
+                                    .range(min_d..=25.0)
+                                    .speed(0.25)
+                                    .suffix(" mm"),
+                            );
+                        }
+                    });
+                });
+
+                row(ui, "Z Distance", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.gravity_settle_config.separate_z_distance, "Separate Z");
+                        if self.gravity_settle_config.separate_z_distance {
+                            ui.add(
+                                egui::DragValue::new(&mut self.gravity_settle_config.min_z_distance_mm)
+                                    .range(0.0..=25.0)
+                                    .speed(0.25)
+                                    .suffix(" mm"),
+                            );
+                        }
+                    });
+                });
+
+                row(ui, "Margins", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Wall");
+                        ui.add(
+                            egui::DragValue::new(&mut self.gravity_settle_config.wall_margin_mm)
+                                .range(0.0..=50.0)
+                                .speed(0.5)
+                                .suffix(" mm"),
+                        );
+                        ui.label("Min Z");
+                        ui.add(
+                            egui::DragValue::new(&mut self.gravity_settle_config.min_z_mm)
+                                .range(0.0..=max_z_ceiling)
+                                .speed(0.5)
+                                .suffix(" mm"),
+                        );
+                    });
+                });
+
+                row(ui, "Z Ceiling", |ui| {
+                    ui.horizontal(|ui| {
+                        let mut has_cap = self.gravity_settle_config.max_z_limit_mm.is_some();
+                        if ui.checkbox(&mut has_cap, "Limit Max Z").changed() {
+                            self.gravity_settle_config.max_z_limit_mm = if has_cap {
+                                Some(max_z_ceiling)
+                            } else {
+                                None
+                            };
+                        }
+                        if let Some(ref mut cap) = self.gravity_settle_config.max_z_limit_mm {
+                            ui.add(
+                                egui::DragValue::new(cap)
+                                    .range((min_z_floor + 1.0)..=max_z_ceiling)
+                                    .speed(1.0)
+                                    .suffix(" mm"),
+                            );
+                        }
+                    });
+                });
+
+                row(ui, "Micro-Tilt", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.gravity_settle_config.allow_micro_rotations, "Allow Micro-Rotations");
+                        if self.gravity_settle_config.allow_micro_rotations {
+                            ui.add(
+                                egui::DragValue::new(&mut self.gravity_settle_config.max_tilt_deg)
+                                    .range(0.5..=25.0)
+                                    .speed(0.5)
+                                    .suffix("°"),
+                            );
+                        }
+                    });
+                });
+
+                if checkbox_row(
+                    ui,
+                    "gravity_settle_prevent_interlock",
+                    "Prevent Interlocking (verify escape path after settle)",
+                    self.gravity_settle_config.prevent_interlocking,
+                ) {
+                    self.gravity_settle_config.prevent_interlocking =
+                        !self.gravity_settle_config.prevent_interlocking;
+                }
+                if checkbox_row(
+                    ui,
+                    "gravity_settle_avoid_nbz",
+                    "Avoid enabled No-Build Zone",
+                    self.gravity_settle_config.avoid_no_build_zone,
+                ) {
+                    self.gravity_settle_config.avoid_no_build_zone =
+                        !self.gravity_settle_config.avoid_no_build_zone;
+                }
+
+                row(ui, "Budget", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Steps");
+                        ui.add(egui::DragValue::new(&mut self.gravity_settle_config.max_steps).range(30..=1000).speed(10.0));
+                        ui.label("Time");
+                        ui.add(
+                            egui::DragValue::new(&mut self.gravity_settle_config.time_limit_secs)
+                                .range(0.5..=60.0)
+                                .speed(0.5)
+                                .suffix(" s"),
+                        );
+                    });
+                });
+
+                if let Some(res) = &self.gravity_settle_last_result {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Last settle: {} moved, {} rolled back | Max Z {:.1} -> {:.1} mm (-{:.1} mm, {} ms)",
+                            res.moved_count,
+                            res.rolled_back_count,
+                            res.max_z_before_mm,
+                            res.max_z_after_mm,
+                            res.z_reduction_mm,
+                            res.elapsed_ms
+                        ))
+                        .small()
+                        .color(if res.rolled_back_count > 0 { t.text_dim } else { t.accent }),
+                    );
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if !self.is_nest3d_running()
+                        && self.calc_task.is_none()
+                        && button(ui, "Run Gravity Settle", Button::Primary).clicked()
+                    {
+                        run_now = true;
+                    }
+                    if button(ui, "Close", Button::Small).clicked() {
+                        close_now = true;
+                    }
+                });
+            });
+
+        if run_now {
+            self.start_gravity_settle(ctx);
+        } else if close_now || !open {
+            self.gravity_settle_dialog_open = false;
         }
     }
 

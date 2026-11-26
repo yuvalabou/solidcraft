@@ -45,6 +45,7 @@ pub struct SceneCache {
     pub no_build_zone: Option<(Arc<TriMesh>, Arc<SharedTris>)>,
     pub thermal_colors: Option<HashMap<InstanceId, [u8; 4]>>,
     pub collision_ids: HashSet<InstanceId>,
+    pub max_z_limit_mm: Option<f32>,
 }
 
 impl SceneCache {
@@ -67,20 +68,33 @@ impl SceneCache {
     }
 }
 
+enum IdLookup<'a> {
+    Slice(&'a [InstanceId]),
+    Set(HashSet<InstanceId>),
+}
+
+impl<'a> IdLookup<'a> {
+    fn from_slice(ids: &'a [InstanceId]) -> Self {
+        if ids.len() > 8 {
+            Self::Set(ids.iter().copied().collect())
+        } else {
+            Self::Slice(ids)
+        }
+    }
+
+    fn contains(&self, id: InstanceId) -> bool {
+        match self {
+            Self::Slice(ids) => ids.contains(&id),
+            Self::Set(set) => set.contains(&id),
+        }
+    }
+}
+
 /// Item(s) currently being dragged in a separate [`solidcraft_viewport_gpu::view::MovingLayer`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DragExclude {
     Instances(Vec<InstanceId>),
     NoBuildZone,
-}
-
-impl DragExclude {
-    fn contains_instance(&self, id: InstanceId) -> bool {
-        match self {
-            Self::Instances(ids) => ids.contains(&id),
-            Self::NoBuildZone => false,
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -155,11 +169,16 @@ pub fn build_gpu_scene_with_exclude(
         margin_color,
         ceiling_color,
         [axis_x, axis_y, axis_z],
+        cache.max_z_limit_mm,
     );
 
+    let exclude_lookup = match exclude {
+        Some(DragExclude::Instances(ids)) => Some(IdLookup::from_slice(ids)),
+        _ => None,
+    };
     let mut per_part: HashMap<(PartId, bool), InstancedMesh> = HashMap::new();
     for inst in &job.instances {
-        if exclude.is_some_and(|e| e.contains_instance(inst.id)) || !job.is_instance_visible(inst) {
+        if exclude_lookup.as_ref().is_some_and(|l| l.contains(inst.id)) || !job.is_instance_visible(inst) {
             continue;
         }
         let Some(proto) = job.part(inst.part_id) else {
@@ -259,9 +278,10 @@ pub fn build_moving_scene(
 
     match target {
         DragExclude::Instances(ids) => {
+            let include_lookup = IdLookup::from_slice(ids);
             let mut per_part: HashMap<(PartId, bool), InstancedMesh> = HashMap::new();
             for inst in &job.instances {
-                if !ids.contains(&inst.id) || !job.is_instance_visible(inst) {
+                if !include_lookup.contains(inst.id) || !job.is_instance_visible(inst) {
                     continue;
                 }
                 let Some(proto) = job.part(inst.part_id) else {
@@ -374,6 +394,46 @@ fn draw_rect_z(
     scene.line([x0, y1, z], [x0, y0, z], color, width, false);
 }
 
+fn draw_dashed_rect_z(
+    scene: &mut GpuScene,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    z: f32,
+    color: PaletteIndex,
+    width: f32,
+) {
+    let draw_dashed_edge = |scene: &mut GpuScene, a: [f32; 3], b: [f32; 3]| {
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let dz = b[2] - a[2];
+        let len = (dx * dx + dy * dy + dz * dz).sqrt();
+        if len < 1.0 {
+            return;
+        }
+        let dash = 8.0_f32;
+        let step = 14.0_f32;
+        let mut t = 0.0_f32;
+        while t < len {
+            let t0 = t / len;
+            let t1 = ((t + dash).min(len)) / len;
+            scene.line(
+                [a[0] + dx * t0, a[1] + dy * t0, a[2] + dz * t0],
+                [a[0] + dx * t1, a[1] + dy * t1, a[2] + dz * t1],
+                color,
+                width,
+                false,
+            );
+            t += step;
+        }
+    };
+    draw_dashed_edge(scene, [x0, y0, z], [x1, y0, z]);
+    draw_dashed_edge(scene, [x1, y0, z], [x1, y1, z]);
+    draw_dashed_edge(scene, [x1, y1, z], [x0, y1, z]);
+    draw_dashed_edge(scene, [x0, y1, z], [x0, y0, z]);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_free_floor_and_bed(
     scene: &mut GpuScene,
@@ -383,6 +443,7 @@ fn draw_free_floor_and_bed(
     margin_color: PaletteIndex,
     bed_outline_color: PaletteIndex,
     axes: [PaletteIndex; 3],
+    max_z_limit_mm: Option<f32>,
 ) {
     let [w, d, h] = job.machine.size_mm();
     let ([x0, y0], [x1, y1]) = job.bed_xy_bounds();
@@ -453,6 +514,15 @@ fn draw_free_floor_and_bed(
     let m = job.wall_margin_mm.max(0.0);
     if m > 0.0 && w > 2.0 * m && d > 2.0 * m {
         draw_rect_z(scene, x0 + m, y0 + m, x1 - m, y1 - m, min_z + 0.05, margin_color, 1.1);
+    }
+
+    if let Some(z_lim) = max_z_limit_mm {
+        let z_clamped = z_lim.clamp(min_z + 1.0, h.max(min_z + 1.0));
+        let cx0 = if w > 2.0 * m { x0 + m } else { x0 };
+        let cx1 = if w > 2.0 * m { x1 - m } else { x1 };
+        let cy0 = if d > 2.0 * m { y0 + m } else { y0 };
+        let cy1 = if d > 2.0 * m { y1 - m } else { y1 };
+        draw_dashed_rect_z(scene, cx0, cy0, cx1, cy1, z_clamped, bed_outline_color, 1.6);
     }
 
     // Origin triad (25 mm)

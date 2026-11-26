@@ -3,7 +3,7 @@
 use crate::viewport;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +27,7 @@ pub(crate) struct DragState {
     pub(crate) instances: Vec<(InstanceId, [f32; 3])>,
     pub(crate) start_hit: [f32; 3],
     pub(crate) plane_z: f32,
+    pub(crate) min_allowed_dz: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +118,29 @@ pub(crate) struct BackgroundCalcTask {
     pub(crate) completed: Arc<AtomicUsize>,
     pub(crate) total: Arc<AtomicUsize>,
     pub(crate) rx: Receiver<CalcOutcome>,
+}
+
+pub(crate) enum Nest3dMsg {
+    Progress(nestcraft_core::nest3d::Nest3dProgress),
+    Finished {
+        job: Box<BuildJob>,
+        result: nestcraft_core::nest3d::Nest3dResult,
+    },
+    SettleFinished {
+        job: Box<BuildJob>,
+        result: nestcraft_core::compact::GravitySettleResult,
+    },
+    Cancelled,
+    Failed(String),
+}
+
+pub(crate) struct ActiveNest3dTask {
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) stop_and_apply: Arc<AtomicBool>,
+    pub(crate) pre_nest_snapshot: UndoSnapshot,
+    pub(crate) started_at: std::time::Instant,
+    pub(crate) latest: nestcraft_core::nest3d::Nest3dProgress,
+    pub(crate) rx: Receiver<Nest3dMsg>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,6 +337,15 @@ pub(crate) struct NestCraftApp {
     pub(crate) nest2d_dialog_open: bool,
     pub(crate) nest2d_config: nestcraft_core::nest2d::Nest2dConfig,
     pub(crate) nest2d_last_result: Option<nestcraft_core::nest2d::Nest2dResult>,
+    pub(crate) nest3d_dialog_open: bool,
+    pub(crate) nest3d_advanced_open: bool,
+    pub(crate) nest3d_config: nestcraft_core::nest3d::Nest3dConfig,
+    pub(crate) nest3d_last_result: Option<nestcraft_core::nest3d::Nest3dResult>,
+    pub(crate) nest3d_task: Option<ActiveNest3dTask>,
+    pub(crate) nest3d_sys_avail_ram_bytes: u64,
+    pub(crate) gravity_settle_dialog_open: bool,
+    pub(crate) gravity_settle_config: nestcraft_core::compact::GravitySettleConfig,
+    pub(crate) gravity_settle_last_result: Option<nestcraft_core::compact::GravitySettleResult>,
     pub(crate) slice_dist_open: bool,
     pub(crate) slice_dist_step_mm: f32,
     pub(crate) slice_dist_bed_scale: bool,
@@ -872,6 +905,7 @@ impl NestCraftApp {
         job.bed_origin = p0.bed_origin.into();
         job.material_id = p0.material_id.clone();
         job.no_build_zone = load_no_build_zone_for_slot(0);
+        let nest3d_config = nestcraft_core::nest3d::Nest3dConfig::from_job(&job);
         let camera = viewport::default_camera_with_origin(&job.machine, job.bed_origin);
         let custom_name = p0.name.clone();
         let custom_size_mm = job.machine.size_mm();
@@ -880,6 +914,7 @@ impl NestCraftApp {
         let custom_clearance = job.clearance_mm;
         let custom_bed_origin = job.bed_origin;
         let custom_material_id = job.material_id.clone();
+        let gravity_settle_config = nestcraft_core::compact::GravitySettleConfig::from_job(&job);
         Self {
             job,
             selected: None,
@@ -951,6 +986,15 @@ impl NestCraftApp {
             nest2d_dialog_open: false,
             nest2d_config: nestcraft_core::nest2d::Nest2dConfig::default(),
             nest2d_last_result: None,
+            nest3d_dialog_open: false,
+            nest3d_advanced_open: false,
+            nest3d_config,
+            nest3d_last_result: None,
+            nest3d_task: None,
+            nest3d_sys_avail_ram_bytes: 4 * 1024 * 1024 * 1024,
+            gravity_settle_dialog_open: false,
+            gravity_settle_config,
+            gravity_settle_last_result: None,
             slice_dist_open: false,
             slice_dist_step_mm: 1.0,
             slice_dist_bed_scale: false,
@@ -1056,6 +1100,65 @@ impl NestCraftApp {
             self.failed_print_z_mm = (self.job.max_z_mm() * 0.5).max(0.0);
         }
         self.failed_print_dialog_open = true;
+    }
+
+    pub(crate) fn is_nest3d_running(&self) -> bool {
+        self.nest3d_task.is_some()
+    }
+
+    pub(crate) fn refresh_available_ram(&mut self) {
+        if let Ok(mut sys) = sysinfo::System::new_with_specifics(
+            sysinfo::RefreshKind::nothing()
+                .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
+        ) {
+            sys.refresh_memory();
+            let avail = sys.available_memory();
+            if avail > 0 {
+                self.nest3d_sys_avail_ram_bytes = avail;
+            }
+        }
+    }
+
+    pub(crate) fn sync_nest3d_ceiling_overlay(&mut self) {
+        let next = if self.nest3d_dialog_open || self.is_nest3d_running() {
+            self.nest3d_config
+                .max_z_limit_mm
+                .map(|_| self.nest3d_config.effective_max_z(&self.job))
+        } else {
+            None
+        };
+        if self.scene_cache.max_z_limit_mm != next {
+            self.scene_cache.max_z_limit_mm = next;
+            self.scene_dirty = true;
+        }
+    }
+
+    pub(crate) fn open_nest3d_dialog(&mut self) {
+        if self.is_nest3d_running() {
+            return;
+        }
+        self.refresh_available_ram();
+        self.nest3d_config.min_distance_mm = self.job.clearance_mm.max(0.0);
+        self.nest3d_config.wall_margin_mm = self.job.wall_margin_mm.max(0.0);
+        self.nest3d_config.min_z_mm = self.job.min_z_mm.max(0.0);
+        if self.selected_set.is_empty() {
+            self.nest3d_config.selected_only = false;
+        }
+        self.nest3d_dialog_open = true;
+        self.sync_nest3d_ceiling_overlay();
+    }
+
+    pub(crate) fn open_gravity_settle_dialog(&mut self) {
+        if self.is_nest3d_running() {
+            return;
+        }
+        self.gravity_settle_config.min_distance_mm = self.job.clearance_mm.max(0.0);
+        self.gravity_settle_config.wall_margin_mm = self.job.wall_margin_mm.max(0.0);
+        self.gravity_settle_config.min_z_mm = self.job.min_z_mm.max(0.0);
+        if self.selected_set.is_empty() {
+            self.gravity_settle_config.selected_only = false;
+        }
+        self.gravity_settle_dialog_open = true;
     }
 
     pub(crate) fn open_nest2d_dialog(&mut self) {
@@ -1987,8 +2090,39 @@ impl NestCraftApp {
             || self.report_dialog_open
             || self.failed_print_dialog_open
             || self.nest2d_dialog_open
+            || self.nest3d_dialog_open
+            || self.gravity_settle_dialog_open
             || !self.below_zero_import_dialog.is_empty()
         {
+            return;
+        }
+        if self.is_nest3d_running() {
+            ctx.input(|i| {
+                let cmd = i.modifiers.command;
+                let alt = i.modifiers.alt;
+                let shift = i.modifiers.shift;
+                if !cmd && !alt && i.key_pressed(egui::Key::Escape) {
+                    self.request_nest3d_cancel();
+                    return;
+                }
+                if !cmd && !alt && !shift && i.key_pressed(egui::Key::Space) {
+                    self.cycle_standard_view();
+                }
+                if !cmd && !alt && i.key_pressed(egui::Key::F) {
+                    self.camera = self.default_camera_for_job();
+                }
+                if !cmd && !alt {
+                    if i.key_pressed(egui::Key::Num1) {
+                        self.camera = self.camera.looking_from([0.0, -1.0, 0.0].into());
+                    } else if i.key_pressed(egui::Key::Num3) {
+                        self.camera = self.camera.looking_from([1.0, 0.0, 0.0].into());
+                    } else if i.key_pressed(egui::Key::Num7) {
+                        self.camera = self.camera.looking_from([0.0, 0.0, 1.0].into());
+                    } else if i.key_pressed(egui::Key::Num0) {
+                        self.camera = self.default_camera_for_job();
+                    }
+                }
+            });
             return;
         }
         ctx.input(|i| {
@@ -2298,6 +2432,312 @@ impl NestCraftApp {
         });
     }
 
+    pub(crate) fn request_nest3d_stop_and_apply(&mut self) {
+        if let Some(task) = &self.nest3d_task {
+            task.stop_and_apply.store(true, Ordering::Relaxed);
+            self.status = "Stopping 3D Nest and applying best layout...".to_owned();
+        }
+    }
+
+    pub(crate) fn request_nest3d_cancel(&mut self) {
+        if let Some(task) = &self.nest3d_task {
+            task.cancel.store(true, Ordering::Relaxed);
+            self.status = "Cancelling 3D Nest...".to_owned();
+        }
+    }
+
+    pub(crate) fn start_nest3d(&mut self, ctx: &egui::Context) {
+        if self.is_nest3d_running() || self.calc_task.is_some() || self.job.instances.is_empty() {
+            return;
+        }
+        self.nest3d_dialog_open = false;
+        self.drag_state = None;
+        self.rotate_drag = None;
+        self.drag_zone = None;
+        self.moving_target = None;
+        self.clear_align_face_mode();
+
+        let pre_nest_snapshot = self.snapshot();
+        let mut job = self.job.clone();
+        let cfg = self.nest3d_config.clone();
+        let sel = self.selected_set.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop_and_apply = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+
+        let initial_progress = nestcraft_core::nest3d::Nest3dProgress {
+            phase: nestcraft_core::nest3d::Nest3dPhase::Preprocessing,
+            label: "Preparing 3D voxel masks...".to_owned(),
+            done: 0,
+            total: 1,
+            best_max_z_mm: self.job.max_z_mm(),
+            best_density_pct: self.job.packing_density_pct(),
+            best_placed: 0,
+            best_overflow: self.job.instances.len(),
+            elapsed_ms: 0,
+            live_transforms: None,
+        };
+
+        let cancel_bg = Arc::clone(&cancel);
+        let stop_bg = Arc::clone(&stop_and_apply);
+        let ctx_bg = ctx.clone();
+        std::thread::spawn(move || {
+            let cb = |prog: nestcraft_core::nest3d::Nest3dProgress| {
+                let _ = tx.send(Nest3dMsg::Progress(prog));
+                ctx_bg.request_repaint();
+            };
+            let res = nestcraft_core::nest3d::nest_3d_with_callbacks(
+                &mut job,
+                &cfg,
+                Some(&sel),
+                Some(cancel_bg.as_ref()),
+                Some(stop_bg.as_ref()),
+                Some(&cb),
+            );
+            let msg = match res {
+                Ok(result) => {
+                    if cancel_bg.load(Ordering::Relaxed) {
+                        Nest3dMsg::Cancelled
+                    } else {
+                        Nest3dMsg::Finished {
+                            job: Box::new(job),
+                            result,
+                        }
+                    }
+                }
+                Err(e) => {
+                    if cancel_bg.load(Ordering::Relaxed) {
+                        Nest3dMsg::Cancelled
+                    } else {
+                        Nest3dMsg::Failed(e.to_string())
+                    }
+                }
+            };
+            let _ = tx.send(msg);
+            ctx_bg.request_repaint();
+        });
+
+        self.nest3d_task = Some(ActiveNest3dTask {
+            cancel,
+            stop_and_apply,
+            pre_nest_snapshot,
+            started_at: std::time::Instant::now(),
+            latest: initial_progress,
+            rx,
+        });
+        self.sync_nest3d_ceiling_overlay();
+        self.status = "3D Nesting running (camera orbit/zoom active; Esc to cancel)...".to_owned();
+    }
+
+    pub(crate) fn start_gravity_settle(&mut self, ctx: &egui::Context) {
+        if self.is_nest3d_running() || self.calc_task.is_some() || self.job.instances.is_empty() {
+            return;
+        }
+        self.gravity_settle_dialog_open = false;
+        self.drag_state = None;
+        self.rotate_drag = None;
+        self.drag_zone = None;
+        self.moving_target = None;
+        self.clear_align_face_mode();
+
+        let pre_nest_snapshot = self.snapshot();
+        let mut job = self.job.clone();
+        let cfg = self.gravity_settle_config.clone();
+        let sel = self.selected_set.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop_and_apply = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+
+        let total_vol: f64 = job
+            .instances
+            .iter()
+            .filter(|i| job.is_instance_visible(i))
+            .filter_map(|i| job.part(i.part_id).map(|p| p.mesh.volume_mm3))
+            .sum();
+        let [w, d, _] = job.machine.size_mm();
+        let bed_area = f64::from(w) * f64::from(d);
+        let initial_placed = job.instances.iter().filter(|i| job.is_instance_visible(i)).count();
+
+        let initial_progress = nestcraft_core::nest3d::Nest3dProgress {
+            phase: nestcraft_core::nest3d::Nest3dPhase::Compacting,
+            label: "Building physics collision shapes (V-HACD)...".to_owned(),
+            done: 0,
+            total: cfg.max_steps.max(1) as usize,
+            best_max_z_mm: self.job.max_z_mm(),
+            best_density_pct: self.job.packing_density_pct(),
+            best_placed: initial_placed,
+            best_overflow: 0,
+            elapsed_ms: 0,
+            live_transforms: None,
+        };
+
+        let cancel_bg = Arc::clone(&cancel);
+        let stop_bg = Arc::clone(&stop_and_apply);
+        let ctx_bg = ctx.clone();
+        let started_bg = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let cb = |sp: nestcraft_core::compact::GravitySettleProgress| {
+                let density = if bed_area > 1e-4 && sp.max_z_mm > 1e-4 {
+                    (total_vol / (bed_area * f64::from(sp.max_z_mm))) * 100.0
+                } else {
+                    0.0
+                };
+                let prog = nestcraft_core::nest3d::Nest3dProgress {
+                    phase: nestcraft_core::nest3d::Nest3dPhase::Compacting,
+                    label: format!(
+                        "Gravity Settle step {}/{} ({}/{} sleeping, -Z {:.1} mm)",
+                        sp.step, sp.total_steps, sp.sleeping_count, sp.dynamic_count, sp.z_reduction_mm
+                    ),
+                    done: sp.step as usize,
+                    total: sp.total_steps.max(1) as usize,
+                    best_max_z_mm: sp.max_z_mm,
+                    best_density_pct: density,
+                    best_placed: initial_placed,
+                    best_overflow: 0,
+                    elapsed_ms: started_bg.elapsed().as_millis() as u64,
+                    live_transforms: sp.preview_transforms,
+                };
+                let _ = tx.send(Nest3dMsg::Progress(prog));
+                ctx_bg.request_repaint();
+            };
+            let res = nestcraft_core::compact::gravity_settle_with_callbacks(
+                &mut job,
+                &cfg,
+                Some(&sel),
+                None,
+                Some(cancel_bg.as_ref()),
+                Some(stop_bg.as_ref()),
+                Some(&cb),
+            );
+            let msg = match res {
+                Ok(result) => {
+                    if cancel_bg.load(Ordering::Relaxed) {
+                        Nest3dMsg::Cancelled
+                    } else {
+                        Nest3dMsg::SettleFinished {
+                            job: Box::new(job),
+                            result,
+                        }
+                    }
+                }
+                Err(e) => {
+                    if cancel_bg.load(Ordering::Relaxed) {
+                        Nest3dMsg::Cancelled
+                    } else {
+                        Nest3dMsg::Failed(e.to_string())
+                    }
+                }
+            };
+            let _ = tx.send(msg);
+            ctx_bg.request_repaint();
+        });
+
+        self.nest3d_task = Some(ActiveNest3dTask {
+            cancel,
+            stop_and_apply,
+            pre_nest_snapshot,
+            started_at: std::time::Instant::now(),
+            latest: initial_progress,
+            rx,
+        });
+        self.status = "Gravity Settle running (camera orbit/zoom active; Esc to cancel)...".to_owned();
+    }
+
+    pub(crate) fn poll_nest3d_task(&mut self, ctx: &egui::Context) {
+        let Some(mut task) = self.nest3d_task.take() else {
+            return;
+        };
+        let mut finished: Option<Nest3dMsg> = None;
+        loop {
+            match task.rx.try_recv() {
+                Ok(Nest3dMsg::Progress(prog)) => {
+                    if let Some(ref live) = prog.live_transforms {
+                        for &(iid, tf) in live {
+                            if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == iid) {
+                                inst.transform = tf;
+                            }
+                        }
+                        self.scene_dirty = true;
+                    }
+                    task.latest = prog;
+                }
+                Ok(msg) => {
+                    finished = Some(msg);
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Nest3dMsg::Cancelled);
+                    break;
+                }
+            }
+        }
+
+        if let Some(msg) = finished {
+            match msg {
+                Nest3dMsg::Finished { job, result } => {
+                    if self.undo_stack.len() >= 40 {
+                        self.undo_stack.remove(0);
+                    }
+                    self.undo_stack.push(task.pre_nest_snapshot);
+                    self.redo_stack.clear();
+                    self.job = *job;
+                    self.euler_edit.clear();
+                    self.mark_dirty();
+                    let stopped_note = if result.stopped_early { " (stopped early)" } else { "" };
+                    self.status = format!(
+                        "3D Nest{stopped_note}: {} placed, {} overflow | Max Z {:.1} mm | Density {:.2}% ({} ms)",
+                        result.placed_count,
+                        result.overflow_count,
+                        result.max_z_mm,
+                        result.packing_density_pct,
+                        result.elapsed_ms,
+                    );
+                    self.nest3d_last_result = Some(result);
+                }
+                Nest3dMsg::SettleFinished { job, result } => {
+                    if self.undo_stack.len() >= 40 {
+                        self.undo_stack.remove(0);
+                    }
+                    self.undo_stack.push(task.pre_nest_snapshot);
+                    self.redo_stack.clear();
+                    self.job = *job;
+                    self.euler_edit.clear();
+                    self.mark_dirty();
+                    let stopped_note = if result.stopped_early { " (stopped early)" } else { "" };
+                    let rb_note = if result.rolled_back_count > 0 {
+                        format!(", {} rolled back", result.rolled_back_count)
+                    } else {
+                        String::new()
+                    };
+                    self.status = format!(
+                        "Gravity Settle{stopped_note}: {} moved{rb_note} | Max Z {:.1} -> {:.1} mm (-{:.1} mm, {} steps, {} ms)",
+                        result.moved_count,
+                        result.max_z_before_mm,
+                        result.max_z_after_mm,
+                        result.z_reduction_mm,
+                        result.steps_run,
+                        result.elapsed_ms,
+                    );
+                    self.gravity_settle_last_result = Some(result);
+                }
+                Nest3dMsg::Cancelled => {
+                    self.restore_snapshot(task.pre_nest_snapshot);
+                    self.status = "3D Nesting cancelled — bed restored".to_owned();
+                }
+                Nest3dMsg::Failed(err) => {
+                    self.restore_snapshot(task.pre_nest_snapshot);
+                    self.status = format!("3D Nest error: {err}");
+                }
+                Nest3dMsg::Progress(_) => {}
+            }
+            self.sync_nest3d_ceiling_overlay();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            self.nest3d_task = Some(task);
+        }
+    }
+
     pub(crate) fn start_nest2d(&mut self) {
         let mut job = self.job.clone();
         let cfg = self.nest2d_config.clone();
@@ -2413,6 +2853,9 @@ impl NestCraftApp {
     }
 
     pub(crate) fn update_live_drag_collision(&mut self) {
+        if !self.collision_check_active {
+            return;
+        }
         let mut active = HashSet::new();
         if let Some(ds) = &self.drag_state {
             for (id, _) in &ds.instances {
@@ -2424,11 +2867,11 @@ impl NestCraftApp {
                 active.insert(*id);
             }
         }
-        if active.is_empty() {
+        if active.len() != 1 {
+            // Defer multi-part or empty live collision checks until drag release (`mark_dirty`).
             return;
         }
-        if self.collision_check_active
-            && self.collision_cache.is_initialized()
+        if self.collision_cache.is_initialized()
             && !matches!(
                 self.collision_cache.diff(&self.job, COLLISION_VOXEL_PITCH_MM),
                 nestcraft_core::collision::CollisionDiff::FullRebuild
@@ -2436,13 +2879,6 @@ impl NestCraftApp {
         {
             let rep = self.collision_cache.sync(&self.job, COLLISION_VOXEL_PITCH_MM);
             self.apply_collision_report(&rep, false);
-        } else {
-            let rep = nestcraft_core::collision::detect_collisions(
-                &self.job,
-                Some(&active),
-                COLLISION_VOXEL_PITCH_MM,
-            );
-            self.apply_collision_overlay(&rep);
         }
     }
 
@@ -3064,7 +3500,7 @@ impl NestCraftApp {
 
     pub(crate) fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
-        if dropped.is_empty() {
+        if dropped.is_empty() || self.is_nest3d_running() {
             return;
         }
         let paths: Vec<std::path::PathBuf> = dropped
@@ -3096,7 +3532,7 @@ impl NestCraftApp {
         }
         self.moving_key = self.moving_key.wrapping_add(1).max(1);
         self.moving_target = Some(target);
-        self.mark_dirty();
+        self.scene_dirty = true;
     }
 
     pub(crate) fn current_moving_layer(&self) -> Option<MovingLayer> {
