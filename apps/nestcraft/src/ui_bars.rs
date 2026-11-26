@@ -68,14 +68,12 @@ impl NestCraftApp {
                                 self.start_open_bed(path, ctx);
                             }
                             if icon_label_button(ui, "Save Bed", "save", self.save_task.is_none(), false)
-                                .backing_on_hover_text("Save current bed, parts, and settings as .nestc (Ctrl+Shift+S)")
+                                .backing_on_hover_text(
+                                    "Save current bed, parts, and settings as .nestc (Ctrl+Shift+S). Quick-saves directly if machine and chamber settings are unchanged.",
+                                )
                                 .clicked()
-                                && let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("NestCraft Bed", &["nestc"])
-                                    .set_file_name(self.default_save_filename("nestc"))
-                                    .save_file()
                             {
-                                self.start_save_bed(path, ctx);
+                                self.trigger_save_bed(ctx);
                             }
                             if icon_label_button(ui, "Generate Report", "export", true, self.report_dialog_open)
                                 .backing_on_hover_text(

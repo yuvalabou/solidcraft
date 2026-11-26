@@ -72,6 +72,7 @@ pub(crate) enum BackgroundLoadOutcome {
     },
     OpenedBed {
         job: Box<BuildJob>,
+        path: Option<PathBuf>,
         path_display: String,
     },
     Failed(String),
@@ -118,10 +119,39 @@ pub(crate) struct BackgroundCalcTask {
     pub(crate) rx: Receiver<CalcOutcome>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SavedBedConfig {
+    pub(crate) machine_name: String,
+    pub(crate) size_mm_bits: [u32; 3],
+    pub(crate) bed_origin: BedOrigin,
+    pub(crate) wall_margin_bits: u32,
+    pub(crate) min_z_bits: u32,
+    pub(crate) clearance_bits: u32,
+    pub(crate) material_id: String,
+}
+
+impl SavedBedConfig {
+    pub(crate) fn from_job(job: &BuildJob) -> Self {
+        let norm = |f: f32| if f == 0.0 { 0.0_f32.to_bits() } else { f.to_bits() };
+        let sz = job.machine.size_mm();
+        Self {
+            machine_name: job.machine.name().to_owned(),
+            size_mm_bits: [norm(sz[0]), norm(sz[1]), norm(sz[2])],
+            bed_origin: job.bed_origin,
+            wall_margin_bits: norm(job.wall_margin_mm),
+            min_z_bits: norm(job.min_z_mm),
+            clearance_bits: norm(job.clearance_mm),
+            material_id: job.material_id.clone(),
+        }
+    }
+}
+
 pub(crate) enum SaveOutcome {
     Saved {
+        path: PathBuf,
         path_display: String,
         file_name: String,
+        saved_config: SavedBedConfig,
     },
     Failed(String),
 }
@@ -155,6 +185,7 @@ pub(crate) fn load_single_file_outcome(path: &Path) -> BackgroundLoadOutcome {
         match nestc::read_nestc(&bytes) {
             Ok(job) => BackgroundLoadOutcome::OpenedBed {
                 job: Box::new(job),
+                path: Some(path.to_path_buf()),
                 path_display: path.display().to_string(),
             },
             Err(e) => BackgroundLoadOutcome::Failed(format!("Open bed error: {e}")),
@@ -162,10 +193,15 @@ pub(crate) fn load_single_file_outcome(path: &Path) -> BackgroundLoadOutcome {
     } else if ext == "3mf" {
         match threemf::read_threemf(&bytes) {
             Ok(items) => {
+                let mut tris_by_ptr: HashMap<usize, Arc<SharedTris>> = HashMap::new();
                 let prepared = items
                     .into_iter()
                     .map(|item| {
-                        let tris = viewport::mesh_to_shared_tris(&item.mesh);
+                        let key = Arc::as_ptr(&item.mesh) as usize;
+                        let tris = tris_by_ptr
+                            .entry(key)
+                            .or_insert_with(|| viewport::mesh_to_shared_tris(&item.mesh))
+                            .clone();
                         (item, tris)
                     })
                     .collect();
@@ -303,6 +339,8 @@ pub(crate) struct NestCraftApp {
     pub(crate) load_task: Option<ActiveLoadTask>,
     pub(crate) save_task: Option<ActiveSaveTask>,
     pub(crate) save_hint: Option<(String, bool, std::time::Instant)>,
+    pub(crate) current_bed_path: Option<PathBuf>,
+    pub(crate) last_saved_config: Option<SavedBedConfig>,
     pub(crate) calc_task: Option<BackgroundCalcTask>,
     pub(crate) below_zero_import_dialog: Vec<(InstanceId, f32)>,
     pub(crate) undo_stack: Vec<UndoSnapshot>,
@@ -939,6 +977,8 @@ impl NestCraftApp {
             load_task: None,
             save_task: None,
             save_hint: None,
+            current_bed_path: None,
+            last_saved_config: None,
             calc_task: None,
             below_zero_import_dialog: Vec::new(),
             undo_stack: Vec::new(),
@@ -1469,7 +1509,8 @@ impl NestCraftApp {
             self.status = "Select part(s) to create a Sinterbox".to_owned();
             return;
         }
-        let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        let mut ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
+        ids.sort_by_key(|id| id.0);
         match sinterbox::analyze_sinterbox_inputs(&self.job, &ids) {
             Ok((_bounds, min_dim, default_name)) => {
                 let rec_win = sinterbox::recommended_window_size_mm(min_dim);
@@ -1679,6 +1720,14 @@ impl NestCraftApp {
         self.hl_key = self.hl_key.wrapping_add(1).max(1);
     }
 
+    pub(crate) fn purge_unused_part_caches(&mut self) {
+        let active: HashSet<PartId> = self.job.parts.iter().map(|p| p.id).collect();
+        self.scene_cache.parts.retain(|pid, _| active.contains(pid));
+        self.manifold_cache.retain(|pid, _| active.contains(pid));
+        self.part_thumbs.retain(|pid, _| active.contains(pid));
+        self.expanded_parts.retain(|pid| active.contains(pid));
+    }
+
     pub(crate) fn delete_selected(&mut self) {
         let ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
         if ids.is_empty() {
@@ -1696,6 +1745,7 @@ impl NestCraftApp {
         self.selected = None;
         self.selection_anchor = None;
         if removed > 0 {
+            self.purge_unused_part_caches();
             self.mark_dirty();
             self.status = if removed == 1 {
                 "Removed selected instance".to_owned()
@@ -1955,14 +2005,7 @@ impl NestCraftApp {
                 return;
             }
             if cmd && shift && i.key_pressed(egui::Key::S) {
-                if self.save_task.is_none()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("NestCraft Bed", &["nestc"])
-                        .set_file_name(self.default_save_filename("nestc"))
-                        .save_file()
-                {
-                    self.start_save_bed(path, ctx);
-                }
+                self.trigger_save_bed(ctx);
                 return;
             }
             if cmd && !shift && i.key_pressed(egui::Key::S) {
@@ -2473,17 +2516,49 @@ impl NestCraftApp {
 
     #[cfg(test)]
     pub(crate) fn save_bed_file(&mut self, path: &Path) {
+        let saved_config = SavedBedConfig::from_job(&self.job);
         match nestc::write_nestc(&self.job) {
             Ok(bytes) => {
                 if let Err(e) = std::fs::write(path, bytes) {
                     self.status = format!("Save bed failed: {e}");
                 } else {
+                    self.current_bed_path = Some(path.to_path_buf());
+                    self.last_saved_config = Some(saved_config);
                     self.status = format!("Saved bed to {}", path.display());
                 }
             }
             Err(e) => {
                 self.status = format!("Save bed error: {e}");
             }
+        }
+    }
+
+    pub(crate) fn quick_save_target(&self) -> Option<PathBuf> {
+        let path = self.current_bed_path.as_ref()?;
+        let saved = self.last_saved_config.as_ref()?;
+        if saved == &SavedBedConfig::from_job(&self.job) {
+            Some(path.clone())
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn trigger_save_bed(&mut self, ctx: &egui::Context) {
+        if self.save_task.is_some() {
+            return;
+        }
+        if let Some(path) = self.quick_save_target() {
+            self.start_save_bed(path, ctx);
+            return;
+        }
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("NestCraft Bed", &["nestc"])
+            .set_file_name(self.default_save_filename("nestc"));
+        if let Some(parent) = self.current_bed_path.as_deref().and_then(Path::parent) {
+            dialog = dialog.set_directory(parent);
+        }
+        if let Some(path) = dialog.save_file() {
+            self.start_save_bed(path, ctx);
         }
     }
 
@@ -2499,6 +2574,7 @@ impl NestCraftApp {
             .to_owned();
         let path_display = path.display().to_string();
         let job = self.job.clone();
+        let saved_config = SavedBedConfig::from_job(&job);
         let progress_permille = Arc::new(AtomicUsize::new(0));
         let stage = Arc::new(Mutex::new("Preparing parts...".to_owned()));
         let (tx, rx) = mpsc::channel();
@@ -2530,8 +2606,10 @@ impl NestCraftApp {
                         Ok(()) => {
                             p_bg.store(1000, Ordering::Relaxed);
                             SaveOutcome::Saved {
+                                path,
                                 path_display,
                                 file_name: fname_bg,
+                                saved_config,
                             }
                         }
                         Err(e) => SaveOutcome::Failed(format!("Save bed failed: {e}")),
@@ -2565,10 +2643,14 @@ impl NestCraftApp {
         ctx.request_repaint();
         match task.rx.try_recv() {
             Ok(SaveOutcome::Saved {
+                path,
                 path_display,
                 file_name,
+                saved_config,
             }) => {
                 self.save_task = None;
+                self.current_bed_path = Some(path);
+                self.last_saved_config = Some(saved_config);
                 self.status = format!("Saved bed to {path_display}");
                 self.save_hint = Some((format!("Saved {file_name}"), false, std::time::Instant::now()));
             }
@@ -2593,8 +2675,18 @@ impl NestCraftApp {
         )
     }
 
-    pub(crate) fn apply_loaded_bed(&mut self, job: BuildJob, path_display: &str) {
+    pub(crate) fn apply_loaded_bed(&mut self, job: BuildJob, path_display: &str, source_path: Option<PathBuf>) {
         self.job = job;
+        match source_path {
+            Some(path) => {
+                self.last_saved_config = Some(SavedBedConfig::from_job(&self.job));
+                self.current_bed_path = Some(path);
+            }
+            None => {
+                self.current_bed_path = None;
+                self.last_saved_config = None;
+            }
+        }
         self.selected = None;
         self.selected_set.clear();
         self.selection_anchor = None;
@@ -2630,7 +2722,7 @@ impl NestCraftApp {
         match nestc::read_nestc(&bytes) {
             Ok(job) => {
                 let display = path.display().to_string();
-                self.apply_loaded_bed(job, &display);
+                self.apply_loaded_bed(job, &display, Some(path.to_path_buf()));
             }
             Err(e) => {
                 self.status = format!("Open bed error: {e}");
@@ -2722,8 +2814,10 @@ impl NestCraftApp {
                                 task.imported_files += 1;
                                 match kind {
                                     ImportedKind::Stl(mesh, shared_tris) => {
-                                        let pid = self.job.add_part(name, mesh);
-                                        self.scene_cache.parts.insert(pid, shared_tris);
+                                        let (pid, created) = self.job.add_or_reuse_part(name, mesh);
+                                        if created || !self.scene_cache.parts.contains_key(&pid) {
+                                            self.scene_cache.parts.insert(pid, shared_tris);
+                                        }
                                         if let Ok(iid) = self.job.add_instance(pid, IDENTITY_TRANSFORM) {
                                             if let Some(min_z) = self.job.instance_min_z(iid)
                                                 && min_z < -1e-4
@@ -2737,8 +2831,10 @@ impl NestCraftApp {
                                     }
                                     ImportedKind::ThreeMf(items) => {
                                         for (item, shared_tris) in items {
-                                            let pid = self.job.add_part(item.name, item.mesh);
-                                            self.scene_cache.parts.insert(pid, shared_tris);
+                                            let (pid, created) = self.job.add_or_reuse_part(item.name, item.mesh);
+                                            if created || !self.scene_cache.parts.contains_key(&pid) {
+                                                self.scene_cache.parts.insert(pid, shared_tris);
+                                            }
                                             if let Ok(iid) = self.job.add_instance(pid, item.transform) {
                                                 if let Some(min_z) = self.job.instance_min_z(iid)
                                                     && min_z < -1e-4
@@ -2753,8 +2849,12 @@ impl NestCraftApp {
                                     }
                                 }
                             }
-                            BackgroundLoadOutcome::OpenedBed { job, path_display } => {
-                                self.apply_loaded_bed(*job, &path_display);
+                            BackgroundLoadOutcome::OpenedBed {
+                                job,
+                                path,
+                                path_display,
+                            } => {
+                                self.apply_loaded_bed(*job, &path_display, path);
                                 opened_bed = true;
                             }
                             BackgroundLoadOutcome::Failed(err) => {
@@ -2881,7 +2981,7 @@ impl NestCraftApp {
             let items = threemf::read_threemf(&bytes).map_err(|e| format!("3MF import error: {e}"))?;
             let count = items.len();
             for item in items {
-                let pid = self.job.add_part(item.name, item.mesh);
+                let (pid, _) = self.job.add_or_reuse_part(item.name, item.mesh);
                 if let Ok(iid) = self.job.add_instance(pid, item.transform) {
                     if let Some(min_z) = self.job.instance_min_z(iid)
                         && min_z < -1e-4
@@ -2899,7 +2999,7 @@ impl NestCraftApp {
                 .and_then(|s| s.to_str())
                 .unwrap_or("part")
                 .to_owned();
-            let pid = self.job.add_part(name.clone(), Arc::new(mesh));
+            let (pid, _) = self.job.add_or_reuse_part(name.clone(), Arc::new(mesh));
             if let Ok(iid) = self.job.add_instance(pid, IDENTITY_TRANSFORM) {
                 if let Some(min_z) = self.job.instance_min_z(iid)
                     && min_z < -1e-4

@@ -1083,3 +1083,141 @@ use solidcraft_viewport::StandardView;
         assert_eq!(migrated[5].size_mm, [300.0, 300.0, 300.0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn import_deduplicates_prototypes_and_delete_prunes_with_undo() {
+        let dir = std::env::temp_dir().join(format!("nestcraft_dedup_prune_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Multi-instance 3MF with 2 instances of 1 part.
+        let mut src_job = nestcraft_core::model::BuildJob::new(nestcraft_core::model::MachineProfile::FormigaP110);
+        let mesh = Arc::new(create_sample_bracket_mesh(0).expect("bracket"));
+        let pid = src_job.add_part("Bracket3MF", mesh);
+        let _ = src_job.add_instance_centered_on_floor(pid).expect("i1");
+        let _ = src_job.add_instance_on_floor_next(pid).expect("i2");
+        let threemf_bytes = nestcraft_core::io::threemf::write_threemf(&src_job).expect("3mf");
+        let threemf_path = dir.join("multi.3mf");
+        assert!(std::fs::write(&threemf_path, threemf_bytes).is_ok());
+
+        // Single STL file imported twice, plus a differently named copy with identical STL bytes.
+        let stl_bytes = stl::write_binary_stl(&src_job.parts[0].mesh, None).expect("stl");
+        let stl_path = dir.join("single.stl");
+        let stl_copy_path = dir.join("single_copy.stl");
+        assert!(std::fs::write(&stl_path, &stl_bytes).is_ok());
+        assert!(std::fs::write(&stl_copy_path, &stl_bytes).is_ok());
+
+        let mut app = NestCraftApp::new();
+        let _ = app.import_single_file(&threemf_path).expect("import 3mf");
+        assert_eq!(app.job.instances.len(), 2);
+        assert_eq!(app.job.parts.len(), 1, "multi-instance 3MF should share 1 prototype");
+
+        let _ = app.import_single_file(&stl_path).expect("import stl 1");
+        let _ = app.import_single_file(&stl_path).expect("import stl 2");
+        assert_eq!(app.job.instances.len(), 4);
+        assert_eq!(app.job.parts.len(), 2, "re-importing same STL should reuse prototype");
+        let stl_pid = app.job.parts[1].id;
+
+        let _ = app.import_single_file(&stl_copy_path).expect("import stl copy");
+        assert_eq!(app.job.instances.len(), 5);
+        assert_eq!(app.job.parts.len(), 3, "different filename keeps its own prototype");
+        assert!(Arc::ptr_eq(&app.job.parts[1].mesh, &app.job.parts[2].mesh));
+
+        // Delete both `single` STL instances and verify prototype + caches are pruned, then undo restores them.
+        let stl_insts: Vec<_> = app
+            .job
+            .instances
+            .iter()
+            .filter(|i| i.part_id == stl_pid)
+            .map(|i| i.id)
+            .collect();
+        app.selected_set = stl_insts.into_iter().collect();
+        app.selected = app.selected_set.iter().copied().next();
+        app.delete_selected();
+        assert_eq!(app.job.instances.len(), 3);
+        assert_eq!(app.job.parts.len(), 2);
+        assert!(!app.scene_cache.parts.contains_key(&stl_pid));
+
+        assert!(app.undo());
+        assert_eq!(app.job.instances.len(), 5);
+        assert_eq!(app.job.parts.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_save_reuses_path_until_machine_or_config_changes() {
+        let dir = std::env::temp_dir().join(format!("nestcraft_quicksave_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let bed_path = dir.join("bed_one.nestc");
+        let bed_path_two = dir.join("bed_two.nestc");
+
+        let ctx = egui::Context::default();
+        let mut app = NestCraftApp::new();
+        assert_eq!(app.quick_save_target(), None);
+
+        app.add_sample_part();
+        app.start_save_bed(bed_path.clone(), &ctx);
+        for _ in 0..100 {
+            app.poll_save_task(&ctx);
+            if app.save_task.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(app.quick_save_target(), Some(bed_path.clone()));
+
+        // Adding/moving parts keeps the same machine & config, so quick-save remains active.
+        app.add_sample_part();
+        app.nudge_selected([5.0, 0.0, 0.0]);
+        assert_eq!(app.quick_save_target(), Some(bed_path.clone()));
+
+        // Changing material clears quick-save; reverting it restores quick-save.
+        let prev_mat = app.job.material_id.clone();
+        app.job.material_id = "fs3300".to_owned();
+        assert_eq!(app.quick_save_target(), None);
+        app.job.material_id = prev_mat;
+        assert_eq!(app.quick_save_target(), Some(bed_path.clone()));
+
+        // Changing wall margin, min Z, clearance, bed origin, or machine slot invalidates quick-save.
+        let prev_margin = app.job.wall_margin_mm;
+        app.job.wall_margin_mm += 1.0;
+        assert_eq!(app.quick_save_target(), None);
+        app.job.wall_margin_mm = prev_margin;
+
+        let prev_min_z = app.job.min_z_mm;
+        app.job.min_z_mm += 2.0;
+        assert_eq!(app.quick_save_target(), None);
+        app.job.min_z_mm = prev_min_z;
+
+        let prev_clearance = app.job.clearance_mm;
+        app.job.clearance_mm += 0.5;
+        assert_eq!(app.quick_save_target(), None);
+        app.job.clearance_mm = prev_clearance;
+
+        let prev_origin = app.job.bed_origin;
+        app.job.bed_origin = nestcraft_core::model::BedOrigin::Center;
+        assert_eq!(app.quick_save_target(), None);
+        app.job.bed_origin = prev_origin;
+        assert_eq!(app.quick_save_target(), Some(bed_path.clone()));
+
+        app.apply_machine_slot(3);
+        assert_eq!(app.quick_save_target(), None);
+
+        // Saving under a new path enables quick-save for the new path.
+        app.save_bed_file(&bed_path_two);
+        assert_eq!(app.quick_save_target(), Some(bed_path_two.clone()));
+
+        // Opening an existing .nestc bed sets quick-save to the opened path.
+        let mut app2 = NestCraftApp::new();
+        app2.open_bed_file(&bed_path);
+        assert_eq!(app2.quick_save_target(), Some(bed_path));
+
+        // Loading an unsaved generated job (e.g. Reprint Job) clears quick-save.
+        let reprint = nestcraft_core::model::BuildJob::new(nestcraft_core::model::MachineProfile::FormigaP110);
+        app2.apply_loaded_bed(reprint, "Reprint Job", None);
+        assert_eq!(app2.quick_save_target(), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }

@@ -193,6 +193,18 @@ impl TriMesh {
     }
 }
 
+/// Return `true` when `a` and `b` have identical vertex bit patterns and triangle index lists.
+pub fn meshes_bit_equal(a: &TriMesh, b: &TriMesh) -> bool {
+    a.positions.len() == b.positions.len()
+        && a.indices.len() == b.indices.len()
+        && a.positions.iter().zip(&b.positions).all(|(pa, pb)| {
+            pa[0].to_bits() == pb[0].to_bits()
+                && pa[1].to_bits() == pb[1].to_bits()
+                && pa[2].to_bits() == pb[2].to_bits()
+        })
+        && a.indices == b.indices
+}
+
 fn compute_face_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
     let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
@@ -495,6 +507,42 @@ impl BuildJob {
         id
     }
 
+    /// Reuse an existing prototype with matching `name` and bit-identical geometry, or
+    /// create a new prototype sharing the existing `Arc<TriMesh>` if only geometry matches.
+    ///
+    /// Returns `(part_id, created_new_prototype)`.
+    pub fn add_or_reuse_part(&mut self, name: impl Into<String>, mesh: Arc<TriMesh>) -> (PartId, bool) {
+        let name = name.into();
+        if let Some(existing) = self.parts.iter().find(|p| {
+            p.name == name && (Arc::ptr_eq(&p.mesh, &mesh) || meshes_bit_equal(&p.mesh, &mesh))
+        }) {
+            return (existing.id, false);
+        }
+        let shared_mesh = self
+            .parts
+            .iter()
+            .find(|p| Arc::ptr_eq(&p.mesh, &mesh) || meshes_bit_equal(&p.mesh, &mesh))
+            .map_or(mesh, |p| Arc::clone(&p.mesh));
+        let pid = self.add_part(name, shared_mesh);
+        (pid, true)
+    }
+
+    /// Remove any [`PartPrototype`] no longer referenced by any [`PartInstance`], returning their IDs.
+    pub fn prune_unused_parts(&mut self) -> Vec<PartId> {
+        let referenced: std::collections::HashSet<PartId> =
+            self.instances.iter().map(|i| i.part_id).collect();
+        let mut removed = Vec::new();
+        self.parts.retain(|p| {
+            if referenced.contains(&p.id) {
+                true
+            } else {
+                removed.push(p.id);
+                false
+            }
+        });
+        removed
+    }
+
     /// Look up a prototype by [`PartId`].
     pub fn part(&self, id: PartId) -> Option<&PartPrototype> {
         self.parts.iter().find(|p| p.id == id)
@@ -509,7 +557,12 @@ impl BuildJob {
     pub fn remove_instance(&mut self, id: InstanceId) -> bool {
         let before = self.instances.len();
         self.instances.retain(|i| i.id != id);
-        self.instances.len() < before
+        if self.instances.len() < before {
+            self.prune_unused_parts();
+            true
+        } else {
+            false
+        }
     }
 
     /// Place a new instance of `part_id` with `transform`.
@@ -1161,6 +1214,7 @@ impl BuildJob {
         if let Some(inst) = self.instances.iter_mut().find(|i| i.id == inst_id) {
             inst.part_id = target_part_id;
         }
+        self.prune_unused_parts();
         self.clamp_instance_above_floor(inst_id);
         Ok(target_part_id)
     }
@@ -1815,5 +1869,63 @@ mod tests {
 
         // Part AABB [0..30, 0..30] overlaps the zone, but actual L triangles are >= 5 mm away!
         assert!(!job.is_instance_in_no_build_zone(iid));
+    }
+
+    #[test]
+    fn remove_instance_and_scale_instance_prune_unused_parts() {
+        let cube_a = unit_cube();
+        let cube_b = Arc::new(
+            TriMesh::from_indexed(cube_a.positions.clone(), cube_a.indices.clone()).expect("valid cube"),
+        );
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        let pid_a = job.add_part("CubeA", cube_a);
+        let i1 = job.add_instance_centered_on_floor(pid_a).expect("i1");
+        let i2 = job.add_instance_on_floor_next(pid_a).expect("i2");
+        let pid_b = job.add_part("CubeB", cube_b);
+        let i3 = job.add_instance_on_floor_next(pid_b).expect("i3");
+
+        // Removing one of two instances sharing CubeA keeps CubeA.
+        assert!(job.remove_instance(i1));
+        assert!(job.part(pid_a).is_some());
+
+        // Removing the remaining instance of CubeA prunes CubeA.
+        assert!(job.remove_instance(i2));
+        assert!(job.part(pid_a).is_none());
+
+        // Scaling the sole instance of CubeB prunes the old unscaled CubeB prototype.
+        let scaled_pid = job.scale_instance(i3, [1.5, 1.0, 1.0]).expect("scaled");
+        assert_ne!(scaled_pid, pid_b);
+        assert!(job.part(pid_b).is_none());
+        assert!(job.part(scaled_pid).is_some());
+    }
+
+    #[test]
+    fn add_or_reuse_part_deduplicates_name_and_shares_identical_geometry() {
+        let cube_a = unit_cube();
+        let cube_a_copy = Arc::new(
+            TriMesh::from_indexed(cube_a.positions.clone(), cube_a.indices.clone()).expect("valid cube"),
+        );
+        let cube_b_copy = Arc::new(
+            TriMesh::from_indexed(cube_a.positions.clone(), cube_a.indices.clone()).expect("valid cube"),
+        );
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        let (p1, created1) = job.add_or_reuse_part("Bracket", cube_a);
+        assert!(created1);
+
+        // Same name + bit-identical mesh reuses the existing PartId.
+        let (p1_again, created2) = job.add_or_reuse_part("Bracket", cube_a_copy);
+        assert!(!created2);
+        assert_eq!(p1_again, p1);
+        assert_eq!(job.parts.len(), 1);
+
+        // Different name + bit-identical mesh keeps a separate PartPrototype but shares Arc<TriMesh>.
+        let (p2, created3) = job.add_or_reuse_part("Bracket_Alt", cube_b_copy);
+        assert!(created3);
+        assert_ne!(p2, p1);
+        assert_eq!(job.parts.len(), 2);
+        assert!(Arc::ptr_eq(
+            &job.part(p1).expect("p1").mesh,
+            &job.part(p2).expect("p2").mesh
+        ));
     }
 }

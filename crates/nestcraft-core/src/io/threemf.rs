@@ -112,7 +112,7 @@ pub fn read_threemf_into_job(bytes: &[u8], machine: MachineProfile) -> Result<Bu
     let loaded = read_threemf(bytes)?;
     let mut job = BuildJob::new(machine);
     for item in loaded {
-        let pid = job.add_part(item.name, item.mesh);
+        let (pid, _) = job.add_or_reuse_part(item.name, item.mesh);
         let _ = job.add_instance(pid, item.transform)?;
     }
     Ok(job)

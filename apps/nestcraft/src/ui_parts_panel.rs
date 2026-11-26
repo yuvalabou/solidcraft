@@ -837,6 +837,7 @@ impl NestCraftApp {
                                 if self.selected == Some(id) {
                                     self.selected = self.selected_set.iter().copied().next();
                                 }
+                                self.purge_unused_part_caches();
                                 self.mark_dirty();
                                 self.status = format!("Deleted instance #{}", id.0);
                             }

@@ -1733,7 +1733,7 @@ impl NestCraftApp {
                 nestcraft_core::recovery::build_reprint_job(target_job, self.failed_print_z_mm)
             };
             let count = reprint_job.instances.len();
-            self.apply_loaded_bed(reprint_job, "Reprint Job");
+            self.apply_loaded_bed(reprint_job, "Reprint Job", None);
             self.failed_print_dialog_open = false;
             self.status = format!("Loaded reprint job with {count} part(s)");
             return;
