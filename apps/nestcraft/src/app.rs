@@ -2474,6 +2474,8 @@ impl NestCraftApp {
             best_density_pct: self.job.packing_density_pct(),
             best_placed: 0,
             best_overflow: self.job.instances.len(),
+            best_thermal_peak_pct: None,
+            generation: 0,
             elapsed_ms: 0,
             live_transforms: None,
         };
@@ -2567,6 +2569,8 @@ impl NestCraftApp {
             best_density_pct: self.job.packing_density_pct(),
             best_placed: initial_placed,
             best_overflow: 0,
+            best_thermal_peak_pct: None,
+            generation: 0,
             elapsed_ms: 0,
             live_transforms: None,
         };
@@ -2594,6 +2598,8 @@ impl NestCraftApp {
                     best_density_pct: density,
                     best_placed: initial_placed,
                     best_overflow: 0,
+                    best_thermal_peak_pct: None,
+                    generation: 0,
                     elapsed_ms: started_bg.elapsed().as_millis() as u64,
                     live_transforms: sp.preview_transforms,
                 };
@@ -2648,16 +2654,12 @@ impl NestCraftApp {
             return;
         };
         let mut finished: Option<Nest3dMsg> = None;
+        let mut latest_live: Option<Vec<(InstanceId, nestcraft_core::model::Transform3x4)>> = None;
         loop {
             match task.rx.try_recv() {
-                Ok(Nest3dMsg::Progress(prog)) => {
-                    if let Some(ref live) = prog.live_transforms {
-                        for &(iid, tf) in live {
-                            if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == iid) {
-                                inst.transform = tf;
-                            }
-                        }
-                        self.scene_dirty = true;
+                Ok(Nest3dMsg::Progress(mut prog)) => {
+                    if let Some(live) = prog.live_transforms.take() {
+                        latest_live = Some(live);
                     }
                     task.latest = prog;
                 }
@@ -2672,6 +2674,26 @@ impl NestCraftApp {
                 }
             }
         }
+        if finished.is_none()
+            && let Some(live) = latest_live
+        {
+            if live.len() > 8 {
+                let by_id: HashMap<InstanceId, nestcraft_core::model::Transform3x4> =
+                    live.into_iter().collect();
+                for inst in &mut self.job.instances {
+                    if let Some(&tf) = by_id.get(&inst.id) {
+                        inst.transform = tf;
+                    }
+                }
+            } else {
+                for (iid, tf) in live {
+                    if let Some(inst) = self.job.instances.iter_mut().find(|i| i.id == iid) {
+                        inst.transform = tf;
+                    }
+                }
+            }
+            self.scene_dirty = true;
+        }
 
         if let Some(msg) = finished {
             match msg {
@@ -2685,8 +2707,16 @@ impl NestCraftApp {
                     self.euler_edit.clear();
                     self.mark_dirty();
                     let stopped_note = if result.stopped_early { " (stopped early)" } else { "" };
+                    let iter_note = if result.stage2_iterations > 0 {
+                        format!(" | {} refine iters", result.stage2_iterations)
+                    } else {
+                        String::new()
+                    };
+                    let thermal_note = result
+                        .peak_thermal_pct
+                        .map_or_else(String::new, |tp| format!(" | Thermal {tp:.1}%"));
                     self.status = format!(
-                        "3D Nest{stopped_note}: {} placed, {} overflow | Max Z {:.1} mm | Density {:.2}% ({} ms)",
+                        "3D Nest{stopped_note}: {} placed, {} overflow | Max Z {:.1} mm | Density {:.2}%{iter_note}{thermal_note} ({} ms)",
                         result.placed_count,
                         result.overflow_count,
                         result.max_z_mm,

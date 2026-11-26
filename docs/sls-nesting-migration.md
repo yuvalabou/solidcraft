@@ -1,12 +1,14 @@
 # NestCraft 3D Nesting — Migration Architecture & Landmine Audit
 
-> **Naming & Project Format:** Renamed to **NestCraft** (formerly *SolidCraft SLS*) to separate it from a slicer and allow a broader nesting & build-preparation scope, with project file extension **`.nestc`** (replacing `.scsls`). Target workspace members: `crates/nestcraft-core` + `apps/nestcraft`.
+> **Naming & Project Format:** Renamed to **NestCraft** (formerly *SolidCraft SLS*) to separate it from a slicer and allow a broader nesting & build-preparation scope, with project file extension **`.nestc`** (v2 ZIP + SHA-256 content-addressed binary `.nmesh` entries, replacing `.scsls`). Target workspace members: `crates/nestcraft-core` + `apps/nestcraft`.
+>
+> **Related Docs:** [`sls-3d-nesting-plan.md`](sls-3d-nesting-plan.md) · [`sls-feature-matrix.md`](sls-feature-matrix.md) · [`sls-nesting-plan.md`](sls-nesting-plan.md)
 
 - **Repository:** `yuvalabou/solidcraft` (tracking upstream `tangency-labs/solidcraft`)
 - **Target Baseline:** SolidCraft `v0.46.2` (Rust 2024 edition, MSRV `1.95`)
 - **Licensing Strategy:** **Internal / Upstream-Ready Fork (`LICENSE-BRAND` Clause 2a/2b)** — full `solidcraft-ui-kit`, `solidcraft-look`, and `solidcraft-theme` integration
 - **Workspace Topology:** `crates/nestcraft-core` (`Class::Shared`, pure Rust) + `apps/nestcraft` (`Class::Exempt` binary & MCP host)
-- **Target Machines:** EOS Formiga P110 (`160 × 210 × 330 mm`), Farsoon HT403P (`400 × 400 × 450 mm`), PA12 sintered parts
+- **Target Machines:** EOS Formiga P110 / P110 Velocis / P100 (`200 × 250 × 330 mm`, Front-Left), Farsoon HT403P / SS403P (`400 × 400 × 450 mm`, Center), PA12 sintered parts
 
 ---
 
@@ -23,14 +25,17 @@ solidcraft/
 │   ├── ui-kit/            # Shared (LICENSE-BRAND Clause 2a/2b) — Container, Panel, Ribbon, IconSet
 │   ├── look/              # Shared (LICENSE-BRAND Clause 2a/2b) — SVG icon masters, palette.toml, IBM Plex
 │   ├── theme/             # Shared (LICENSE-BRAND Clause 2a/2b) — light/dark Tokens & semantic ramps
-│   └── nestcraft-core/          # NEW (Class::Shared) — pure-Rust mesh I/O, BVH, 3D EDT voxelization, 3D packer, Sinterbox
+│   └── nestcraft-core/          # NEW (Class::Shared) — pure-Rust mesh I/O, BVH, 3D EDT voxelization, 2D/3D packing, interlocking, V-HACD settle, collision, Sinterbox
 ├── apps/
 │   ├── solidcraft/        # Untouched upstream CAD app
 │   └── nestcraft/    # NEW (Class::Exempt) — SolidCraft UI-kit SLS nesting app + `--mcp` headless server
 ├── attribution/pending/
 │   └── nestcraft.md             # Pending asset attribution rows (avoids merge conflicts on ATTRIBUTION.md)
 └── docs/
-    └── sls-nesting-migration.md
+    ├── sls-3d-nesting-plan.md
+    ├── sls-feature-matrix.md
+    ├── sls-nesting-migration.md
+    └── sls-nesting-plan.md
 ```
 
 ### Dependency Boundary Rules
@@ -114,46 +119,47 @@ static NESTCRAFT_ICONS: IconSet = IconSet::extended(
 
 ## 4. 3D Nesting Engine Architecture (`nestcraft-core`)
 
-Rather than writing geometry math from scratch or importing `jagua-rs` (2D), reuse proven pure-Rust primitives already validated in our ecosystem (`ferroform` + `solidcraft`):
+> See [`docs/sls-3d-nesting-plan.md`](sls-3d-nesting-plan.md) for the complete 3-stage hybrid specification, memory/CPU guardrails, and UI controls.
 
-1. **Mesh Ingestion & Repair Gate:**
-   - **Binary/ASCII STL & 3MF:** Pure-mesh parser in `nestcraft-core` using workspace `zip = "9"` + `quick-xml = "0.41"` (mirroring the Production Extension `p:path` build-item logic in `crates/io/src/threemf.rs` without pulling in `solidcraft-doc`).
-   - **Manifold & Winding Check:** Reuse the Farsoon BuildStar manifold/winding checks from `ferroform` (`raw/projects/GitHub/ferroform`) to reject/flag non-manifold customer STLs up front (keeping Netfabb as an upstream repair pre-pass for broken meshes during transition).
-2. **Exact 3D Sintering Clearance via 3D EDT (from `ferroform`):**
-   - **Voxel + 3D EDT Pipeline:**
-     1. Voxelize each unique part mesh at target pitch (`1.0 mm` / `0.5 mm`) using `ferroform` BVH (Rayon-parallel BVH ray-cast containment).
-     2. Compute the **Felzenszwalb-Huttenlocher 3D Euclidean Distance Transform** (`ferroform` EDT) once per unique part / quantized orientation.
-     3. Generate two binary `u64` bitpacked voxel masks per orientation:
-        - `solid_mask` (`EDT <= 0`) — actual part occupancy (thermal density & Sinterbox checks)
-        - `clearance_mask` (`EDT <= clearance_mm / 2.0`, e.g., `1.25 mm` half-clearance for `2.5 mm` part-to-part gap) — dilated shell for `O(1)` bitwise `&` collision detection (`(a_word & b_word) != 0`).
-3. **3D Placement & Optimization:**
-   - **Stage 1 (Constructive):** Gravity / Bottom-Left-Back-Fill (`Z`-first) sorted by bounding volume / height, supporting per-part rotation constraints (`Free`, `ZOnly` / XY-strength lock, `Fixed`).
-   - **Stage 2 (Metaheuristic):** Simulated Annealing / Tabu local search swapping/nudging parts to minimize `max_Z` (recoater time/cost driver) and penalizing excessive local voxel density (thermal hotspot / "egg effect" mitigation).
-   - **Stage 3 (Exact Verification):** Final `parry3d` exact mesh-to-mesh clearance check on placed neighbors before committing or exporting 3MF.
+Rather than writing geometry math from scratch or importing `jagua-rs` (2D), `nestcraft-core` implements pure-Rust primitives aligned with SolidCraft's license and crash-safety rules:
+
+1. **Mesh Ingestion & Repair Gate (`io/`, `manifold.rs` — `Done`):**
+   - **Binary/ASCII STL, 3MF & `.nestc` v2:** Pure-mesh parsers/writers using workspace `zip = "9"` + `quick-xml = "0.41"` + `sha2` (content-addressed binary `.nmesh` blobs in `.nestc` v2) without pulling in `solidcraft-doc`.
+   - **Manifold & Winding Check (`manifold.rs`):** Edge-incidence, winding, shell counting, and degenerate-triangle checks to flag non-manifold customer STLs and split multi-shell parts.
+2. **Exact 3D Sintering Clearance via 3D EDT (`voxel.rs` — `Done`):**
+   - **Conservative Flood-Fill & 3D EDT Pipeline:**
+     1. Voxelize each unique `(PartPrototype, orientation)` at configurable pitch (`2.0 ↔ 0.5 mm`) using conservative triangle-AABB surface rasterization + exterior 3D flood-fill (open cavities stay open unless filled; non-manifold-safe).
+     2. Compute the **Felzenszwalb-Huttenlocher 3D Euclidean Distance Transform** (separable 1D lower-envelope passes) with optional **anisotropic XY/Z spacing** and **adaptive part-mass (`r_A + r_B`)** half-clearance.
+     3. Generate two `u64` bitpacked `BitGrid3D` masks per symmetry-pruned orientation:
+        - `solid_mask` (`EDT == 0`) — exact occupancy (interlocking escape, cavity checks, thermal density).
+        - `clearance_mask` (`EDT <= r_P`) — tight dilated shell for `O(1)` bitwise `&` collision probing, paired with a `2D XY HeightMap` and `CpuBudget` / `try_reserve` RAM guardrails.
+3. **3D Placement, Interlocking, Physics Compaction & Exact Verification:**
+   - **Stage 1 (`nest3d.rs` — `Done`):** Parallel 6-portfolio constructive 3D Bottom-Left-Back-Fill (`Z`-first) respecting `RotationConstraint`, `max_z_limit_mm`, `selected_only`, `keep_in_bounds_fixed`, `NoBuildZone`, and open-cavity-safe topological interlocking rejection (`interlock.rs` — `Done`).
+   - **Stage 2 (`nest3d.rs` — `Done`, Phase 4):** Anytime parallel islands combining Ruin-and-Recreate + GA crossover with live viewport streaming, `Per-Part` / `Override All` orientation mode with `XY Rotation` & `Z Rotation` step sliders (`0° (Locked)`) + conditional `PCA / OBB Pre-Alignment`, and optional `20×20×20 mm` thermal density and slice-smoothness penalties.
+   - **Stage 3 (`compact.rs` — `Done`):** `rapier3d` `0.33` + `parry3d` `0.31` V-HACD compound convex-hull `-Z` gravity compaction (with optional micro-rotations), also available standalone as **Gravity Settle**.
+   - **Exact Final Gate (`collision.rs`, `voxel.rs::MeshBvh` — `Done`):** Incremental `CollisionCache` + exact triangle-level clearance verification (including anisotropic/adaptive rules and `NoBuildZone`) before committing or exporting 3MF.
 
 ---
 
 ## 5. Phased Implementation Roadmap
 
-### Phase 0: Git & Workspace Hygiene
+### Phase 0: Git & Workspace Hygiene (`Done`)
 - Keep `main` tracking upstream-compatible docs/mirrors; all SLS implementation lives on `sls-dev`.
-- Register `("nestcraft-core", Class::Shared)` and `("nestcraft", Class::Exempt)` in `xtask/src/layers.rs::TABLE`.
+- Registered `("nestcraft-core", Class::Shared)` and `("nestcraft", Class::Exempt)` in `xtask/src/layers.rs::TABLE`.
 
-### Phase 1: Headless `nestcraft-core` + Packer Benchmark (Zero UI)
-- Scaffold `crates/nestcraft-core`: STL + 3MF Production build-item I/O, Formiga P110 (`160×210×330 mm`) & Farsoon HT403P (`400×400×450 mm`) build volumes.
-- Port/depend on `ferroform` (pure Rust `bvh.rs`, `edt.rs`, `manifold.rs`) for `u64` bitpacked clearance masks.
-- Implement Bottom-Left-Back-Fill + Simulated Annealing packer and benchmark packing density (%), `max_Z` (mm), and runtime (s) on a real 50–150 part job against Netfabb **before** investing in GUI panels.
+### Phase 1: `nestcraft-core` Engine & 3D Nesting Core (`Done` — Stage 1–3 Packing & Refinement Complete; Automated Benchmarks `Planned`)
+- Implemented STL/3MF/`.nestc` v2 I/O, 5 predefined SLS machines + Custom, `manifold.rs`, `collision.rs`, `nest2d.rs`, `voxel.rs` (flood-fill + 3D EDT), `interlock.rs`, `nest3d.rs` (Stage 1 multi-order BLBF, Stage 2 parallel island GA/Ruin-and-Recreate with thermal/slice refinement & live viewport streaming, + exact gate), and `compact.rs` (`rapier3d`/`parry3d` V-HACD).
+- Remaining: automated 30–150 part Netfabb benchmarks (`Phase 6` in [`sls-3d-nesting-plan.md`](sls-3d-nesting-plan.md)).
 
-### Phase 2: `solidcraft-ui-kit` + `solidcraft-viewport-gpu` App
-- Scaffold `apps/nestcraft` using `solidcraft_ui_kit::Container`, `Panel`, `ribbon`, `solidcraft_look` themes/fonts/glyphs, and `&NESTCRAFT_ICONS` (`IconSet::extended`).
-- Render build volume wireframe (`SceneLine` cube + `Z = 0` floor grid) and instanced parts via `InstancedMesh` (`Arc<Mesh>` + 3×4 affine matrix + normal/red collision palette).
-- Add `solidcraft_viewport::Camera` ray + `parry3d` picking + manual translation/rotation Gizmo with live `parry3d` clearance checks.
+### Phase 2: `solidcraft-ui-kit` + `solidcraft-viewport-gpu` App (`Done`)
+- Scaffolded `apps/nestcraft` using `solidcraft_ui_kit::Container`, `solidcraft_look` themes/fonts/glyphs, and `&NESTCRAFT_ICONS` (`IconSet::extended`).
+- Rendered build volume wireframe, `Z = 0` floor grid, instanced parts via `InstancedMesh` (`Arc<Mesh>` + 3×4 affine matrix + selection/out-of-bounds/thermal/collision palettes), `MovingLayer` drag/rotate gizmo, 3D View Compass, compact fixed-width scrollable `3D Auto-Nest` (with `XY`/`Z` rotation step sliders including `0° (Locked)`) & `Gravity Settle` modals, and non-blocking bottom progress bar with `Stop & Apply Best` / `Cancel`.
 
-### Phase 3: SLS Production Tooling & `--mcp` Automation (Upstreamable)
-- **Sinterbox Generator:** Parametric perforated cage wrapper around tiny parts (`< X mm³` or `< Y mm` min dim).
-- **Thermal Density Heatmap:** Sliding 3D box filter over `solid_mask` voxels highlighting PA12 curl/over-sintering zones.
-- **Headless MCP Server (`nestcraft --mcp`):** Expose `load_job` (folder + CSV/JSON BOM), `nest_job`, `split_builds`, and `export_3mf` over `solidcraft-mcp-server`.
-- **Upstream Path (Optional):** If `tangency-labs` adopts additive manufacturing, `crates/nestcraft-core` (`Class::Shared`) integrates cleanly into `apps/solidcraft` as a `ws_additive` workspace tab alongside `ws_design`, `ws_drawing`, `ws_render`, and `ws_animate`.
+### Phase 3: SLS Production Tooling & `--mcp` Automation (`Partial` — Sinterbox, Thermal & Slice `Done`; `--mcp` & Nightly CI `Planned`)
+- **Sinterbox Generator (`sinterbox.rs` — `Done`):** Parametric perforated cage wrapper around grouped small parts (`Box` / `Tight Fit`, adaptive bars, 3D label).
+- **Thermal Density Heatmap & Slice Distribution (`thermal.rs`, `slice.rs` — `Done`):** `20×20×20 mm` sliding-box thermal map + `0.1–5.0 mm` interactive Z-slice sidebar (`Z`-clip plane pending).
+- **Headless MCP Server (`nestcraft --mcp` — `Planned`):** Expose `load_job`, `nest_job`, `split_builds`, and `export_3mf` over `solidcraft-mcp-server`.
+- **Upstream Path (Optional):** Keep `crates/nestcraft-core` (`Class::Shared`) UI-agnostic so it can integrate cleanly into `apps/solidcraft` as a `ws_additive` workspace tab alongside `ws_design`, `ws_drawing`, `ws_render`, and `ws_animate`.
 
 ---
 

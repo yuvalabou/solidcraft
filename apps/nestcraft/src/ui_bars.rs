@@ -663,6 +663,10 @@ impl NestCraftApp {
         let best_density = task.latest.best_density_pct;
         let best_placed = task.latest.best_placed;
         let best_overflow = task.latest.best_overflow;
+        let thermal_note = task
+            .latest
+            .best_thermal_peak_pct
+            .map_or_else(String::new, |tp| format!("   |   Thermal: {tp:.1}%"));
         let stopping = task.stop_and_apply.load(std::sync::atomic::Ordering::Relaxed)
             || task.cancel.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -682,7 +686,7 @@ impl NestCraftApp {
                     StageBar::separator(ui);
                     ui.label(
                         egui::RichText::new(format!(
-                            "Max Z: {best_max_z:.1} mm   |   Density: {best_density:.2}%   |   Placed: {best_placed}   |   Overflow: {best_overflow}   |   {elapsed_s:.1}s"
+                            "Max Z: {best_max_z:.1} mm   |   Density: {best_density:.2}%   |   Placed: {best_placed}   |   Overflow: {best_overflow}{thermal_note}   |   {elapsed_s:.1}s"
                         ))
                         .size(t.font_small)
                         .color(t.text),

@@ -1483,30 +1483,63 @@ fn seg_seg_closest(p1: [f32; 3], q1: [f32; 3], p2: [f32; 3], q2: [f32; 3]) -> ([
 }
 
 pub(crate) fn seg_intersects_tri_point(p0: [f32; 3], p1: [f32; 3], tri: [[f32; 3]; 3]) -> Option<[f32; 3]> {
-    const EPS: f32 = 1e-5;
-    let dir = sub3(p1, p0);
-    let e1 = sub3(tri[1], tri[0]);
-    let e2 = sub3(tri[2], tri[0]);
-    let h = cross3(dir, e2);
-    let a = dot3(e1, h);
-    if a.abs() < 1e-8 {
+    const EPS: f64 = 1e-6;
+    let to_f64 = |v: [f32; 3]| [f64::from(v[0]), f64::from(v[1]), f64::from(v[2])];
+    let sub64 = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let dot64 = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let cross64 = |a: [f64; 3], b: [f64; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+
+    let p0 = to_f64(p0);
+    let p1 = to_f64(p1);
+    let t0 = to_f64(tri[0]);
+    let t1 = to_f64(tri[1]);
+    let t2 = to_f64(tri[2]);
+
+    let dir = sub64(p1, p0);
+    let e1 = sub64(t1, t0);
+    let e2 = sub64(t2, t0);
+    let n = cross64(e1, e2);
+    let scale = (dot64(n, n) * dot64(dir, dir)).sqrt();
+    let h = cross64(dir, e2);
+    let a = dot64(e1, h);
+    if scale <= 1e-18 || a.abs() <= 1e-9 * scale {
         return None;
     }
+
     let f = 1.0 / a;
-    let s = sub3(p0, tri[0]);
-    let u = f * dot3(s, h);
+    let s = sub64(p0, t0);
+    let u = f * dot64(s, h);
     if !(-EPS..=1.0 + EPS).contains(&u) {
         return None;
     }
-    let q = cross3(s, e1);
-    let v = f * dot3(dir, q);
+    let q = cross64(s, e1);
+    let v = f * dot64(dir, q);
     if v < -EPS || u + v > 1.0 + EPS {
         return None;
     }
-    let t = f * dot3(e2, q);
-    if (-EPS..=1.0 + EPS).contains(&t) {
-        let tc = t.clamp(0.0, 1.0);
-        Some([p0[0] + tc * dir[0], p0[1] + tc * dir[1], p0[2] + tc * dir[2]])
+    let t = f * dot64(e2, q);
+    if !(-EPS..=1.0 + EPS).contains(&t) {
+        return None;
+    }
+
+    let tc = t.clamp(0.0, 1.0);
+    let uc = u.clamp(0.0, 1.0);
+    let vc = v.clamp(0.0, (1.0 - uc).max(0.0));
+    let p_seg = [p0[0] + tc * dir[0], p0[1] + tc * dir[1], p0[2] + tc * dir[2]];
+    let p_tri = [
+        t0[0] + uc * e1[0] + vc * e2[0],
+        t0[1] + uc * e1[1] + vc * e2[1],
+        t0[2] + uc * e1[2] + vc * e2[2],
+    ];
+    let diff = sub64(p_seg, p_tri);
+    if dot64(diff, diff) <= 1e-6 {
+        Some([p_seg[0] as f32, p_seg[1] as f32, p_seg[2] as f32])
     } else {
         None
     }

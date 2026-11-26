@@ -472,11 +472,29 @@ impl HeightMap2D {
     /// Recompute exact column heights from a `BitGrid3D` (used after Ruin-and-Recreate un-stamping).
     pub fn rebuild_from_grid(&mut self, grid: &BitGrid3D) {
         self.heights.fill(0);
-        let x_end = self.nx.min(grid.nx);
-        let y_end = self.ny.min(grid.ny);
-        for y in 0..y_end {
+        self.rebuild_rect_from_grid(grid, 0, 0, self.nx, self.ny);
+    }
+
+    /// Recompute exact column heights inside `[x0..x1, y0..y1]` from `grid` (fast localized Ruin-and-Recreate update).
+    pub fn rebuild_rect_from_grid(
+        &mut self,
+        grid: &BitGrid3D,
+        x0: usize,
+        y0: usize,
+        x1: usize,
+        y1: usize,
+    ) {
+        let x_lo = x0.min(self.nx).min(grid.nx);
+        let y_lo = y0.min(self.ny).min(grid.ny);
+        let x_hi = x1.min(self.nx).min(grid.nx);
+        let y_hi = y1.min(self.ny).min(grid.ny);
+        if x_lo >= x_hi || y_lo >= y_hi {
+            return;
+        }
+        for y in y_lo..y_hi {
             let row = y * self.nx;
-            for x in 0..x_end {
+            for x in x_lo..x_hi {
+                self.heights[row + x] = 0;
                 for z in (0..grid.nz).rev() {
                     if grid.get(x, y, z) {
                         self.heights[row + x] = u16::try_from(z + 1).unwrap_or(u16::MAX);
@@ -1022,21 +1040,81 @@ pub fn adaptive_part_half_clearance_mm(volume_mm3: f64, min_gap_mm: f32, max_gap
     0.5 * (lo + t * (hi - lo))
 }
 
-/// Candidate orientation density for `RotationConstraint::Free`.
+/// XY tilt angular step for 3D candidate orientations (`0° (Locked)` disables X/Y tilting).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FreeAngleSet {
-    /// 24 octahedral orientations (6 face-down directions × 4 Z-rotations).
+pub enum XyRotationStep {
+    /// 0° — X/Y orientation locked to current part pose.
+    Locked0,
+    /// 180° flips only (upright + upside-down).
+    Deg180,
+    /// 90° steps (6 cardinal face-down directions).
     #[default]
-    Octahedral24,
-    /// 48 orientations (24 octahedral + 24 45°-tilted orientations).
-    Tilted48,
-    /// 64 dense orientations (octahedral + multi-axis tilted candidates).
-    Dense64,
+    Deg90,
+    /// 45° steps (cardinal + 45° X/Y tilted candidates).
+    Deg45,
+    /// 30° steps (cardinal + 30°/60° X/Y tilted candidates).
+    Deg30,
 }
 
-/// Z-rotation angular step for `RotationConstraint::ZOnly`.
+impl XyRotationStep {
+    pub fn slider_index(self) -> usize {
+        match self {
+            Self::Locked0 => 0,
+            Self::Deg180 => 1,
+            Self::Deg90 => 2,
+            Self::Deg45 => 3,
+            Self::Deg30 => 4,
+        }
+    }
+
+    pub fn from_slider_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Locked0,
+            1 => Self::Deg180,
+            2 => Self::Deg90,
+            3 => Self::Deg45,
+            _ => Self::Deg30,
+        }
+    }
+
+    pub fn deg(self) -> u16 {
+        match self {
+            Self::Locked0 => 0,
+            Self::Deg180 => 180,
+            Self::Deg90 => 90,
+            Self::Deg45 => 45,
+            Self::Deg30 => 30,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Locked0 => "0° (Locked)",
+            Self::Deg180 => "180°",
+            Self::Deg90 => "90°",
+            Self::Deg45 => "45°",
+            Self::Deg30 => "30°",
+        }
+    }
+
+    pub fn base_tilt_count(self) -> usize {
+        match self {
+            Self::Locked0 => 1,
+            Self::Deg180 => 2,
+            Self::Deg90 => 6,
+            Self::Deg45 => 10,
+            Self::Deg30 => 14,
+        }
+    }
+}
+
+/// Z-axis yaw angular step for 3D candidate orientations (`0° (Locked)` disables Z rotation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ZOnlyStep {
+pub enum ZRotationStep {
+    /// 0° — Z rotation locked to current part pose.
+    Locked0,
+    /// 180° steps (2 candidates).
+    Deg180,
     /// 90° steps (4 candidates).
     Deg90,
     /// 45° steps (8 candidates).
@@ -1044,6 +1122,101 @@ pub enum ZOnlyStep {
     Deg45,
     /// 30° steps (12 candidates).
     Deg30,
+    /// 15° steps (24 candidates).
+    Deg15,
+}
+
+impl ZRotationStep {
+    pub fn slider_index(self) -> usize {
+        match self {
+            Self::Locked0 => 0,
+            Self::Deg180 => 1,
+            Self::Deg90 => 2,
+            Self::Deg45 => 3,
+            Self::Deg30 => 4,
+            Self::Deg15 => 5,
+        }
+    }
+
+    pub fn from_slider_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Locked0,
+            1 => Self::Deg180,
+            2 => Self::Deg90,
+            3 => Self::Deg45,
+            4 => Self::Deg30,
+            _ => Self::Deg15,
+        }
+    }
+
+    pub fn deg(self) -> u16 {
+        match self {
+            Self::Locked0 => 0,
+            Self::Deg180 => 180,
+            Self::Deg90 => 90,
+            Self::Deg45 => 45,
+            Self::Deg30 => 30,
+            Self::Deg15 => 15,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Locked0 => "0° (Locked)",
+            Self::Deg180 => "180°",
+            Self::Deg90 => "90°",
+            Self::Deg45 => "45°",
+            Self::Deg30 => "30°",
+            Self::Deg15 => "15°",
+        }
+    }
+
+    pub fn yaw_count(self) -> usize {
+        match self {
+            Self::Locked0 => 1,
+            Self::Deg180 => 2,
+            Self::Deg90 => 4,
+            Self::Deg45 => 8,
+            Self::Deg30 => 12,
+            Self::Deg15 => 24,
+        }
+    }
+}
+
+/// Estimated candidate orientation count for RAM budgeting given `constraint`, `xy_step`, and `z_step`.
+pub fn estimated_orientation_count(
+    constraint: RotationConstraint,
+    xy_step: XyRotationStep,
+    z_step: ZRotationStep,
+) -> usize {
+    let (eff_xy, eff_z) = match constraint {
+        RotationConstraint::Fixed => (XyRotationStep::Locked0, ZRotationStep::Locked0),
+        RotationConstraint::ZOnly => (XyRotationStep::Locked0, z_step),
+        RotationConstraint::Free => (xy_step, z_step),
+    };
+    if eff_xy == XyRotationStep::Locked0 {
+        return eff_z.yaw_count();
+    }
+    let cardinals = if eff_xy == XyRotationStep::Deg180 { 2 } else { 6 };
+    let cardinal_z = match eff_z {
+        ZRotationStep::Locked0 => 1,
+        ZRotationStep::Deg180 => 2,
+        ZRotationStep::Deg90 => 4,
+        ZRotationStep::Deg45 => 8,
+        ZRotationStep::Deg30 | ZRotationStep::Deg15 => 12,
+    };
+    let extra_tilts = match eff_xy {
+        XyRotationStep::Deg45 => 4,
+        XyRotationStep::Deg30 => 8,
+        _ => 0,
+    };
+    let tilted_z = match eff_z {
+        ZRotationStep::Locked0 => 1,
+        ZRotationStep::Deg180 => 2,
+        ZRotationStep::Deg90 | ZRotationStep::Deg45 => 4,
+        ZRotationStep::Deg30 | ZRotationStep::Deg15 => 6,
+    };
+    cardinals * cardinal_z + extra_tilts * tilted_z
 }
 
 fn mat3_mul(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
@@ -1227,62 +1400,130 @@ fn octahedral_rotations() -> Vec<[[f32; 3]; 3]> {
     out
 }
 
-/// Generate candidate 3×3 orientation matrices respecting `constraint` and optional PCA pre-alignment.
+/// Generate candidate 3×3 orientation matrices respecting `constraint`, `(xy_step, z_step)`,
+/// and optional PCA pre-alignment.
 pub fn generate_candidate_rotations(
     mesh: &TriMesh,
     base_rot: [[f32; 3]; 3],
     constraint: RotationConstraint,
-    free_set: FreeAngleSet,
-    z_step: ZOnlyStep,
+    xy_step: XyRotationStep,
+    z_step: ZRotationStep,
     use_pca_prealign: bool,
 ) -> Vec<[[f32; 3]; 3]> {
-    match constraint {
-        RotationConstraint::Fixed => vec![base_rot],
-        RotationConstraint::ZOnly => {
-            let count = match z_step {
-                ZOnlyStep::Deg90 => 4,
-                ZOnlyStep::Deg45 => 8,
-                ZOnlyStep::Deg30 => 12,
-            };
-            let step = 360.0 / (count as f32);
-            (0..count)
-                .map(|i| mat3_mul(&rot_z_deg((i as f32) * step), &base_rot))
-                .collect()
+    let (eff_xy, eff_z) = match constraint {
+        RotationConstraint::Fixed => (XyRotationStep::Locked0, ZRotationStep::Locked0),
+        RotationConstraint::ZOnly => (XyRotationStep::Locked0, z_step),
+        RotationConstraint::Free => (xy_step, z_step),
+    };
+
+    if eff_xy == XyRotationStep::Locked0 {
+        let count = eff_z.yaw_count();
+        if count <= 1 {
+            return vec![base_rot];
         }
-        RotationConstraint::Free => {
-            let mut rots = octahedral_rotations();
-            if matches!(free_set, FreeAngleSet::Tilted48 | FreeAngleSet::Dense64) {
-                for base_tilt in [rot_x_deg(45.0), rot_y_deg(45.0), rot_x_deg(-45.0), rot_y_deg(-45.0)] {
-                    for k in 0..6 {
-                        rots.push(mat3_mul(&rot_z_deg((k as f32) * 60.0), &base_tilt));
-                    }
-                }
-            }
-            if free_set == FreeAngleSet::Dense64 {
-                let extra_tilts = [
-                    mat3_mul(&rot_x_deg(45.0), &rot_y_deg(45.0)),
-                    mat3_mul(&rot_x_deg(45.0), &rot_y_deg(-45.0)),
-                    mat3_mul(&rot_x_deg(-45.0), &rot_y_deg(45.0)),
-                    mat3_mul(&rot_x_deg(-45.0), &rot_y_deg(-45.0)),
-                ];
-                for t in &extra_tilts {
-                    for k in 0..4 {
-                        rots.push(mat3_mul(&rot_z_deg((k as f32) * 90.0), t));
-                    }
-                }
-            }
-            if use_pca_prealign {
-                let pca = compute_pca_rotation(mesh);
-                let mut pca_oct = octahedral_rotations()
-                    .into_iter()
-                    .map(|r| mat3_mul(&r, &pca))
-                    .collect::<Vec<_>>();
-                pca_oct.extend(rots);
-                pca_oct
+        let step = 360.0 / (count as f32);
+        return (0..count)
+            .map(|i| mat3_mul(&rot_z_deg((i as f32) * step), &base_rot))
+            .collect();
+    }
+
+    let cardinal_tilts: Vec<[[f32; 3]; 3]> = if eff_xy == XyRotationStep::Deg180 {
+        vec![
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            rot_x_deg(180.0),
+        ]
+    } else {
+        vec![
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            rot_x_deg(180.0),
+            rot_x_deg(90.0),
+            rot_x_deg(-90.0),
+            rot_y_deg(90.0),
+            rot_y_deg(-90.0),
+        ]
+    };
+
+    let extra_tilts: Vec<[[f32; 3]; 3]> = match eff_xy {
+        XyRotationStep::Deg45 => vec![
+            rot_x_deg(45.0),
+            rot_y_deg(45.0),
+            rot_x_deg(-45.0),
+            rot_y_deg(-45.0),
+        ],
+        XyRotationStep::Deg30 => vec![
+            rot_x_deg(30.0),
+            rot_y_deg(30.0),
+            rot_x_deg(-30.0),
+            rot_y_deg(-30.0),
+            rot_x_deg(60.0),
+            rot_y_deg(60.0),
+            rot_x_deg(-60.0),
+            rot_y_deg(-60.0),
+        ],
+        _ => Vec::new(),
+    };
+
+    let cardinal_z = match eff_z {
+        ZRotationStep::Locked0 => 1,
+        ZRotationStep::Deg180 => 2,
+        ZRotationStep::Deg90 => 4,
+        ZRotationStep::Deg45 => 8,
+        ZRotationStep::Deg30 | ZRotationStep::Deg15 => 12,
+    };
+    let tilted_z = match eff_z {
+        ZRotationStep::Locked0 => 1,
+        ZRotationStep::Deg180 => 2,
+        ZRotationStep::Deg90 | ZRotationStep::Deg45 => 4,
+        ZRotationStep::Deg30 | ZRotationStep::Deg15 => 6,
+    };
+
+    let mut rots = Vec::with_capacity(
+        cardinal_tilts.len() * cardinal_z + extra_tilts.len() * tilted_z,
+    );
+
+    if eff_z == ZRotationStep::Locked0 {
+        // Z rotation is locked: preserve `base_rot` yaw on every tilt, keeping `base_rot` first.
+        for tilt in &cardinal_tilts {
+            rots.push(mat3_mul(tilt, &base_rot));
+        }
+        for tilt in &extra_tilts {
+            rots.push(mat3_mul(tilt, &base_rot));
+        }
+        return rots;
+    }
+
+    let z_step_card = 360.0 / (cardinal_z as f32);
+    for tilt in &cardinal_tilts {
+        for k in 0..cardinal_z {
+            let rz = rot_z_deg((k as f32) * z_step_card);
+            let r = if eff_xy == XyRotationStep::Deg180 {
+                mat3_mul(&mat3_mul(&rz, tilt), &base_rot)
             } else {
-                rots
+                mat3_mul(&rz, tilt)
+            };
+            rots.push(r);
+        }
+    }
+
+    if !extra_tilts.is_empty() {
+        let z_step_tilt = 360.0 / (tilted_z as f32);
+        for tilt in &extra_tilts {
+            for k in 0..tilted_z {
+                rots.push(mat3_mul(&rot_z_deg((k as f32) * z_step_tilt), tilt));
             }
         }
+    }
+
+    if use_pca_prealign && eff_xy != XyRotationStep::Deg180 {
+        let pca = compute_pca_rotation(mesh);
+        let mut pca_oct = octahedral_rotations()
+            .into_iter()
+            .map(|r| mat3_mul(&r, &pca))
+            .collect::<Vec<_>>();
+        pca_oct.extend(rots);
+        pca_oct
+    } else {
+        rots
     }
 }
 
@@ -1867,6 +2108,20 @@ mod tests {
         assert_eq!(tray.count_ones(), 0);
         hmap.rebuild_from_grid(&tray);
         assert_eq!(hmap.max_height_in_rect(0, 0, 140, 20), 0);
+
+        // Localized rect rebuild matches full rebuild after stamp + partial unstamp.
+        let mut mask_b = BitGrid3D::new(10, 4, 4, None).expect("mask_b");
+        mask_b.set(2, 1, 3);
+        tray.stamp_at(&mask, 61, 3, 2);
+        tray.stamp_at(&mask_b, 10, 2, 5);
+        hmap.rebuild_from_grid(&tray);
+
+        tray.unstamp_at(&mask, 61, 3, 2);
+        let mut hmap_rect = hmap.clone();
+        hmap_rect.rebuild_rect_from_grid(&tray, 61, 3, 61 + mask.nx, 3 + mask.ny);
+        hmap.rebuild_from_grid(&tray);
+        assert_eq!(hmap_rect, hmap);
+        assert_eq!(hmap_rect.max_height_in_rect(0, 0, 140, 20), 9);
     }
 
     #[test]
@@ -1952,8 +2207,8 @@ mod tests {
             &cube,
             id,
             RotationConstraint::Free,
-            FreeAngleSet::Octahedral24,
-            ZOnlyStep::Deg90,
+            XyRotationStep::Deg90,
+            ZRotationStep::Deg90,
             false,
         );
         assert_eq!(cube_cands.len(), 24);
@@ -1977,12 +2232,43 @@ mod tests {
             &l_mesh,
             id,
             RotationConstraint::Free,
-            FreeAngleSet::Octahedral24,
-            ZOnlyStep::Deg90,
+            XyRotationStep::Deg90,
+            ZRotationStep::Deg90,
             false,
         );
         let l_pruned = prune_symmetric_rotations(&l_mesh, &l_cands, 2.0, None, None).expect("prune L");
         assert!(l_pruned.len() >= 12, "asymmetric L should keep >= 12 orientations, got {}", l_pruned.len());
+
+        // 0° XY + 0° Z locks rotation to exact base_rot; 0° XY + 45° Z generates 8 Z-only steps;
+        // 45° XY + 90° Z adds tilted candidates.
+        let tilted_base = rot_x_deg(15.0);
+        let locked = generate_candidate_rotations(
+            &l_mesh,
+            tilted_base,
+            RotationConstraint::Free,
+            XyRotationStep::Locked0,
+            ZRotationStep::Locked0,
+            true,
+        );
+        assert_eq!(locked, vec![tilted_base]);
+        let z_only = generate_candidate_rotations(
+            &l_mesh,
+            id,
+            RotationConstraint::Free,
+            XyRotationStep::Locked0,
+            ZRotationStep::Deg45,
+            true,
+        );
+        assert_eq!(z_only.len(), 8);
+        let tilted_45 = generate_candidate_rotations(
+            &l_mesh,
+            id,
+            RotationConstraint::Free,
+            XyRotationStep::Deg45,
+            ZRotationStep::Deg90,
+            false,
+        );
+        assert!(tilted_45.len() > 24);
     }
 
     #[test]

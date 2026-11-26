@@ -7,7 +7,7 @@ Work: ROADMAP.md, CONTRIBUTING.md ("Where help is wanted most"), `help wanted`, 
 
 ## NestCraft (`sls-dev` branch)
 This branch hosts NestCraft (`apps/nestcraft`, `crates/nestcraft-core`).
-Docs: `docs/sls-feature-matrix.md`, `docs/sls-nesting-migration.md`, `docs/sls-nesting-plan.md`.
+Docs: `docs/sls-3d-nesting-plan.md`, `docs/sls-feature-matrix.md`, `docs/sls-nesting-migration.md`, `docs/sls-nesting-plan.md`.
 Sibling `ferroform` crates are available at "C:\Users\Degamim-I9\Desktop\SLS_wiki\raw\Software\ferroform" if needed.
 After every finished NestCraft task, run `cargo build -p nestcraft` alongside `cargo test -p nestcraft-core -p nestcraft`.
 

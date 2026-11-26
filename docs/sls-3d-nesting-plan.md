@@ -2,6 +2,8 @@
 
 > **Scope:** Pure-Rust 3D true-shape powder-bed SLS nesting (`crates/nestcraft-core`) and interactive UI (`apps/nestcraft`), built to complement the existing 2D bitmap nester ([`nest2d.rs`](../crates/nestcraft-core/src/nest2d.rs)), exact clearance verifier ([`collision.rs`](../crates/nestcraft-core/src/collision.rs)), slice analyzer ([`slice.rs`](../crates/nestcraft-core/src/slice.rs)), and thermal map ([`thermal.rs`](../crates/nestcraft-core/src/thermal.rs)).
 >
+> **Implementation Status (`sls-dev` @ `b79c6dc01`+):** **Phases 1, 2, 3, 4, and 5 are `Done`** ([`voxel.rs`](../crates/nestcraft-core/src/voxel.rs), [`interlock.rs`](../crates/nestcraft-core/src/interlock.rs), [`nest3d.rs`](../crates/nestcraft-core/src/nest3d.rs) Stage 1 live-streaming BLBF + Stage 2 parallel island GA / Ruin-and-Recreate with thermal/slice objectives + exact final gate, [`compact.rs`](../crates/nestcraft-core/src/compact.rs) `rapier3d`/`parry3d` V-HACD gravity settle, and `apps/nestcraft` two-tier modals + non-blocking bottom progress bar). **Phase 6 (`Planned`)** covers 30–150 part Netfabb benchmarks and `--mcp` automation hooks.
+>
 > **Related Docs:** [`sls-feature-matrix.md`](sls-feature-matrix.md) · [`sls-nesting-plan.md`](sls-nesting-plan.md) · [`sls-nesting-migration.md`](sls-nesting-migration.md)
 
 ---
@@ -97,12 +99,11 @@ flowchart LR
      - `clearance_mask` (`EDT <= r_P + 0.25 * pitch` to `0.5 * pitch`): tight dilated half-clearance shell. Using tight dilation (rather than full `0.5*sqrt(3)*pitch` double-padding) keeps narrow open cavities accessible and avoids wasting 1.5–3 mm of packing density, while Stage 3 exact repulsion and the final [`collision.rs`](../crates/nestcraft-core/src/collision.rs) gate catch any sub-voxel grazing pairs.
 
 4. **Smart Rotation Handling & Coarse-First Symmetry Pruning:**
-   - **Pre-alignment:** Before generating discrete angles, compute each prototype's **PCA / 3D OBB principal axes** so arbitrarily tilted CAD imports align cleanly with the machine axes as an extra candidate set.
-   - **Candidate Sets (selectable, respecting `part.constraint`):**
-     - `Fixed`: `1` orientation (current instance rotation).
-     - `ZOnly`: `4` (`90°`), `8` (`45°`), or `12` (`30°`) Z-rotations (+ min-XY-OBB Z angle).
-     - `Free` — **Standard (24)**: All 24 octahedral orientations (`6` face-down directions × `4` 90° Z-rotations).
-     - `Free` — **45° / Dense (48–64)**: 24 octahedral + intermediate `45°` tilted orientations (crucial for flat plates, L-brackets, and diagonal beam struts) + optional continuous Z-angle fine variants.
+   - **Pre-alignment:** Before generating discrete angles, compute each prototype's **PCA / 3D OBB principal axes** so arbitrarily tilted CAD imports align cleanly with the machine axes (when `XY Rotation > 0°` and `PCA / OBB Pre-Alignment` is enabled).
+   - **XY & Z Rotation Step Sliders (with `0° (Locked)`):**
+     - `Orientation`: `Per-Part` (respects per-part `RotationConstraint`, capped by the XY/Z sliders) vs `Override All` (applies the XY/Z sliders to all movable parts).
+     - `XY Rotation` slider: `0° (Locked)` / `180°` / `90°` (6 cardinal faces) / `45°` / `30°`. Setting `0°` replaces separate `Force Fixed` / `Force Z-Only` modes.
+     - `Z Rotation` slider: `0° (Locked)` / `180°` / `90°` / `45°` / `30°` / `15°`. Setting both `XY = 0°` and `Z = 0°` keeps every part fixed; `XY = 0°` + `Z > 0°` performs Z-only nesting; `XY > 0°` + `Z = 0°` tilts XY while preserving instance Z yaw.
    - **Coarse-First Voxel Symmetry Pruning:** Hash candidate orientations at a fast **`3–4 mm` coarse pitch** (plus bounding dimensions) *before* running fine `0.5–1.0 mm` voxelization and 3D EDT, deduplicating identical masks up front. A symmetric cube collapses `24 -> 1`; a cylinder collapses `24 -> 3` — avoiding wasted fine EDTs on symmetric duplicates.
    - **Orientation Ordering:** Sort each part's surviving unique orientations by `(bounding_z, footprint_area)` ascending so low-profile orientations are probed first.
 
@@ -147,6 +148,8 @@ Netfabb allows nesting a smaller part **inside** an open pocket or under an arch
 ---
 
 ### 4.4 Stage 2: Anytime Refined Optimizer (GA + Ruin-and-Recreate)
+
+> *Status: **Done (Phase 4)** — Parallel island optimizer (`RuinAndRecreate`, `Genetic`, `HybridGaRuin`), incremental `CoarseThermalSliceGrid` `20×20×20 mm` thermal density & Z-slice penalties, localized `HeightMap2D` rebuild + exact in-place rollback, live viewport streaming, and `<50 ms` cooperative break implemented in [`nest3d.rs`](../crates/nestcraft-core/src/nest3d.rs) and `apps/nestcraft`.*
 
 When a refined method is selected (**`Ruin-and-Recreate`**, **`Genetic (GA)`**, or **`Hybrid GA + Ruin`**), Stage 2 starts from Stage 1's best bed and improves it until the time/iteration budget finishes or the user clicks **Stop & Apply**:
 
@@ -194,7 +197,7 @@ Works both as **Stage 3** after voxel nesting **and** as a standalone **`Gravity
 
 ### 5.1 `Nest3dConfig` (All Options Selectable, Compact Two-Tier Modal)
 
-To keep the modal compact on smaller viewports, options are organized into **Primary** (always visible) and a collapsible **`Advanced Options ▸`** section:
+To keep the modal compact (`420 pt` fixed width, matching the other NestCraft modals) and usable on smaller viewports, options use single-line rows inside a single vertical scrollable body with pinned footer action buttons (`Run 3D Nest` / `Close`), organized into **Primary** (always visible) and a collapsible **`Advanced Options ▸`** section:
 
 | Tier | Group | Field / UI Control | Options / Range | Default (`Balanced`) |
 | :--- | :--- | :--- | :--- | :--- |
@@ -210,9 +213,9 @@ To keep the modal compact on smaller viewports, options are organized into **Pri
 | **Advanced** | **Spacing** | `Clearance Mode` | `Fixed` / `Adaptive by Part Mass` (`r_A + r_B` by volume/thickness) | `Fixed` |
 | **Advanced** | **Spacing** | `Separate Z Distance` | Checkbox + `Min Z Gap (mm)` (anisotropic XY vs Z clearance in 3D EDT) | Unchecked |
 | **Advanced** | **Margins** | `Wall Margin (mm)` / `Min Z (mm)` | `0.0 – 50.0 mm` / `0.0 – 100.0 mm` | `job.wall_margin_mm`, `job.min_z_mm` |
-| **Advanced** | **Rotations** | `Orientation Freedom` | `Respect Part Constraints` / `Force Fixed` / `Force Z-Only` / `Force Free` | `Respect Part Constraints` |
-| **Advanced** | **Rotations** | `Free Angle Set` | `24 (90°)` / `48 (45° Tilt)` / `64 (Dense)` + `PCA/OBB Pre-Align` toggle | `24 (90°)` + `OBB Align ON` |
-| **Advanced** | **Rotations** | `Z-Only Step` | `90° (4)` / `45° (8)` / `30° (12)` | `45° (8)` |
+| **Advanced** | **Rotations** | `Orientation` | `Per-Part` / `Override All` (caps or overrides per-part `RotationConstraint`) | `Per-Part` |
+| **Advanced** | **Rotations** | `XY Rotation` (`xy_rotation_step`) | Slider `0° (Locked)` / `180°` / `90°` / `45°` / `30°` + `PCA / OBB Pre-Alignment` (shown when `XY > 0°`) | `90°` + `PCA ON` |
+| **Advanced** | **Rotations** | `Z Rotation` (`z_rotation_step`) | Slider `0° (Locked)` / `180°` / `90°` / `45°` / `30°` / `15°` | `45°` |
 | **Advanced** | **Cavities & Safety** | `Allow Open-Cavity Nesting` | Checkbox (`true` = Netfabb style; `false` = fill cavities / convex hull) | `true` |
 | **Advanced** | **Cavities & Safety** | `Avoid No-Build Zone` | Checkbox | `true` |
 | **Advanced** | **Refined Objectives** | `Area / Thermal Density Weight` + `Target Density (%)` | `0% (Off)` ↔ `100%` + `15%–40%` target ceiling (Stage 2 refined methods only) | `0%` (`25%` weight / `25%` cap in `Refined`) |
@@ -225,7 +228,7 @@ To keep the modal compact on smaller viewports, options are organized into **Pri
 
 ### 5.2 Standalone `Gravity Settle / Compact` (`GravitySettleConfig`)
 
-Accessible directly from the **Nest** banner next to **3D Nesting** (replaces/augments manual nudging):
+Accessible directly from the **Nest** banner next to **3D Nesting** (replaces/augments manual nudging) in a matching `400 pt` fixed-width scrollable modal with pinned footer action buttons (`Run Gravity Settle` / `Close`):
 - **Scope:** `Selected Only` toggle (`selected_only`) + `Keep Parts Inside Build Volume` toggle (`keep_in_bounds_fixed`) — default settles all unlocked parts; when either toggle is enabled, fixed parts act as immobile obstacles.
 - **Direction:** `-Z Gravity Only` / `-Z + Inward XY Compaction`
 - **Clearance:** `Fixed` (`job.clearance_mm`), optional `Separate Z Distance`, or `Adaptive by Part Mass` (`min_gap ↔ max_gap`)
@@ -281,14 +284,14 @@ Every visible non-movable instance is treated identically as a **static obstacle
 
 ## 6. Staged Implementation Roadmap
 
-| Phase | Deliverable | Target Files | Exit Criteria |
-| :--- | :--- | :--- | :--- |
-| **Phase 1** | **3D Voxelizer, 3D EDT, Bitgrid & Local BVH** | `crates/nestcraft-core/src/voxel.rs` | Conservative flood-fill voxelization, O(N) 3D EDT, `u64` masks, coarse-first symmetry pruning, per-prototype local BVH, staged mask release, `estimate_nest3d_memory_bytes` + `try_reserve` OOM guard, cooperative `AtomicBool` cancel, unit tests (cube/sphere/torus/leaky STL/degenerate) |
-| **Phase 2** | **Interlocking Detector** | `crates/nestcraft-core/src/interlock.rs` | AABB pre-filter + fast 6/14-dir swept escape + bounded voxel BFS escape + sequential peeling pass; tests proving open-cup nesting passes while ring/cavity trap fails |
-| **Phase 3** | **Constructive 3D BLBF + 3D Nesting UI & Bottom Bar** | `crates/nestcraft-core/src/nest3d.rs`, `apps/nestcraft/src/{app,ui_bars,ui_modals}.rs` | Multi-order parallel BLBF capped by worker budget, `max_z_limit_mm` enforcement + `+X` overflow, `selected_only` + `keep_in_bounds_fixed` static obstacles, two-tier `Nest3dConfig` modal with `Est. RAM` / `sysinfo` warning & `Auto-Fit Resolution`, non-intrusive bottom progress bar with edit-lock + `Stop & Apply Best` / `Cancel`, `Ctrl+Z` undo, `0` exact collisions |
-| **Phase 4** | **Anytime GA + Ruin-and-Recreate + Thermal/Slice Objectives** | `crates/nestcraft-core/src/nest3d.rs`, `apps/nestcraft` | Parallel island optimizer (using budgeted worker count) streaming live best improvements, incremental thermal/slice penalties active only in refined modes, <50 ms cooperative break |
-| **Phase 5** | **Physics Compaction & Standalone `Gravity Settle`** | `crates/nestcraft-core/src/compact.rs`, `apps/nestcraft` | Drop Stage 1/2 voxel state, run `rapier3d` + `parry3d` V-HACD `-Z` gravity + contact settling + optional micro-rotations, post-compaction peeling + exact `collision.rs` gate, standalone Nest-banner tool sharing the bottom progress/break strip |
-| **Phase 6** | **30–150 Part Benchmark & MCP Hooks** | `crates/nestcraft-core/tests/` or `benches/`, `--mcp` | Automated 30–150 part benchmarks measuring `max_Z`, density %, runtime, thermal peak, and `0` exact collisions vs. Netfabb baselines |
+| Phase | Status | Deliverable | Target Files | Exit Criteria |
+| :--- | :---: | :--- | :--- | :--- |
+| **Phase 1** | **`Done`** | **3D Voxelizer, 3D EDT, Bitgrid & Local BVH** | `crates/nestcraft-core/src/voxel.rs` | Conservative flood-fill voxelization, O(N) 3D EDT, `u64` masks, coarse-first symmetry pruning, per-prototype local BVH, staged mask release, `estimate_nest3d_memory_bytes` + `try_reserve` OOM guard, cooperative `AtomicBool` cancel, unit tests (cube/sphere/torus/leaky STL/degenerate) |
+| **Phase 2** | **`Done`** | **Interlocking Detector** | `crates/nestcraft-core/src/interlock.rs` | AABB pre-filter + fast 6/14-dir swept escape + bounded voxel BFS escape + sequential peeling pass; tests proving open-cup nesting passes while ring/cavity trap fails |
+| **Phase 3** | **`Done`** | **Constructive 3D BLBF + 3D Nesting UI & Bottom Bar** | `crates/nestcraft-core/src/nest3d.rs`, `apps/nestcraft/src/{app,ui_bars,ui_modals}.rs` | Multi-order parallel BLBF capped by worker budget, `max_z_limit_mm` enforcement + `+X` overflow, `selected_only` + `keep_in_bounds_fixed` static obstacles, two-tier `Nest3dConfig` modal with `Est. RAM` / `sysinfo` warning & `Auto-Fit Resolution`, non-intrusive bottom progress bar with edit-lock + `Stop & Apply Best` / `Cancel`, `Ctrl+Z` undo, `0` exact collisions |
+| **Phase 4** | **`Done`** | **Anytime GA + Ruin-and-Recreate + Thermal/Slice Objectives** | `crates/nestcraft-core/src/nest3d.rs`, `apps/nestcraft` | Parallel island optimizer (using budgeted worker count) streaming live best improvements, incremental thermal/slice penalties active only in refined modes, <50 ms cooperative break |
+| **Phase 5** | **`Done`** | **Physics Compaction & Standalone `Gravity Settle`** | `crates/nestcraft-core/src/compact.rs`, `apps/nestcraft` | Drop Stage 1/2 voxel state, run `rapier3d` + `parry3d` V-HACD `-Z` gravity + contact settling + optional micro-rotations, post-compaction peeling + exact `collision.rs` gate, standalone Nest-banner tool sharing the bottom progress/break strip |
+| **Phase 6** | **`Planned`** | **30–150 Part Benchmark & MCP Hooks** | `crates/nestcraft-core/tests/` or `benches/`, `--mcp` | Automated 30–150 part benchmarks measuring `max_Z`, density %, runtime, thermal peak, and `0` exact collisions vs. Netfabb baselines |
 
 ---
 

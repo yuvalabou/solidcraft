@@ -969,115 +969,121 @@ fn fast_overlap_voxels(
 
     let mut contact = None;
 
-    // If no direct solid overlap, check 1-voxel clearance dilation when `half_clear > 0`.
+    // If no direct solid overlap, verify exact clearance violation before dilating overlap voxels.
     if voxels.is_empty() && half_clear > 0.0 {
+        let clearance = half_clear * 2.0;
+        let clearance_sq = clearance * clearance;
         let ov_pad = [
-            [ov[0][0] - half_clear, ov[0][1] - half_clear, ov[0][2] - half_clear],
-            [ov[1][0] + half_clear, ov[1][1] + half_clear, ov[1][2] + half_clear],
+            [ov[0][0] - clearance, ov[0][1] - clearance, ov[0][2] - clearance],
+            [ov[1][0] + clearance, ov[1][1] + clearance, ov[1][2] + clearance],
         ];
         let tris_a = collect_tris_in_box(mesh_a, tf_a, ov_pad);
         let tris_b = collect_tris_in_box(mesh_b, tf_b, ov_pad);
-        let has_mask_a = mask_a.iter().any(|&v| v);
-        let has_mask_b = mask_b.iter().any(|&v| v);
-        if (!tris_a.is_empty() || has_mask_a) && (!tris_b.is_empty() || has_mask_b) {
-            let tol = half_clear + step * 0.5;
-            let tol_sq = tol * tol;
-            let tri_voxel_range = |tb: Aabb| -> Option<([usize; 3], [usize; 3])> {
-                let mut lo = [0usize; 3];
-                let mut hi = [0usize; 3];
-                let dims = [nx, ny, nz];
-                for k in 0..3 {
-                    let a = (((tb[0][k] - tol - ov[0][k]) / step) - 0.5).floor() as isize;
-                    let b = (((tb[1][k] + tol - ov[0][k]) / step) - 0.5).ceil() as isize;
-                    let max_idx = dims[k] as isize - 1;
-                    if b < 0 || a > max_idx {
-                        return None;
-                    }
-                    lo[k] = a.clamp(0, max_idx) as usize;
-                    hi[k] = b.clamp(0, max_idx) as usize;
-                }
-                Some((lo, hi))
-            };
-
-            let mut near_a = mask_a;
-            for &(t, tb) in &tris_a {
-                let Some((lo, hi)) = tri_voxel_range(tb) else {
-                    continue;
-                };
-                for iz in lo[2]..=hi[2] {
-                    let z = ov[0][2] + (iz as f32 + 0.5) * step;
-                    for iy in lo[1]..=hi[1] {
-                        let y = ov[0][1] + (iy as f32 + 0.5) * step;
-                        for ix in lo[0]..=hi[0] {
-                            let idx = (iz * ny + iy) * nx + ix;
-                            if !near_a[idx] {
-                                let p = [ov[0][0] + (ix as f32 + 0.5) * step, y, z];
-                                if point_tri_dist_sq(p, t) <= tol_sq {
-                                    near_a[idx] = true;
-                                }
-                            }
+        if !tris_a.is_empty() && !tris_b.is_empty() {
+            let (min_d2, closest) = spatial_min_tri_closest_points(&tris_a, &tris_b, ov_pad, clearance);
+            if min_d2 <= clearance_sq + 1e-5 {
+                let tol = half_clear + step * 0.5;
+                let tol_sq = tol * tol;
+                let tri_voxel_range = |tb: Aabb| -> Option<([usize; 3], [usize; 3])> {
+                    let mut lo = [0usize; 3];
+                    let mut hi = [0usize; 3];
+                    let dims = [nx, ny, nz];
+                    for k in 0..3 {
+                        let a = (((tb[0][k] - tol - ov[0][k]) / step) - 0.5).floor() as isize;
+                        let b = (((tb[1][k] + tol - ov[0][k]) / step) - 0.5).ceil() as isize;
+                        let max_idx = dims[k] as isize - 1;
+                        if b < 0 || a > max_idx {
+                            return None;
                         }
+                        lo[k] = a.clamp(0, max_idx) as usize;
+                        hi[k] = b.clamp(0, max_idx) as usize;
                     }
-                }
-            }
-
-            for iz in 0..nz {
-                let z0 = ov[0][2] + iz as f32 * step;
-                for iy in 0..ny {
-                    let y0 = ov[0][1] + iy as f32 * step;
-                    for ix in 0..nx {
-                        let idx = (iz * ny + iy) * nx + ix;
-                        if near_a[idx] && mask_b[idx] {
-                            occupied[idx] = true;
-                            let x0 = ov[0][0] + ix as f32 * step;
-                            expand_bounds_point(&mut occupied_bounds, [x0, y0, z0], [x0 + step, y0 + step, z0 + step]);
-                            if voxels.len() < budget {
-                                voxels.push([x0 + 0.5 * step, y0 + 0.5 * step, z0 + 0.5 * step]);
-                            }
-                        }
-                    }
-                }
-            }
-
-            for &(t, tb) in &tris_b {
-                let Some((lo, hi)) = tri_voxel_range(tb) else {
-                    continue;
+                    Some((lo, hi))
                 };
-                for iz in lo[2]..=hi[2] {
-                    let z0 = ov[0][2] + iz as f32 * step;
-                    let z = z0 + 0.5 * step;
-                    for iy in lo[1]..=hi[1] {
-                        let y0 = ov[0][1] + iy as f32 * step;
-                        let y = y0 + 0.5 * step;
-                        for ix in lo[0]..=hi[0] {
-                            let idx = (iz * ny + iy) * nx + ix;
-                            if near_a[idx] && !occupied[idx] {
-                                let x0 = ov[0][0] + ix as f32 * step;
-                                let p = [x0 + 0.5 * step, y, z];
-                                if point_tri_dist_sq(p, t) <= tol_sq {
-                                    occupied[idx] = true;
-                                    expand_bounds_point(
-                                        &mut occupied_bounds,
-                                        [x0, y0, z0],
-                                        [x0 + step, y0 + step, z0 + step],
-                                    );
-                                    if voxels.len() < budget {
-                                        voxels.push(p);
+
+                let mut near_a = mask_a;
+                for &(t, tb) in &tris_a {
+                    let Some((lo, hi)) = tri_voxel_range(tb) else {
+                        continue;
+                    };
+                    for iz in lo[2]..=hi[2] {
+                        let z = ov[0][2] + (iz as f32 + 0.5) * step;
+                        for iy in lo[1]..=hi[1] {
+                            let y = ov[0][1] + (iy as f32 + 0.5) * step;
+                            for ix in lo[0]..=hi[0] {
+                                let idx = (iz * ny + iy) * nx + ix;
+                                if !near_a[idx] {
+                                    let p = [ov[0][0] + (ix as f32 + 0.5) * step, y, z];
+                                    if point_tri_dist_sq(p, t) <= tol_sq {
+                                        near_a[idx] = true;
                                     }
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            if !voxels.is_empty() {
-                let (_, closest) = spatial_min_tri_closest_points(&tris_a, &tris_b, ov_pad, half_clear * 2.0);
-                contact = closest.map(|(point_a, point_b)| CollisionContact {
-                    point_a,
-                    point_b,
-                    is_hard: false,
-                });
+                for iz in 0..nz {
+                    let z0 = ov[0][2] + iz as f32 * step;
+                    for iy in 0..ny {
+                        let y0 = ov[0][1] + iy as f32 * step;
+                        for ix in 0..nx {
+                            let idx = (iz * ny + iy) * nx + ix;
+                            if near_a[idx] && mask_b[idx] {
+                                occupied[idx] = true;
+                                let x0 = ov[0][0] + ix as f32 * step;
+                                expand_bounds_point(
+                                    &mut occupied_bounds,
+                                    [x0, y0, z0],
+                                    [x0 + step, y0 + step, z0 + step],
+                                );
+                                if voxels.len() < budget {
+                                    voxels.push([x0 + 0.5 * step, y0 + 0.5 * step, z0 + 0.5 * step]);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for &(t, tb) in &tris_b {
+                    let Some((lo, hi)) = tri_voxel_range(tb) else {
+                        continue;
+                    };
+                    for iz in lo[2]..=hi[2] {
+                        let z0 = ov[0][2] + iz as f32 * step;
+                        let z = z0 + 0.5 * step;
+                        for iy in lo[1]..=hi[1] {
+                            let y0 = ov[0][1] + iy as f32 * step;
+                            let y = y0 + 0.5 * step;
+                            for ix in lo[0]..=hi[0] {
+                                let idx = (iz * ny + iy) * nx + ix;
+                                if near_a[idx] && !occupied[idx] {
+                                    let x0 = ov[0][0] + ix as f32 * step;
+                                    let p = [x0 + 0.5 * step, y, z];
+                                    if point_tri_dist_sq(p, t) <= tol_sq {
+                                        occupied[idx] = true;
+                                        expand_bounds_point(
+                                            &mut occupied_bounds,
+                                            [x0, y0, z0],
+                                            [x0 + step, y0 + step, z0 + step],
+                                        );
+                                        if voxels.len() < budget {
+                                            voxels.push(p);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !voxels.is_empty() {
+                    contact = closest.map(|(point_a, point_b)| CollisionContact {
+                        point_a,
+                        point_b,
+                        is_hard: false,
+                    });
+                }
             }
         }
     }
@@ -1392,5 +1398,36 @@ mod tests {
         let dz = c.point_b[2] - c.point_a[2];
         let dist = (dx * dx + dy * dy + dz * dz).sqrt();
         assert!((dist - 2.0).abs() < 1e-3, "expected 2.0 mm contact gap, got {dist}");
+    }
+
+    #[test]
+    fn coarse_pitch_does_not_flag_valid_clearance_on_45_deg_rotated_parts() {
+        let mut job = BuildJob::new(MachineProfile::FormigaP110);
+        job.clearance_mm = 2.5;
+        let pid = job.add_part("Cube20", cube_mesh(20.0));
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        let tf_a = [[c, -c, 0.0, 0.0], [c, c, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+        let tf_b_ok = [
+            [c, -c, 0.0, 23.0 * c],
+            [c, c, 0.0, 23.0 * c],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
+        let _a = job.add_instance(pid, tf_a).expect("a");
+        let b = job.add_instance(pid, tf_b_ok).expect("b");
+
+        let ok_rep = detect_collisions(&job, None, 3.0);
+        assert!(
+            ok_rep.pairs.is_empty(),
+            "3.0 mm gap with 2.5 mm clearance must not report false collision at 3.0 mm pitch: {:?}",
+            ok_rep.pairs
+        );
+
+        // Move `b` to a 2.0 mm gap (< 2.5 mm clearance): must report 1 non-hard clearance violation.
+        if let Some(inst) = job.instances.iter_mut().find(|i| i.id == b) {
+            inst.set_translation([22.0 * c, 22.0 * c, 0.0]);
+        }
+        let bad_rep = detect_collisions(&job, None, 3.0);
+        assert_eq!(bad_rep.pairs.len(), 1);
+        assert!(!bad_rep.pairs[0].is_hard_intersection);
     }
 }

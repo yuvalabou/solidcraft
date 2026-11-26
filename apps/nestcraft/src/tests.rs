@@ -1247,12 +1247,13 @@ use solidcraft_viewport::StandardView;
         // Starting and polling a 3D nest pushes a single undo snapshot when finished.
         let orig_tfs: Vec<_> = app.job.instances.iter().map(|i| i.transform).collect();
         app.nest3d_config.resolution_mm = 2.0;
+        app.nest3d_config.time_limit_secs = 1.5;
         let ctx = egui::Context::default();
         app.start_nest3d(&ctx);
         assert!(app.is_nest3d_running());
         assert!(!app.nest3d_dialog_open);
 
-        for _ in 0..200 {
+        for _ in 0..400 {
             app.poll_nest3d_task(&ctx);
             if !app.is_nest3d_running() {
                 break;
@@ -1392,4 +1393,62 @@ use solidcraft_viewport::StandardView;
         assert_eq!(app.undo_stack.len(), undo_len_before_cancel);
         let after_cancel_tfs: Vec<_> = app.job.instances.iter().map(|i| i.transform).collect();
         assert_eq!(after_cancel_tfs, orig_tfs);
+    }
+
+    #[test]
+    fn poll_nest3d_task_coalesces_live_transforms_and_dirties_scene() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        app.add_sample_part();
+        let id0 = app.job.instances[0].id;
+        let id1 = app.job.instances[1].id;
+        app.scene_dirty = false;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tf_old = [[1.0, 0.0, 0.0, 10.0], [0.0, 1.0, 0.0, 10.0], [0.0, 0.0, 1.0, 0.0]];
+        let tf_new_0 = [[1.0, 0.0, 0.0, 42.0], [0.0, 1.0, 0.0, 18.0], [0.0, 0.0, 1.0, 5.0]];
+        let tf_new_1 = [[1.0, 0.0, 0.0, 88.0], [0.0, 1.0, 0.0, 24.0], [0.0, 0.0, 1.0, 12.0]];
+
+        let mk_prog = |max_z: f32, live: Option<Vec<(nestcraft_core::model::InstanceId, nestcraft_core::model::Transform3x4)>>| {
+            nestcraft_core::nest3d::Nest3dProgress {
+                phase: nestcraft_core::nest3d::Nest3dPhase::Constructive,
+                label: "Constructive".to_owned(),
+                done: 1,
+                total: 2,
+                best_max_z_mm: max_z,
+                best_density_pct: 12.0,
+                best_placed: 2,
+                best_overflow: 0,
+                best_thermal_peak_pct: Some(18.5),
+                generation: 1,
+                elapsed_ms: 15,
+                live_transforms: live,
+            }
+        };
+
+        tx.send(Nest3dMsg::Progress(mk_prog(30.0, Some(vec![(id0, tf_old), (id1, tf_old)]))))
+            .expect("send 1");
+        tx.send(Nest3dMsg::Progress(mk_prog(22.0, Some(vec![(id0, tf_new_0), (id1, tf_new_1)]))))
+            .expect("send 2");
+        tx.send(Nest3dMsg::Progress(mk_prog(22.0, None)))
+            .expect("send 3");
+
+        app.nest3d_task = Some(ActiveNest3dTask {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop_and_apply: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pre_nest_snapshot: app.snapshot(),
+            started_at: std::time::Instant::now(),
+            latest: mk_prog(50.0, None),
+            rx,
+        });
+
+        let ctx = egui::Context::default();
+        app.poll_nest3d_task(&ctx);
+        assert!(app.scene_dirty);
+        assert_eq!(app.job.instances[0].transform, tf_new_0);
+        assert_eq!(app.job.instances[1].transform, tf_new_1);
+        let task = app.nest3d_task.as_ref().expect("still active");
+        assert!((task.latest.best_max_z_mm - 22.0).abs() < 1e-4);
+        assert_eq!(task.latest.best_thermal_peak_pct, Some(18.5));
+        drop(tx);
     }
