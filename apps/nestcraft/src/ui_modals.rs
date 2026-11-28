@@ -23,7 +23,7 @@ impl NestCraftApp {
         let mut reset_now = false;
         let mut new_rgb = None;
 
-        egui::Window::new("Part Color")
+        Container::new(ctx, Surface::Window).window("Part Color")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -119,7 +119,7 @@ impl NestCraftApp {
         let mut reset_default = false;
         let mut cancel = false;
         let slot = self.active_machine_slot.min(MACHINE_SLOT_COUNT - 1);
-        egui::Window::new("Configure Machine Platform")
+        Container::new(ctx, Surface::Window).window("Configure Machine Platform")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -278,7 +278,7 @@ impl NestCraftApp {
         let mut apply = false;
         let mut cancel = false;
 
-        egui::Window::new("Duplicate Parts")
+        Container::new(ctx, Surface::Window).window("Duplicate Parts")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -386,7 +386,7 @@ impl NestCraftApp {
         let mut apply = false;
         let mut cancel = false;
 
-        egui::Window::new("Move Selection")
+        Container::new(ctx, Surface::Window).window("Move Selection")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -477,7 +477,7 @@ impl NestCraftApp {
         let mut undo_scale = false;
         let mut cancel = false;
 
-        egui::Window::new("Scale Part(s)")
+        Container::new(ctx, Surface::Window).window("Scale Part(s)")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -717,7 +717,7 @@ impl NestCraftApp {
         let selected_ids: Vec<InstanceId> = self.selected_set.iter().copied().collect();
         let single_selected = selected_ids.len() == 1;
 
-        egui::Window::new("Create Sinterbox")
+        Container::new(ctx, Surface::Window).window("Create Sinterbox")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -1015,7 +1015,7 @@ impl NestCraftApp {
         let mut do_export = false;
         let mut cancel = false;
 
-        egui::Window::new("Export Individual STLs")
+        Container::new(ctx, Surface::Window).window("Export Individual STLs")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -1135,7 +1135,7 @@ impl NestCraftApp {
         let mut reset_zero = false;
         let mut keep_location = false;
 
-        egui::Window::new("Imported Part(s) Below Z = 0")
+        Container::new(ctx, Surface::Window).window("Imported Part(s) Below Z = 0")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -1182,7 +1182,7 @@ impl NestCraftApp {
         } else {
             0.0
         };
-        egui::Window::new("Loading")
+        Container::new(ctx, Surface::Window).window("Loading")
             .collapsible(false)
             .resizable(false)
             .title_bar(true)
@@ -1221,7 +1221,7 @@ impl NestCraftApp {
                 .ok()
                 .map(|s| s.clone())
                 .unwrap_or_else(|| "Saving...".to_owned());
-            egui::Window::new("Saving Job")
+            Container::new(ctx, Surface::Window).window("Saving Job")
                 .collapsible(false)
                 .resizable(false)
                 .title_bar(true)
@@ -1247,19 +1247,20 @@ impl NestCraftApp {
             if elapsed < ttl {
                 ctx.request_repaint_after(ttl - elapsed);
                 let stroke_color = if *is_error { t.form_error } else { t.accent };
-                egui::Area::new(egui::Id::unique("sls_save_hint"))
+                Container::new(ctx, Surface::Toast)
+                    .area(egui::Id::unique("sls_save_hint"))
                     .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
                     .interactable(false)
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
-                        egui::Frame::NONE
-                            .fill(t.panel)
+                        let frame = Container::new(ctx, Surface::Toast)
+                            .edge_frame(t.panel)
                             .stroke(egui::Stroke::new(1.0, stroke_color))
                             .corner_radius(t.radius_md)
-                            .inner_margin(egui::Margin::symmetric(14, 8))
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(msg).color(t.text).strong());
-                            });
+                            .inner_margin(egui::Margin::symmetric(14, 8));
+                        Container::show_backing(ui, frame, |ui| {
+                            ui.label(egui::RichText::new(msg).color(t.text).strong());
+                        });
                     });
             }
         }
@@ -1288,7 +1289,7 @@ impl NestCraftApp {
         let mut open = true;
         let mut choice: Option<bool> = None;
         let mut cancel = false;
-        egui::Window::new(title)
+        Container::new(ctx, Surface::Window).window(title)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -1337,7 +1338,7 @@ impl NestCraftApp {
         let t = Tokens::get();
 
         if let Some(rep) = &self.report_preview {
-            egui::Window::new("Build Report Generator (Mockup)")
+            Container::new(ctx, Surface::Window).window("Build Report Generator (Mockup)")
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(true)
@@ -1529,7 +1530,7 @@ impl NestCraftApp {
         let max_slider_z = report.job_max_z_mm.max(1.0);
         let reprint_total = report.partial_count + report.not_started_count;
 
-        egui::Window::new("Failed Print Recovery")
+        Container::new(ctx, Surface::Window).window("Failed Print Recovery")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -1586,7 +1587,7 @@ impl NestCraftApp {
                         ui.label(
                             egui::RichText::new(format!("{}", report.completed_count))
                                 .strong()
-                                .color(egui::Color32::from_rgb(0x22, 0xC5, 0x5E)),
+                                .color(t.pref_ok),
                         );
                         ui.label(
                             egui::RichText::new(format!("{}", report.partial_count))
@@ -1596,7 +1597,7 @@ impl NestCraftApp {
                         ui.label(
                             egui::RichText::new(format!("{}", report.not_started_count))
                                 .strong()
-                                .color(egui::Color32::from_rgb(0xF5, 0x9E, 0x0B)),
+                                .color(t.warning),
                         );
                         ui.label(
                             egui::RichText::new(format!("{reprint_total} ({:.2} cm³)", report.reprint_volume_cm3))
@@ -1653,7 +1654,7 @@ impl NestCraftApp {
                                             ui.label("100.0%");
                                             ui.label(
                                                 egui::RichText::new("Completed")
-                                                    .color(egui::Color32::from_rgb(0x22, 0xC5, 0x5E)),
+                                                    .color(t.pref_ok),
                                             );
                                         }
                                         nestcraft_core::recovery::FailedPrintStatus::Partial { pct_printed } => {
@@ -1664,7 +1665,7 @@ impl NestCraftApp {
                                             ui.label("0.0%");
                                             ui.label(
                                                 egui::RichText::new("Not Started (Reprint)")
-                                                    .color(egui::Color32::from_rgb(0xF5, 0x9E, 0x0B)),
+                                                    .color(t.warning),
                                             );
                                         }
                                     }
@@ -1763,7 +1764,7 @@ impl NestCraftApp {
         let mut close_now = false;
         let t = Tokens::get();
 
-        egui::Window::new("2D Auto-Nest Configuration")
+        Container::new(ctx, Surface::Window).window("2D Auto-Nest Configuration")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -2868,7 +2869,7 @@ impl NestCraftApp {
         let total = task.total.load(std::sync::atomic::Ordering::Relaxed).max(1);
         let done = task.completed.load(std::sync::atomic::Ordering::Relaxed).min(total);
         let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
-        egui::Window::new(&task.title)
+        Container::new(ctx, Surface::Window).window(&task.title)
             .collapsible(false)
             .resizable(false)
             .movable(true)

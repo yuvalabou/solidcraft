@@ -152,7 +152,7 @@ impl NestCraftApp {
                                     let vis_label = if group.hidden { "○" } else { "●" };
                                     if ui
                                         .small_button(vis_label)
-                                        .on_hover_text(if group.hidden { "Show group" } else { "Hide group" })
+                                        .backing_on_hover_text(if group.hidden { "Show group" } else { "Hide group" })
                                         .clicked()
                                     {
                                         actions.push(TreeAction::ToggleGroupHidden(group.id, !group.hidden));
@@ -163,7 +163,7 @@ impl NestCraftApp {
                                             .color(if group.hidden { t.form_dim } else { t.form_ink }),
                                     );
                                 });
-                                header_resp.response.context_menu(|ui| {
+                                Container::new(ctx, Surface::Popup).context_menu(&header_resp.response).show(|ui| {
                                     if ui.button("Select Group").clicked() {
                                         actions.push(TreeAction::SelectGroup(group.id));
                                         ui.close();
@@ -235,7 +235,7 @@ impl NestCraftApp {
                                                 actions.push(TreeAction::Select(inst.id));
                                             }
                                         }
-                                        resp.context_menu(|ui| {
+                                        Container::new(ctx, Surface::Popup).context_menu(&resp).show(|ui| {
                                             if ui.button("Duplicate").clicked() {
                                                 actions.push(TreeAction::Duplicate(inst.id));
                                                 ui.close();
@@ -415,7 +415,7 @@ impl NestCraftApp {
                                     .horizontal(|ui| {
                                         if ui
                                             .small_button(if inst.hidden { "○" } else { "●" })
-                                            .on_hover_text(if inst.hidden { "Show" } else { "Hide" })
+                                            .backing_on_hover_text(if inst.hidden { "Show" } else { "Hide" })
                                             .clicked()
                                         {
                                             actions.push(TreeAction::ToggleInstanceHidden(inst.id, !inst.hidden));
@@ -430,7 +430,7 @@ impl NestCraftApp {
                                         ui.selectable_label(is_sel, rich)
                                     })
                                     .inner
-                                    .on_hover_text(&tooltip);
+                                    .backing_on_hover_text(&tooltip);
                                 if resp.clicked() {
                                     let mods = ui.input(|i| i.modifiers);
                                     if mods.shift {
@@ -441,7 +441,7 @@ impl NestCraftApp {
                                         actions.push(TreeAction::Select(inst.id));
                                     }
                                 }
-                                resp.context_menu(|ui| {
+                                Container::new(ctx, Surface::Popup).context_menu(&resp).show(|ui| {
                                     if ui.button("Duplicate").clicked() {
                                         actions.push(TreeAction::Duplicate(inst.id));
                                         ui.close();
@@ -496,7 +496,7 @@ impl NestCraftApp {
                                         ui.close();
                                     }
                                     if !self.job.groups.is_empty() {
-                                        ui.menu_button("Assign to Group", |ui| {
+                                        show_submenu(ui, "Assign to Group", |ui| {
                                             for g in &self.job.groups {
                                                 if ui.button(&g.name).clicked() {
                                                     actions.push(TreeAction::SetInstanceGroup(inst.id, Some(g.id)));
@@ -569,11 +569,11 @@ impl NestCraftApp {
                                 } else {
                                     text = text.color(t.form_ink);
                                 }
-                                if ui.selectable_label(false, text).on_hover_text(&tooltip).clicked() {
+                                if ui.selectable_label(false, text).backing_on_hover_text(&tooltip).clicked() {
                                     toggle_expand = Some(proto.id);
                                 }
                                 if report_info.as_ref().is_some_and(|(_, multi_shell, _)| *multi_shell)
-                                    && ui.small_button("Split").on_hover_text("Split shells into parts").clicked()
+                                    && ui.small_button("Split").backing_on_hover_text("Split shells into parts").clicked()
                                 {
                                     actions.push(TreeAction::SplitShells(proto.id));
                                 }
@@ -616,7 +616,7 @@ impl NestCraftApp {
                                         let row_resp = ui.horizontal(|ui| {
                                             if ui
                                                 .small_button(if inst.hidden { "○" } else { "●" })
-                                                .on_hover_text(if inst.hidden { "Show" } else { "Hide" })
+                                                .backing_on_hover_text(if inst.hidden { "Show" } else { "Hide" })
                                                 .clicked()
                                             {
                                                 actions.push(TreeAction::ToggleInstanceHidden(inst.id, !inst.hidden));
@@ -634,7 +634,7 @@ impl NestCraftApp {
                                                 actions.push(TreeAction::Select(inst.id));
                                             }
                                         }
-                                        resp.context_menu(|ui| {
+                                        Container::new(ctx, Surface::Popup).context_menu(&resp).show(|ui| {
                                             if ui.button("Duplicate").clicked() {
                                                 actions.push(TreeAction::Duplicate(inst.id));
                                                 ui.close();
@@ -681,7 +681,7 @@ impl NestCraftApp {
                                                 }
                                             }
                                             if !self.job.groups.is_empty() {
-                                                ui.menu_button("Assign to Group", |ui| {
+                                                show_submenu(ui, "Assign to Group", |ui| {
                                                     for g in &self.job.groups {
                                                         if ui.button(&g.name).clicked() {
                                                             actions.push(TreeAction::SetInstanceGroup(inst.id, Some(g.id)));

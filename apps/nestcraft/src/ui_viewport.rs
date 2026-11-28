@@ -556,7 +556,7 @@ impl NestCraftApp {
                     .and_then(|id| self.job.instances.iter().find(|i| i.id == id))
                     .is_some_and(|i| i.locked);
 
-                resp.context_menu(|ui| {
+                Container::new(ctx, Surface::Popup).context_menu(&resp).show(|ui| {
                     if ui.button("Move... (M)").clicked() {
                         open_move = true;
                         ui.close();
@@ -613,7 +613,7 @@ impl NestCraftApp {
                         ui.close();
                     }
                     if !self.job.groups.is_empty() {
-                        ui.menu_button("Assign to Group", |ui| {
+                        show_submenu(ui, "Assign to Group", |ui| {
                             for g in &self.job.groups {
                                 if ui.button(&g.name).clicked() {
                                     assign_group = Some(g.id);
@@ -823,11 +823,7 @@ impl NestCraftApp {
 
             if let Some(g) = &gizmo {
                 let p = ui.painter_at(rect);
-                let axis_colors = [
-                    egui::Color32::from_rgb(0xE0, 0x52, 0x52), // X: red
-                    egui::Color32::from_rgb(0x4C, 0xAF, 0x50), // Y: green
-                    egui::Color32::from_rgb(0x4A, 0x90, 0xE2), // Z: blue
-                ];
+                let axis_colors = [t.axis_x, t.axis_y, t.axis_z];
                 let axis_names = ["X", "Y", "Z"];
                 for ring in &g.rings {
                     let color = axis_colors[ring.axis.min(2)];

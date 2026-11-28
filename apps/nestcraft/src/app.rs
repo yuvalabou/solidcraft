@@ -16,6 +16,7 @@ use nestcraft_core::model::{
 use nestcraft_core::sinterbox::{self, CageShape, LabelPanel, SinterboxConfig};
 use serde::{Deserialize, Serialize};
 use solidcraft_theme::Tokens;
+use solidcraft_ui_kit::container::{Container, Surface};
 use solidcraft_ui_kit::view_compass::Drag as CompassDrag;
 use solidcraft_viewport::{Camera, StandardView};
 use solidcraft_viewport_gpu::view::{GpuScene, MovingLayer, SceneSlot, SharedTris};
@@ -650,6 +651,11 @@ pub(crate) enum ColorMenuChoice {
     Set(Option<[u8; 3]>),
 }
 
+pub(crate) fn show_submenu(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui)) {
+    let btn = ui.add(egui::Button::new(format!("{label} ▸")));
+    Container::new(ui.ctx(), Surface::Popup).submenu().show(ui, &btn, body);
+}
+
 pub(crate) fn show_color_submenu(ui: &mut egui::Ui) -> Option<ColorMenuChoice> {
     const PRESETS: &[(&str, [u8; 3])] = &[
         ("Red", [224, 72, 72]),
@@ -662,7 +668,7 @@ pub(crate) fn show_color_submenu(ui: &mut egui::Ui) -> Option<ColorMenuChoice> {
         ("White", [232, 234, 238]),
     ];
     let mut choice = None;
-    ui.menu_button("Color", |ui| {
+    show_submenu(ui, "Color", |ui| {
         if ui.button("Color Picker...").clicked() {
             choice = Some(ColorMenuChoice::OpenPicker);
             ui.close();
