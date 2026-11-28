@@ -85,19 +85,22 @@ impl FeatureKind {
             | FeatureKind::SurfaceOffset { .. }
             | FeatureKind::SurfaceMidsurface { .. }
             | FeatureKind::SurfaceMatch { .. }
-            | FeatureKind::SurfaceFair { .. } => &["faces"],
+            | FeatureKind::SurfaceFair { .. }
+            | FeatureKind::SurfaceMorph { .. } => &["faces"],
             FeatureKind::SplitFace { .. } => &["faces", "tool"],
             FeatureKind::Split { .. } => &["tool", "tool_faces"],
             FeatureKind::SurfaceTrim { .. } => &["tool"],
+            FeatureKind::SurfaceFillet { .. } | FeatureKind::SurfaceChamfer { .. } => &["a", "b"],
             FeatureKind::Hole { .. } => &["position", "to"],
             FeatureKind::Boss { .. } | FeatureKind::SnapFit { .. } | FeatureKind::Rest { .. } => &["position"],
             FeatureKind::Thread { .. } => &["face", "up_to"],
+            FeatureKind::ShaftSpline { .. } => &["shaft", "shaft_start", "bore", "bore_start"],
             FeatureKind::SheetConvert { .. } | FeatureKind::Lip { .. } | FeatureKind::SurfaceUntrim { .. } | FeatureKind::SurfaceRuled { .. } => {
                 &["face"]
             }
-            FeatureKind::Emboss { .. } | FeatureKind::Dome { .. } => &["face"],
+            FeatureKind::Emboss { .. } | FeatureKind::Dome { .. } | FeatureKind::TransformFace { .. } => &["face"],
             FeatureKind::Revolve { .. } => &["to"],
-            FeatureKind::Extrude { .. } | FeatureKind::SurfaceExtrude { .. } => &["extent.to", "extent.from"],
+            FeatureKind::Extrude { .. } | FeatureKind::SurfaceExtrude { .. } => &["extent.to", "extent.from", "extent.to2"],
             FeatureKind::SurfaceExtend { .. } => &["up_to"],
             _ => &[],
         }
@@ -112,6 +115,7 @@ impl FeatureKind {
             FeatureKind::Shell { body, .. }
             | FeatureKind::Dome { body, .. }
             | FeatureKind::Draft { body, .. }
+            | FeatureKind::Dogbone { body, .. }
             | FeatureKind::SplitFace { body, .. }
             | FeatureKind::OffsetFace { body, .. }
             | FeatureKind::DeleteFace { body, .. }
@@ -122,13 +126,23 @@ impl FeatureKind {
             | FeatureKind::Lip { body, .. }
             | FeatureKind::SnapFit { body, .. }
             | FeatureKind::Rest { body, .. } => body.as_deref(),
-            FeatureKind::SheetConvert { body, .. }
+            FeatureKind::TransformFace { body, .. }
+            | FeatureKind::SheetConvert { body, .. }
             | FeatureKind::SheetSurfaceConvert { body, .. }
             | FeatureKind::SheetRecognize { body, .. }
             | FeatureKind::SurfaceRuled { body, .. } => Some(body.as_ref()),
             FeatureKind::SurfaceUntrim { face, .. } | FeatureKind::Split { tool: Some(face), .. } => Some(face.body.as_ref()),
             _ => None,
         }
+    }
+
+    /// Whether face point `slot` of a Shaft Spline, in the order the geometry walk gives its points, is a face
+    /// the teeth start from (`shaft_start`, `bore_start`). Such a face only says which end of the round face the
+    /// teeth start at, and the point saved for it says so as well.
+    pub fn spline_start_slot(&self, slot: usize) -> bool {
+        let FeatureKind::ShaftSpline { shaft, shaft_start, bore, bore_start, .. } = self else { return false };
+        let points = [(shaft.is_some(), false), (shaft_start.is_some(), true), (bore.is_some(), false), (bore_start.is_some(), true)];
+        points.into_iter().filter(|(given, _)| *given).nth(slot).is_some_and(|(_, start)| start)
     }
 
     /// The recorded body for a Thread target face slot; its optional Up To face has no target body.
@@ -140,6 +154,20 @@ impl FeatureKind {
         }
         let index = if slot == 0 { 0 } else { slot.checked_sub(usize::from(has_up_to))? };
         target_bodies.get(index).map(AsRef::as_ref)
+    }
+
+    /// The body a face point slot picks a face of, when each slot names its own body: a Thread's
+    /// target faces, and the `a` and `b` faces of Surface Fillet and Surface Chamfer. The point is
+    /// named, and found again, on that body only.
+    pub fn face_slot_body(&self, slot: usize) -> Option<&str> {
+        match self {
+            FeatureKind::SurfaceFillet { a, b, .. } | FeatureKind::SurfaceChamfer { a, b, .. } => match slot {
+                0 => Some(a.body.0.as_str()),
+                1 => Some(b.body.0.as_str()),
+                _ => None,
+            },
+            _ => self.thread_target_body(slot),
+        }
     }
 
     /// The feature's profile selections, each with its sketch.

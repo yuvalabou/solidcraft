@@ -744,7 +744,7 @@ impl NestCraftApp {
             self.sync_scene_if_dirty();
 
             let painter = ui.painter_at(rect);
-            paint_background(&painter, rect, t.viewport_top, t.viewport_bottom);
+            paint_background(&painter, rect, t.viewport_top, t.viewport_middle, t.viewport_bottom);
 
             let ppp = ctx.pixels_per_point();
             let size_px = [(rect.width() * ppp).max(1.0), (rect.height() * ppp).max(1.0)];

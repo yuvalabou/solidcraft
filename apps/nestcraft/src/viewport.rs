@@ -549,6 +549,7 @@ pub fn default_camera_with_origin(machine: &MachineProfile, origin: BedOrigin) -
         distance: f64::from(diag) * 1.15,
         fov: 0.65,
         up: UpAxis::Z,
+        frame: None,
     }
 }
 
@@ -1386,6 +1387,7 @@ mod tests {
             distance: 100.0,
             fov: 0.5,
             up: UpAxis::Z,
+            frame: None,
         };
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         assert_eq!(pick_instance(&job, &cam, rect, rect.center()), None);
