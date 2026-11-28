@@ -1,6 +1,6 @@
 //! Pure-mesh 3MF reader and writer (including Production Extension `p:path` build items).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
@@ -12,6 +12,9 @@ use zip::{ZipArchive, ZipWriter};
 
 use crate::model::{BuildJob, IDENTITY_TRANSFORM, MachineProfile, Transform3x4, TriMesh};
 use crate::{NestCraftError, Result};
+
+const MAX_3MF_XML_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_3MF_COMPONENT_DEPTH: usize = 64;
 
 /// One object + placement extracted from a 3MF archive.
 #[derive(Debug, Clone)]
@@ -36,16 +39,15 @@ pub fn read_threemf(bytes: &[u8]) -> Result<Vec<ThreeMfLoadedItem>> {
     model_cache.insert(normalize_part_path(&root_path), root_model.clone());
 
     let mut items = Vec::new();
+    let mut active = HashSet::new();
     for build_item in &root_model.build_items {
         let model_key = build_item
             .path
             .as_deref()
             .map(normalize_part_path)
             .unwrap_or_else(|| normalize_part_path(&root_path));
-        if !model_cache.contains_key(&model_key) {
-            let xml = read_zip_text(&mut archive, &model_key)?;
-            let parsed = parse_model_xml(&xml)?;
-            model_cache.insert(model_key.clone(), parsed);
+        if !cache_contains_and_load(&model_key, &mut archive, &mut model_cache)? {
+            // loaded into cache
         }
         if let Some(model) = model_cache.get(&model_key).cloned() {
             collect_object_meshes(
@@ -55,6 +57,8 @@ pub fn read_threemf(bytes: &[u8]) -> Result<Vec<ThreeMfLoadedItem>> {
                 build_item.transform,
                 &mut archive,
                 &mut model_cache,
+                &mut active,
+                0,
                 &mut items,
             )?;
         }
@@ -145,6 +149,21 @@ struct BuildItem {
     transform: Transform3x4,
 }
 
+fn cache_contains_and_load(
+    path: &str,
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    cache: &mut HashMap<String, ParsedModel>,
+) -> Result<bool> {
+    if cache.contains_key(path) {
+        return Ok(true);
+    }
+    let xml = read_zip_text(archive, path)?;
+    let parsed = parse_model_xml(&xml)?;
+    cache.insert(path.to_owned(), parsed);
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_object_meshes(
     model: &ParsedModel,
     current_path: &str,
@@ -152,43 +171,59 @@ fn collect_object_meshes(
     parent_xform: Transform3x4,
     archive: &mut ZipArchive<Cursor<&[u8]>>,
     cache: &mut HashMap<String, ParsedModel>,
+    active: &mut HashSet<(String, u32)>,
+    depth: usize,
     out: &mut Vec<ThreeMfLoadedItem>,
 ) -> Result<()> {
-    let Some(obj) = model.objects.get(&object_id) else {
-        return Ok(());
-    };
-    if let Some(mesh) = &obj.mesh {
-        out.push(ThreeMfLoadedItem {
-            name: obj.name.clone(),
-            mesh: mesh.clone(),
-            transform: parent_xform,
-        });
+    if depth > MAX_3MF_COMPONENT_DEPTH {
+        return Err(NestCraftError::InvalidInput(format!(
+            "3MF component nesting exceeds max depth ({MAX_3MF_COMPONENT_DEPTH})"
+        )));
     }
-    for comp in &obj.components {
-        let target_path = comp
-            .path
-            .as_deref()
-            .map(normalize_part_path)
-            .unwrap_or_else(|| current_path.to_owned());
-        if !cache.contains_key(&target_path) {
-            let xml = read_zip_text(archive, &target_path)?;
-            let parsed = parse_model_xml(&xml)?;
-            cache.insert(target_path.clone(), parsed);
-        }
-        let child_xform = mul_3x4(&parent_xform, &comp.transform);
-        if let Some(target_model) = cache.get(&target_path).cloned() {
-            collect_object_meshes(
-                &target_model,
-                &target_path,
-                comp.object_id,
-                child_xform,
-                archive,
-                cache,
-                out,
-            )?;
-        }
+    let key = (normalize_part_path(current_path), object_id);
+    if !active.insert(key.clone()) {
+        return Err(NestCraftError::InvalidInput(format!(
+            "cyclic 3MF component reference on object {object_id} in '{}'",
+            key.0
+        )));
     }
-    Ok(())
+    let res = (|| -> Result<()> {
+        let Some(obj) = model.objects.get(&object_id) else {
+            return Ok(());
+        };
+        if let Some(mesh) = &obj.mesh {
+            out.push(ThreeMfLoadedItem {
+                name: obj.name.clone(),
+                mesh: mesh.clone(),
+                transform: parent_xform,
+            });
+        }
+        for comp in &obj.components {
+            let target_path = comp
+                .path
+                .as_deref()
+                .map(normalize_part_path)
+                .unwrap_or_else(|| current_path.to_owned());
+            let _ = cache_contains_and_load(&target_path, archive, cache)?;
+            let child_xform = mul_3x4(&parent_xform, &comp.transform);
+            if let Some(target_model) = cache.get(&target_path).cloned() {
+                collect_object_meshes(
+                    &target_model,
+                    &target_path,
+                    comp.object_id,
+                    child_xform,
+                    archive,
+                    cache,
+                    active,
+                    depth + 1,
+                    out,
+                )?;
+            }
+        }
+        Ok(())
+    })();
+    active.remove(&key);
+    res
 }
 
 fn find_root_model_path(archive: &mut ZipArchive<Cursor<&[u8]>>) -> Result<String> {
@@ -216,13 +251,20 @@ fn normalize_part_path(path: &str) -> String {
 
 fn read_zip_text(archive: &mut ZipArchive<Cursor<&[u8]>>, path: &str) -> Result<String> {
     let norm = normalize_part_path(path);
-    let mut file = archive
+    let file = archive
         .by_name(&norm)
         .map_err(|e| NestCraftError::InvalidInput(format!("missing 3MF part '{norm}': {e}")))?;
-    let mut s = String::new();
-    file.read_to_string(&mut s)
+    let mut buf = Vec::new();
+    file.take(MAX_3MF_XML_BYTES + 1)
+        .read_to_end(&mut buf)
         .map_err(|e| NestCraftError::InvalidInput(format!("unreadable 3MF part '{norm}': {e}")))?;
-    Ok(s)
+    if (buf.len() as u64) > MAX_3MF_XML_BYTES {
+        return Err(NestCraftError::InvalidInput(format!(
+            "3MF part '{norm}' exceeds size limit ({MAX_3MF_XML_BYTES} bytes)"
+        )));
+    }
+    String::from_utf8(buf)
+        .map_err(|e| NestCraftError::InvalidInput(format!("3MF part '{norm}' is not valid UTF-8: {e}")))
 }
 
 fn parse_model_xml(xml: &str) -> Result<ParsedModel> {
@@ -304,11 +346,10 @@ fn parse_model_xml(xml: &str) -> Result<ParsedModel> {
                                 b"objectid" => oid = std::str::from_utf8(&attr.value).ok().and_then(|s| s.parse().ok()),
                                 b"path" => path = std::str::from_utf8(&attr.value).ok().map(str::to_owned),
                                 b"transform" => {
-                                    if let Ok(s) = std::str::from_utf8(&attr.value)
-                                        && let Ok(t) = parse_threemf_transform(s)
-                                    {
-                                        transform = t;
-                                    }
+                                    let s = std::str::from_utf8(&attr.value).map_err(|_| {
+                                        NestCraftError::InvalidInput("3MF transform attribute is not valid UTF-8".to_owned())
+                                    })?;
+                                    transform = parse_threemf_transform(s)?;
                                 }
                                 _ => {}
                             }
@@ -326,11 +367,10 @@ fn parse_model_xml(xml: &str) -> Result<ParsedModel> {
                                 b"objectid" => oid = std::str::from_utf8(&attr.value).ok().and_then(|s| s.parse().ok()),
                                 b"path" => path = std::str::from_utf8(&attr.value).ok().map(str::to_owned),
                                 b"transform" => {
-                                    if let Ok(s) = std::str::from_utf8(&attr.value)
-                                        && let Ok(t) = parse_threemf_transform(s)
-                                    {
-                                        transform = t;
-                                    }
+                                    let s = std::str::from_utf8(&attr.value).map_err(|_| {
+                                        NestCraftError::InvalidInput("3MF transform attribute is not valid UTF-8".to_owned())
+                                    })?;
+                                    transform = parse_threemf_transform(s)?;
                                 }
                                 _ => {}
                             }
@@ -500,5 +540,64 @@ mod tests {
     #[test]
     fn rejects_invalid_3mf_zip() {
         assert!(read_threemf(b"not a zip").is_err());
+    }
+
+    fn zip_single_model(model_xml: &str) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut buf);
+            let opts = SimpleFileOptions::default();
+            zip.start_file("3D/3dmodel.model", opts).expect("start model");
+            zip.write_all(model_xml.as_bytes()).expect("write model");
+            zip.finish().expect("finish zip");
+        }
+        buf.into_inner()
+    }
+
+    #[test]
+    fn rejects_cyclic_3mf_components() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+  <resources>
+    <object id="1" type="model"><components><component objectid="2"/></components></object>
+    <object id="2" type="model"><components><component objectid="1"/></components></object>
+  </resources>
+  <build><item objectid="1"/></build>
+</model>"#;
+        let bytes = zip_single_model(xml);
+        let err = read_threemf(&bytes).expect_err("cyclic 3MF must be rejected");
+        assert!(err.to_string().contains("cyclic"));
+    }
+
+    #[test]
+    fn allows_shared_dag_3mf_components() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+  <resources>
+    <object id="2" name="leaf" type="model">
+      <mesh>
+        <vertices>
+          <vertex x="0" y="0" z="0"/><vertex x="10" y="0" z="0"/>
+          <vertex x="0" y="10" z="0"/><vertex x="0" y="0" z="10"/>
+        </vertices>
+        <triangles>
+          <triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="1" v3="3"/>
+          <triangle v1="1" v2="2" v3="3"/><triangle v1="2" v2="0" v3="3"/>
+        </triangles>
+      </mesh>
+    </object>
+    <object id="1" type="model">
+      <components>
+        <component objectid="2" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>
+        <component objectid="2" transform="1 0 0 0 1 0 0 0 1 20 0 0"/>
+      </components>
+    </object>
+  </resources>
+  <build><item objectid="1"/></build>
+</model>"#;
+        let bytes = zip_single_model(xml);
+        let items = read_threemf(&bytes).expect("shared DAG components should succeed");
+        assert_eq!(items.len(), 2);
+        assert!((items[1].transform[0][3] - 20.0).abs() < 1e-4);
     }
 }

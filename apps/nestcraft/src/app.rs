@@ -1754,8 +1754,14 @@ impl NestCraftApp {
         self.selection_anchor = snap.selection_anchor;
         self.euler_edit.clear();
         self.drag_state = None;
+        self.rotate_drag = None;
+        self.rotate_gizmo_open = false;
         self.drag_zone = None;
+        self.box_select = None;
+        self.zoom_rect = None;
+        self.zoom_rect_mode = false;
         self.moving_target = None;
+        self.color_picker_undo_pushed = false;
         self.clear_align_face_mode();
         self.below_zero_import_dialog.clear();
         self.mark_dirty();
@@ -2093,6 +2099,10 @@ impl NestCraftApp {
             || self.nest3d_dialog_open
             || self.gravity_settle_dialog_open
             || !self.below_zero_import_dialog.is_empty()
+            || self.pending_keep_delete.is_some()
+            || self.load_task.is_some()
+            || self.save_task.is_some()
+            || self.calc_task.is_some()
         {
             return;
         }
@@ -2698,9 +2708,6 @@ impl NestCraftApp {
         if let Some(msg) = finished {
             match msg {
                 Nest3dMsg::Finished { job, result } => {
-                    if self.undo_stack.len() >= 40 {
-                        self.undo_stack.remove(0);
-                    }
                     self.undo_stack.push(task.pre_nest_snapshot);
                     self.redo_stack.clear();
                     self.job = *job;
@@ -2726,9 +2733,6 @@ impl NestCraftApp {
                     self.nest3d_last_result = Some(result);
                 }
                 Nest3dMsg::SettleFinished { job, result } => {
-                    if self.undo_stack.len() >= 40 {
-                        self.undo_stack.remove(0);
-                    }
                     self.undo_stack.push(task.pre_nest_snapshot);
                     self.redo_stack.clear();
                     self.job = *job;

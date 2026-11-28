@@ -22,6 +22,8 @@ use crate::{NestCraftError, Result};
 
 const PROJECT_ENTRY: &str = "project.json";
 const NESTC_FORMAT_VERSION: u32 = 2;
+const MAX_NESTC_JSON_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_NESTC_MESH_BYTES: u64 = 256 * 1024 * 1024;
 
 const NMESH_MAGIC: [u8; 4] = *b"NME1";
 const NMESH_VERSION: u16 = 1;
@@ -688,6 +690,20 @@ fn write_zip_entry_chunked(
     Ok(())
 }
 
+fn read_zip_entry_capped<R: Read>(reader: R, max_bytes: u64, label: &str) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    reader
+        .take(max_bytes + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| NestCraftError::InvalidInput(format!("failed to read {label}: {e}")))?;
+    if (buf.len() as u64) > max_bytes {
+        return Err(NestCraftError::InvalidInput(format!(
+            "{label} exceeds size limit ({max_bytes} bytes)"
+        )));
+    }
+    Ok(buf)
+}
+
 /// Deserialize a `.nestc` project archive (v1 inline JSON or v2 hybrid binary) into a [`BuildJob`].
 pub fn read_nestc(bytes: &[u8]) -> Result<BuildJob> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))
@@ -695,10 +711,7 @@ pub fn read_nestc(bytes: &[u8]) -> Result<BuildJob> {
     let mut entry = archive
         .by_name(PROJECT_ENTRY)
         .map_err(|e| NestCraftError::InvalidInput(format!("missing {PROJECT_ENTRY} in .nestc: {e}")))?;
-    let mut json = Vec::new();
-    entry
-        .read_to_end(&mut json)
-        .map_err(|e| NestCraftError::InvalidInput(format!("failed to read .nestc payload: {e}")))?;
+    let json = read_zip_entry_capped(&mut entry, MAX_NESTC_JSON_BYTES, ".nestc project payload")?;
     drop(entry);
 
     let project: NestcProject = serde_json::from_slice(&json)
@@ -708,6 +721,16 @@ pub fn read_nestc(bytes: &[u8]) -> Result<BuildJob> {
             "unsupported .nestc version {}",
             project.version
         )));
+    }
+    if !project.clearance_mm.is_finite()
+        || project.clearance_mm < 0.0
+        || !project.wall_margin_mm.is_finite()
+        || project.wall_margin_mm < 0.0
+        || !project.min_z_mm.is_finite()
+    {
+        return Err(NestCraftError::InvalidInput(
+            "invalid non-finite or negative chamber parameter in .nestc".to_owned(),
+        ));
     }
 
     let mut unique_refs_set: HashSet<String> = HashSet::new();
@@ -729,7 +752,14 @@ pub fn read_nestc(bytes: &[u8]) -> Result<BuildJob> {
     let machine = match project.machine {
         NestcMachine::FormigaP110 => MachineProfile::FormigaP110,
         NestcMachine::FarsoonHT403P => MachineProfile::FarsoonHT403P,
-        NestcMachine::Custom { name, size_mm } => MachineProfile::custom(name, size_mm),
+        NestcMachine::Custom { name, size_mm } => {
+            if !size_mm.iter().all(|v| v.is_finite() && *v > 0.0) {
+                return Err(NestCraftError::InvalidInput(
+                    "invalid custom machine dimensions in .nestc".to_owned(),
+                ));
+            }
+            MachineProfile::custom(name, size_mm)
+        }
     };
     let mut job = BuildJob::new(machine);
     job.clearance_mm = project.clearance_mm;
@@ -742,6 +772,7 @@ pub fn read_nestc(bytes: &[u8]) -> Result<BuildJob> {
     job.material_id = project.material_id;
 
     let mut max_part_id = 0_u32;
+    let mut part_ids = HashSet::with_capacity(project.parts.len());
     for p in project.parts {
         max_part_id = max_part_id.max(p.id);
         let mesh = match p.mesh_ref {
@@ -751,8 +782,10 @@ pub fn read_nestc(bytes: &[u8]) -> Result<BuildJob> {
                 .ok_or_else(|| NestCraftError::InvalidInput(format!("missing decoded mesh '{path}'")))?,
             None => Arc::new(TriMesh::from_indexed(p.positions, p.indices)?),
         };
+        let pid = PartId(p.id);
+        part_ids.insert(pid);
         job.parts.push(PartPrototype {
-            id: PartId(p.id),
+            id: pid,
             name: p.name,
             mesh,
             default_constraint: from_nestc_constraint(p.default_constraint),
@@ -760,10 +793,13 @@ pub fn read_nestc(bytes: &[u8]) -> Result<BuildJob> {
     }
 
     let mut max_group_id = 0_u32;
+    let mut group_ids = HashSet::with_capacity(project.groups.len());
     for g in project.groups {
         max_group_id = max_group_id.max(g.id);
+        let gid = GroupId(g.id);
+        group_ids.insert(gid);
         job.groups.push(PartGroup {
-            id: GroupId(g.id),
+            id: gid,
             name: g.name,
             hidden: g.hidden,
         });
@@ -772,20 +808,42 @@ pub fn read_nestc(bytes: &[u8]) -> Result<BuildJob> {
     let mut max_inst_id = 0_u32;
     for i in project.instances {
         max_inst_id = max_inst_id.max(i.id);
+        let pid = PartId(i.part_id);
+        if !part_ids.contains(&pid) {
+            return Err(NestCraftError::InvalidInput(format!(
+                "instance {} references unknown part {}",
+                i.id, i.part_id
+            )));
+        }
+        if !i.transform.iter().flat_map(|row| row.iter()).all(|v| v.is_finite()) {
+            return Err(NestCraftError::InvalidInput(format!(
+                "instance {} has non-finite transform in .nestc",
+                i.id
+            )));
+        }
         job.instances.push(PartInstance {
             id: InstanceId(i.id),
-            part_id: PartId(i.part_id),
+            part_id: pid,
             transform: i.transform,
             constraint: from_nestc_constraint(i.constraint),
             locked: i.locked,
             hidden: i.hidden,
             transparent: i.transparent,
             color: i.color,
-            group_id: i.group_id.map(GroupId),
+            group_id: i.group_id.map(GroupId).filter(|gid| group_ids.contains(gid)),
         });
     }
 
     if let Some(z) = project.no_build_zone {
+        if !z.position.iter().all(|v| v.is_finite())
+            || !z.rotation_deg.iter().all(|v| v.is_finite())
+            || !z.clearance_mm.is_finite()
+            || z.clearance_mm < 0.0
+        {
+            return Err(NestCraftError::InvalidInput(
+                "invalid no-build zone parameters in .nestc".to_owned(),
+            ));
+        }
         let mesh = match z.mesh_ref {
             Some(ref path) => decoded_meshes
                 .get(path)
@@ -815,10 +873,7 @@ fn read_and_decode_mesh_entry(archive: &mut ZipArchive<Cursor<&[u8]>>, path: &st
     let mut entry = archive
         .by_name(path)
         .map_err(|e| NestCraftError::InvalidInput(format!("missing mesh entry '{path}' in .nestc: {e}")))?;
-    let mut buf = Vec::new();
-    entry
-        .read_to_end(&mut buf)
-        .map_err(|e| NestCraftError::InvalidInput(format!("failed to read mesh entry '{path}': {e}")))?;
+    let buf = read_zip_entry_capped(&mut entry, MAX_NESTC_MESH_BYTES, &format!("mesh entry '{path}'"))?;
     Ok(Arc::new(decode_nmesh(&buf)?))
 }
 
@@ -1327,5 +1382,78 @@ mod tests {
             assert!(meshes_bit_equal(&orig.mesh, &b.mesh));
             assert!(meshes_bit_equal(&orig.mesh, &c.mesh));
         }
+    }
+
+    fn zip_project_json(json: &str) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut buf);
+            let opts = SimpleFileOptions::default();
+            zip.start_file(PROJECT_ENTRY, opts).expect("start project.json");
+            zip.write_all(json.as_bytes()).expect("write project.json");
+            zip.finish().expect("finish zip");
+        }
+        buf.into_inner()
+    }
+
+    #[test]
+    fn rejects_hostile_nestc_nan_and_dangling_refs() {
+        // Non-finite chamber parameter (JSON null or huge? serde deserializes null/str as error,
+        // so test negative clearance and dangling part_id via valid JSON).
+        let bad_clearance = r#"{
+            "version": 2,
+            "machine": "FormigaP110",
+            "clearance_mm": -1.0,
+            "wall_margin_mm": 5.0,
+            "min_z_mm": 0.0,
+            "bed_origin": "FrontLeft",
+            "material_id": "pa2200",
+            "parts": [],
+            "groups": [],
+            "instances": [],
+            "no_build_zone": null
+        }"#;
+        assert!(read_nestc(&zip_project_json(bad_clearance)).is_err());
+
+        let dangling_part = r#"{
+            "version": 2,
+            "machine": "FormigaP110",
+            "clearance_mm": 2.5,
+            "wall_margin_mm": 5.0,
+            "min_z_mm": 0.0,
+            "bed_origin": "FrontLeft",
+            "material_id": "pa2200",
+            "parts": [],
+            "groups": [],
+            "instances": [{
+                "id": 1,
+                "part_id": 999,
+                "transform": [[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0]],
+                "constraint": "Free",
+                "locked": false,
+                "hidden": false,
+                "transparent": false,
+                "color": null,
+                "group_id": null
+            }],
+            "no_build_zone": null
+        }"#;
+        let err = read_nestc(&zip_project_json(dangling_part)).expect_err("dangling part_id must fail");
+        assert!(err.to_string().contains("unknown part"));
+
+        let bad_machine = r#"{
+            "version": 2,
+            "machine": {"Custom": {"name": "Zero", "size_mm": [0.0, 200.0, 200.0]}},
+            "clearance_mm": 2.5,
+            "wall_margin_mm": 5.0,
+            "min_z_mm": 0.0,
+            "bed_origin": "FrontLeft",
+            "material_id": "pa2200",
+            "parts": [],
+            "groups": [],
+            "instances": [],
+            "no_build_zone": null
+        }"#;
+        assert!(read_nestc(&zip_project_json(bad_machine)).is_err());
     }
 }

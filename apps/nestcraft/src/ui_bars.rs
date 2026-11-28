@@ -399,7 +399,7 @@ impl NestCraftApp {
                                     self.open_duplicate_dialog();
                                 }
                                 if icon_label_button(ui, "Drop Z=0", "sls_orient_lock", self.selected.is_some(), false)
-                                    .backing_on_hover_text("Drop selected part to the build floor (Z)")
+                                    .backing_on_hover_text("Drop selected part to the build floor (Ctrl+Down)")
                                     .clicked()
                                     && let Some(sel) = self.selected
                                     && self.job.drop_instance_to_floor(sel)

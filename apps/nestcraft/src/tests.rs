@@ -1452,3 +1452,38 @@ use solidcraft_viewport::StandardView;
         assert_eq!(task.latest.best_thermal_peak_pct, Some(18.5));
         drop(tx);
     }
+
+    #[test]
+    fn undo_clears_transient_interaction_and_modal_flags() {
+        let mut app = NestCraftApp::new();
+        app.add_sample_part();
+        let iid = app.selected.expect("selected");
+        app.nudge_selected([5.0, 0.0, 0.0]);
+
+        app.rotate_gizmo_open = true;
+        app.rotate_drag = Some(RotateDragState {
+            pivot: [0.0; 3],
+            pivot_screen: egui::pos2(10.0, 10.0),
+            axis: 2,
+            angle_rad: 0.5,
+            prev_pos: egui::pos2(20.0, 10.0),
+            edge_tangent: egui::vec2(0.0, 1.0),
+            instances: vec![(iid, IDENTITY_TRANSFORM)],
+        });
+        app.box_select = Some(BoxSelectState {
+            start: egui::pos2(0.0, 0.0),
+            current: egui::pos2(50.0, 50.0),
+            additive: false,
+        });
+        app.zoom_rect = Some((egui::pos2(0.0, 0.0), egui::pos2(50.0, 50.0)));
+        app.zoom_rect_mode = true;
+        app.color_picker_undo_pushed = true;
+
+        assert!(app.undo());
+        assert!(app.rotate_drag.is_none());
+        assert!(!app.rotate_gizmo_open);
+        assert!(app.box_select.is_none());
+        assert!(app.zoom_rect.is_none());
+        assert!(!app.zoom_rect_mode);
+        assert!(!app.color_picker_undo_pushed);
+    }

@@ -2884,9 +2884,11 @@ impl NestCraftApp {
 fn open_file_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", ""])
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("explorer")
             .arg(path)
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn()?;
         Ok(())
     }

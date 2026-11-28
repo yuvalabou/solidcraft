@@ -4,6 +4,11 @@ use std::sync::Arc;
 
 use crate::{NestCraftError, Result};
 
+/// Clamp `v` into `[lo, hi]`, returning `default` if `v` is non-finite (`NaN` or `±inf`).
+pub(crate) fn clamp_finite(v: f32, default: f32, lo: f32, hi: f32) -> f32 {
+    if v.is_finite() { v.clamp(lo, hi) } else { default }
+}
+
 /// Axis-aligned bounding box `[min, max]` in millimetres.
 pub type Aabb = [[f32; 3]; 2];
 
@@ -108,9 +113,9 @@ impl MachineProfile {
             trimmed.to_owned()
         };
         let clamped = [
-            size_mm[0].clamp(10.0, 2000.0),
-            size_mm[1].clamp(10.0, 2000.0),
-            size_mm[2].clamp(10.0, 2000.0),
+            clamp_finite(size_mm[0], 200.0, 10.0, 2000.0),
+            clamp_finite(size_mm[1], 200.0, 10.0, 2000.0),
+            clamp_finite(size_mm[2], 200.0, 10.0, 2000.0),
         ];
         Self::Custom {
             name: clean_name,
@@ -1960,5 +1965,13 @@ mod tests {
             &job.part(p1).expect("p1").mesh,
             &job.part(p2).expect("p2").mesh
         ));
+    }
+
+    #[test]
+    fn custom_machine_sanitizes_nan_and_infinite_dimensions() {
+        let m = MachineProfile::custom("bad", [f32::NAN, f32::INFINITY, -5.0]);
+        let sz = m.size_mm();
+        assert!(sz.iter().all(|v| v.is_finite()));
+        assert_eq!(sz, [200.0, 200.0, 10.0]);
     }
 }

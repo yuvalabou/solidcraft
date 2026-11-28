@@ -16,7 +16,7 @@ use crate::collision;
 use crate::interlock::{InterlockConfig, VoxelAabb, can_part_escape_tray, tight_solid_bounds};
 use crate::model::{
     Aabb, BuildJob, InstanceId, PartId, PartInstance, RotationConstraint, Transform3x4, TriMesh,
-    aabbs_overlap, point_inside_mesh_x_ray, transform_point,
+    aabbs_overlap, clamp_finite, point_inside_mesh_x_ray, transform_point,
 };
 use crate::voxel::{
     BitGrid3D, CpuBudget, EdtScratch, HeightMap2D, MemoryEstimate, MeshBvh,
@@ -207,11 +207,11 @@ impl Nest3dConfig {
     /// Effective Z ceiling inside the machine envelope, clamped to `[min_z + 1.0, machine_z - wall_margin]`.
     pub fn effective_max_z(&self, job: &BuildJob) -> f32 {
         let [_, _, wz] = job.machine.size_mm();
-        let wm = self.wall_margin_mm.max(0.0);
-        let min_z = self.min_z_mm.max(0.0);
+        let wm = clamp_finite(self.wall_margin_mm, 0.0, 0.0, 500.0);
+        let min_z = clamp_finite(self.min_z_mm, 0.0, 0.0, 2000.0);
         let ceiling = (wz - wm).max(min_z + 1.0);
         match self.max_z_limit_mm {
-            Some(cap) => cap.clamp(min_z + 1.0, ceiling),
+            Some(cap) => clamp_finite(cap, ceiling, min_z + 1.0, ceiling),
             None => ceiling,
         }
     }
@@ -366,10 +366,10 @@ fn estimate_geometry_inputs(
     cfg: &Nest3dConfig,
     movable_indices: &[usize],
 ) -> ([f32; 3], [usize; 3], Vec<([f32; 3], usize)>, f32, usize) {
-    let pitch = cfg.resolution_mm.clamp(0.5, 4.0);
+    let pitch = clamp_finite(cfg.resolution_mm, 1.5, 0.5, 4.0);
     let ([bx0, by0], [bx1, by1]) = job.bed_xy_bounds();
-    let wm = cfg.wall_margin_mm.max(0.0);
-    let min_z = cfg.min_z_mm.max(0.0);
+    let wm = clamp_finite(cfg.wall_margin_mm, 0.0, 0.0, 500.0);
+    let min_z = clamp_finite(cfg.min_z_mm, 0.0, 0.0, 2000.0);
     let max_z = cfg.effective_max_z(job);
     let span = [
         ((bx1 - bx0) - 2.0 * wm).max(pitch),
@@ -2255,10 +2255,10 @@ pub fn nest_3d_with_callbacks(
         )));
     }
 
-    let pitch = cfg.resolution_mm.clamp(0.5, 4.0);
+    let pitch = clamp_finite(cfg.resolution_mm, 1.5, 0.5, 4.0);
     let ([bx0, by0], [bx1, by1]) = job.bed_xy_bounds();
-    let wm = cfg.wall_margin_mm.max(0.0);
-    let min_z = cfg.min_z_mm.max(0.0);
+    let wm = clamp_finite(cfg.wall_margin_mm, 0.0, 0.0, 500.0);
+    let min_z = clamp_finite(cfg.min_z_mm, 0.0, 0.0, 2000.0);
     let max_z_limit = cfg.effective_max_z(job);
     let tray_min = [bx0 + wm, by0 + wm, min_z];
     let tray_max = [
@@ -3068,7 +3068,7 @@ pub fn nest_3d_with_callbacks(
                 last_heartbeat_ms: t0.elapsed().as_millis() as u64,
             });
 
-            let total_budget = cfg.time_limit_secs.clamp(0.5, 300.0);
+            let total_budget = clamp_finite(cfg.time_limit_secs, 30.0, 0.5, 300.0);
             let elapsed_s = t0.elapsed().as_secs_f32();
             let reserve_s3 = if cfg.gravity_settle_after {
                 (total_budget * 0.20).clamp(0.5, 5.0)

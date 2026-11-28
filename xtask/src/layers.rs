@@ -111,6 +111,8 @@ pub const TABLE: &[(&str, Class)] = &[
     ("window-gpu", Class::Shared),
     // the views of a design as plain data: kinds, the set a design keeps open, the saved form (no UI toolkit)
     ("views", Class::Shared),
+    // pure-Rust 3D nesting core (zero UI/GPU dependencies)
+    ("nestcraft-core", Class::Shared),
     // apps and tooling
     ("solidcraft", Class::Exempt),
     ("nestcraft", Class::Exempt),

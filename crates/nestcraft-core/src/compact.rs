@@ -18,7 +18,7 @@ use rapier3d::prelude::{
 
 use crate::interlock::{InterlockConfig, detect_interlocking};
 use crate::model::{
-    Aabb, BuildJob, InstanceId, PartId, RotationConstraint, Transform3x4, TriMesh,
+    Aabb, BuildJob, InstanceId, PartId, RotationConstraint, Transform3x4, TriMesh, clamp_finite,
 };
 use crate::nest3d::{
     ClearanceMode, Nest3dConfig, OrientationFreedom, instance_inside_raw_machine, nbz_violated,
@@ -127,7 +127,7 @@ impl GravitySettleConfig {
             allow_micro_rotations: cfg.allow_micro_rotations,
             max_tilt_deg: cfg.max_tilt_deg,
             max_steps: 180,
-            time_limit_secs: (cfg.time_limit_secs * 0.25).clamp(1.5, 6.0),
+            time_limit_secs: clamp_finite(cfg.time_limit_secs * 0.25, 3.0, 1.5, 6.0),
             vhacd_resolution: 32,
             max_convex_hulls: 16,
             prevent_interlocking: cfg.prevent_interlocking,
@@ -138,11 +138,11 @@ impl GravitySettleConfig {
     /// Effective Z ceiling inside the machine envelope, clamped to `[min_z + 1.0, machine_z - wall_margin]`.
     pub fn effective_max_z(&self, job: &BuildJob) -> f32 {
         let [_, _, wz] = job.machine.size_mm();
-        let wm = self.wall_margin_mm.max(0.0);
-        let min_z = self.min_z_mm.max(0.0);
+        let wm = clamp_finite(self.wall_margin_mm, 0.0, 0.0, 500.0);
+        let min_z = clamp_finite(self.min_z_mm, 0.0, 0.0, 2000.0);
         let ceiling = (wz - wm).max(min_z + 1.0);
         match self.max_z_limit_mm {
-            Some(cap) => cap.clamp(min_z + 1.0, ceiling),
+            Some(cap) => clamp_finite(cap, ceiling, min_z + 1.0, ceiling),
             None => ceiling,
         }
     }
@@ -935,8 +935,8 @@ pub(crate) fn gravity_settle_with_orientation_freedom(
 
     let gravity = Vector::new(0.0, 0.0, -3.5);
     let max_steps = cfg.max_steps.clamp(1, 2000);
-    let max_tilt_rad = cfg.max_tilt_deg.clamp(0.5, 45.0).to_radians();
-    let time_limit_secs = cfg.time_limit_secs.clamp(0.25, 120.0);
+    let max_tilt_rad = clamp_finite(cfg.max_tilt_deg, 10.0, 0.5, 45.0).to_radians();
+    let time_limit_secs = clamp_finite(cfg.time_limit_secs, 10.0, 0.25, 120.0);
 
     let mut best_snapshot: Vec<Transform3x4> = dynamic_parts.iter().map(|d| d.initial_tf).collect();
     let mut best_max_z = max_z_before_mm;

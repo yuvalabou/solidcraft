@@ -60,6 +60,7 @@ fn main() -> eframe::Result<()> {
                     depth: Some(solidcraft_viewport_gpu::depth_format(&rs.device, true)),
                     ..window
                 };
+                let _ = solidcraft_viewport_egui::watch_window(rs, 1);
                 let _ = solidcraft_viewport_egui::install(rs, scene, window, false, false, |err| {
                     let _ = writeln!(std::io::stderr(), "nestcraft wgpu error: {err}");
                 });
